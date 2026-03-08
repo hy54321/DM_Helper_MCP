@@ -1,12 +1,16 @@
 [project]
-name = "app"
+name = "dm-helper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Data Migration Helper — MCP server for comparing source/target data extracts"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "anthropic>=0.51.0",
+    "duckdb>=1.0.0",
+    "fastapi>=0.115.0",
     "mcp[cli]>=1.8.0",
+    "openpyxl>=3.1.0",
     "prompt-toolkit>=3.0.51",
     "python-dotenv>=1.1.0",
+    "uvicorn>=0.34.0",
 ]

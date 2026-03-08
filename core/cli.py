@@ -31,7 +31,8 @@ class CommandAutoSuggest(AutoSuggest):
 
             if cmd in self.prompt_dict:
                 prompt = self.prompt_dict[cmd]
-                return Suggestion(f" {prompt.arguments[0].name}")
+                if prompt.arguments:
+                    return Suggestion(f" <{prompt.arguments[0].name}>")
 
         return None
 
@@ -40,33 +41,35 @@ class UnifiedCompleter(Completer):
     def __init__(self):
         self.prompts = []
         self.prompt_dict = {}
-        self.resources = []
+        self.datasets: List[str] = []
 
     def update_prompts(self, prompts: List):
         self.prompts = prompts
         self.prompt_dict = {prompt.name: prompt for prompt in prompts}
 
-    def update_resources(self, resources: List):
-        self.resources = resources
+    def update_datasets(self, datasets: List[str]):
+        self.datasets = datasets
 
     def get_completions(self, document, complete_event):
         text = document.text
         text_before_cursor = document.text_before_cursor
 
+        # @ mentions for dataset IDs
         if "@" in text_before_cursor:
             last_at_pos = text_before_cursor.rfind("@")
             prefix = text_before_cursor[last_at_pos + 1 :]
 
-            for resource_id in self.resources:
-                if resource_id.lower().startswith(prefix.lower()):
+            for ds_id in self.datasets:
+                if ds_id.lower().startswith(prefix.lower()):
                     yield Completion(
-                        resource_id,
+                        ds_id,
                         start_position=-len(prefix),
-                        display=resource_id,
-                        display_meta="Resource",
+                        display=ds_id,
+                        display_meta="Dataset",
                     )
             return
 
+        # / commands (prompts)
         if text.startswith("/"):
             parts = text[1:].split()
 
@@ -83,29 +86,26 @@ class UnifiedCompleter(Completer):
                         )
                 return
 
-            if len(parts) == 1 and text.endswith(" "):
-                cmd = parts[0]
-
-                if cmd in self.prompt_dict:
-                    for id in self.resources:
-                        yield Completion(
-                            id,
-                            start_position=0,
-                            display=id,
-                        )
+            # After command name, suggest dataset IDs
+            if len(parts) >= 1 and text.endswith(" "):
+                for ds_id in self.datasets:
+                    yield Completion(
+                        ds_id,
+                        start_position=0,
+                        display=ds_id,
+                        display_meta="Dataset",
+                    )
                 return
 
             if len(parts) >= 2:
-                doc_prefix = parts[-1]
-
-                for resource in self.resources:
-                    if "id" in resource and resource["id"].lower().startswith(
-                        doc_prefix.lower()
-                    ):
+                ds_prefix = parts[-1]
+                for ds_id in self.datasets:
+                    if ds_id.lower().startswith(ds_prefix.lower()):
                         yield Completion(
-                            resource["id"],
-                            start_position=-len(doc_prefix),
-                            display=resource["id"],
+                            ds_id,
+                            start_position=-len(ds_prefix),
+                            display=ds_id,
+                            display_meta="Dataset",
                         )
                 return
 
@@ -113,7 +113,7 @@ class UnifiedCompleter(Completer):
 class CliApp:
     def __init__(self, agent: CliChat):
         self.agent = agent
-        self.resources = []
+        self.datasets: List[str] = []
         self.prompts = []
 
         self.completer = UnifiedCompleter()
@@ -150,14 +150,6 @@ class CliApp:
 
                 if len(parts) == 1:
                     buffer.start_completion(select_first=False)
-                elif len(parts) == 2:
-                    arg = parts[1]
-                    if (
-                        "doc" in arg.lower()
-                        or "file" in arg.lower()
-                        or "id" in arg.lower()
-                    ):
-                        buffer.start_completion(select_first=False)
 
         self.history = InMemoryHistory()
         self.session = PromptSession(
@@ -177,15 +169,15 @@ class CliApp:
         )
 
     async def initialize(self):
-        await self.refresh_resources()
+        await self.refresh_datasets()
         await self.refresh_prompts()
 
-    async def refresh_resources(self):
+    async def refresh_datasets(self):
         try:
-            self.resources = await self.agent.list_docs_ids()
-            self.completer.update_resources(self.resources)
+            self.datasets = await self.agent.list_dataset_ids()
+            self.completer.update_datasets(self.datasets)
         except Exception as e:
-            print(f"Error refreshing resources: {e}")
+            print(f"Error refreshing datasets: {e}")
 
     async def refresh_prompts(self):
         try:
@@ -197,14 +189,24 @@ class CliApp:
             print(f"Error refreshing prompts: {e}")
 
     async def run(self):
+        print("DM Helper — Data Migration Assistant")
+        print("Type your query, use /command, or @dataset_id for autocomplete.")
+        print("Press Ctrl+C to exit.\n")
+
         while True:
             try:
-                user_input = await self.session.prompt_async("> ")
+                user_input = await self.session.prompt_async("dm> ")
                 if not user_input.strip():
                     continue
 
                 response = await self.agent.run(user_input)
-                print(f"\nResponse:\n{response}")
+                print(f"\n{response}\n")
+
+                # Refresh datasets after catalog-modifying commands
+                lower = user_input.lower()
+                if "refresh" in lower or "scan" in lower or "catalog" in lower:
+                    await self.refresh_datasets()
 
             except KeyboardInterrupt:
+                print("\nGoodbye!")
                 break

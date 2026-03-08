@@ -36,10 +36,10 @@ async def main():
     )
 
     async with AsyncExitStack() as stack:
-        doc_client = await stack.enter_async_context(
+        dm_client = await stack.enter_async_context(
             MCPClient(command=command, args=args)
         )
-        clients["doc_client"] = doc_client
+        clients["dm_client"] = dm_client
 
         for i, server_script in enumerate(server_scripts):
             client_id = f"client_{i}_{server_script}"
@@ -49,7 +49,7 @@ async def main():
             clients[client_id] = client
 
         chat = CliChat(
-            doc_client=doc_client,
+            dm_client=dm_client,
             clients=clients,
             claude_service=claude_service,
         )

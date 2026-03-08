@@ -7,46 +7,73 @@ from core.claude import Claude
 from mcp_client import MCPClient
 
 
+SYSTEM_PROMPT = """You are DM Helper — a data-migration assistant.
+
+You help users compare source-system data extracts against target-ERP
+extracts (CSV / Excel files) using DuckDB-powered tools.
+
+Capabilities:
+• Catalog management: scan folders, list datasets, preview data.
+• Data profiling: column statistics, value distributions, duplicate detection.
+• Source ↔ target comparison: ADDED/REMOVED/CHANGED analysis with XLSX reports.
+• Read-only SQL queries against loaded datasets.
+
+Rules:
+1. NEVER modify source or target data files.
+2. Return summaries and samples — not full datasets — unless writing to a report.
+3. When comparing, always confirm key columns with the user before running.
+4. For large result sets, cap at 10 rows by default; mention total count.
+5. Point users to generated XLSX reports for full data.
+"""
+
+
 class CliChat(Chat):
     def __init__(
         self,
-        doc_client: MCPClient,
+        dm_client: MCPClient,
         clients: dict[str, MCPClient],
         claude_service: Claude,
     ):
         super().__init__(clients=clients, claude_service=claude_service)
 
-        self.doc_client: MCPClient = doc_client
+        self.dm_client: MCPClient = dm_client
 
     async def list_prompts(self) -> list[Prompt]:
-        return await self.doc_client.list_prompts()
+        return await self.dm_client.list_prompts()
 
-    async def list_docs_ids(self) -> list[str]:
-        return await self.doc_client.read_resource("docs://documents")
+    async def list_dataset_ids(self) -> list[str]:
+        """Return dataset IDs from the data://datasets resource."""
+        import json
 
-    async def get_doc_content(self, doc_id: str) -> str:
-        return await self.doc_client.read_resource(f"docs://documents/{doc_id}")
+        raw = await self.dm_client.read_resource("data://datasets")
+        if raw:
+            try:
+                data = json.loads(raw)
+                return [d["id"] for d in data]
+            except Exception:
+                pass
+        return []
 
     async def get_prompt(
-        self, command: str, doc_id: str
+        self, command: str, args: dict[str, str]
     ) -> list[PromptMessage]:
-        return await self.doc_client.get_prompt(command, {"doc_id": doc_id})
+        return await self.dm_client.get_prompt(command, args)
 
-    async def _extract_resources(self, query: str) -> str:
-        mentions = [word[1:] for word in query.split() if word.startswith("@")]
+    async def _process_query(self, query: str):
+        if await self._process_command(query):
+            return
 
-        doc_ids = await self.list_docs_ids()
-        mentioned_docs: list[Tuple[str, str]] = []
+        prompt = f"""{SYSTEM_PROMPT}
 
-        for doc_id in doc_ids:
-            if doc_id in mentions:
-                content = await self.get_doc_content(doc_id)
-                mentioned_docs.append((doc_id, content))
+The user says:
+<query>
+{query}
+</query>
 
-        return "".join(
-            f'\n<document id="{doc_id}">\n{content}\n</document>\n'
-            for doc_id, content in mentioned_docs
-        )
+Answer the user's question directly and concisely. Use the available tools
+to look up data when needed. Start with the exact information they need.
+"""
+        self.messages.append({"role": "user", "content": prompt})
 
     async def _process_command(self, query: str) -> bool:
         if not query.startswith("/"):
@@ -55,38 +82,24 @@ class CliChat(Chat):
         words = query.split()
         command = words[0].replace("/", "")
 
-        messages = await self.doc_client.get_prompt(
-            command, {"doc_id": words[1]}
-        )
+        # Build args dict from remaining words
+        args: dict[str, str] = {}
+        prompts = await self.list_prompts()
+        prompt_names = {p.name for p in prompts}
 
+        if command not in prompt_names:
+            return False
+
+        # Map positional args
+        prompt_def = next((p for p in prompts if p.name == command), None)
+        if prompt_def and prompt_def.arguments:
+            for i, arg_def in enumerate(prompt_def.arguments):
+                if i + 1 < len(words):
+                    args[arg_def.name] = words[i + 1]
+
+        messages = await self.get_prompt(command, args)
         self.messages += convert_prompt_messages_to_message_params(messages)
         return True
-
-    async def _process_query(self, query: str):
-        if await self._process_command(query):
-            return
-
-        added_resources = await self._extract_resources(query)
-
-        prompt = f"""
-        The user has a question:
-        <query>
-        {query}
-        </query>
-
-        The following context may be useful in answering their question:
-        <context>
-        {added_resources}
-        </context>
-
-        Note the user's query might contain references to documents like "@report.docx". The "@" is only
-        included as a way of mentioning the doc. The actual name of the document would be "report.docx".
-        If the document content is included in this prompt, you don't need to use an additional tool to read the document.
-        Answer the user's question directly and concisely. Start with the exact information they need. 
-        Don't refer to or mention the provided context in any way - just use it to inform your answer.
-        """
-
-        self.messages.append({"role": "user", "content": prompt})
 
 
 def convert_prompt_message_to_message_param(
@@ -96,7 +109,6 @@ def convert_prompt_message_to_message_param(
 
     content = prompt_message.content
 
-    # Check if content is a dict-like object with a "type" field
     if isinstance(content, dict) or hasattr(content, "__dict__"):
         content_type = (
             content.get("type", None)
@@ -114,7 +126,6 @@ def convert_prompt_message_to_message_param(
     if isinstance(content, list):
         text_blocks = []
         for item in content:
-            # Check if item is a dict-like object with a "type" field
             if isinstance(item, dict) or hasattr(item, "__dict__"):
                 item_type = (
                     item.get("type", None)
