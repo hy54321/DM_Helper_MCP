@@ -80,6 +80,10 @@ body {
   grid-column: span 3;
 }
 
+.col-2 {
+  grid-column: span 2;
+}
+
 .col-4 {
   grid-column: span 4;
 }
@@ -264,6 +268,10 @@ pre {
   font-size: 12px;
 }
 
+.auto-link-btn {
+  white-space: nowrap;
+}
+
 @media (max-width: 900px) {
   .layout {
     grid-template-columns: 1fr;
@@ -283,6 +291,7 @@ pre {
     text-align: center;
   }
 
+  .col-2,
   .col-3,
   .col-4,
   .col-6,

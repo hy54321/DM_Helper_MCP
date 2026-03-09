@@ -17,12 +17,30 @@ from typing import Any, Dict, List, Optional
 from server import db
 
 
-def _reports_dir() -> str:
+def _default_reports_dir() -> str:
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    d = os.path.join(base, "reports")
+    return os.path.join(base, "reports")
+
+
+def _reports_dir(conn=None) -> str:
+    custom_dir = ""
+    own_conn = False
+    if conn is None:
+        try:
+            conn = db.get_connection()
+            own_conn = True
+        except Exception:
+            conn = None
+    if conn is not None:
+        try:
+            custom_dir = (db.get_meta(conn, "report_folder", "") or "").strip()
+        finally:
+            if own_conn:
+                conn.close()
+    d = custom_dir or _default_reports_dir()
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -153,7 +171,7 @@ def write_comparison_report(
         filename=filename,
         default_stem=f"comparison_{source_id}_vs_{target_id}",
     )
-    file_path = os.path.join(_reports_dir(), filename)
+    file_path = os.path.join(_reports_dir(conn), filename)
 
     # Styles
     header_font = Font(bold=True, color="FFFFFF")
@@ -320,6 +338,7 @@ def export_query_to_xlsx(
     headers: List[str],
     rows: List[list],
     filename: Optional[str] = None,
+    conn=None,
 ) -> Dict[str, Any]:
     """Write arbitrary query results to an XLSX file."""
     from openpyxl import Workbook
@@ -329,7 +348,7 @@ def export_query_to_xlsx(
         filename=filename,
         default_stem="query_export",
     )
-    file_path = os.path.join(_reports_dir(), filename)
+    file_path = os.path.join(_reports_dir(conn), filename)
 
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -357,7 +376,31 @@ def export_query_to_xlsx(
 
     wb.save(file_path)
 
+    report_id = f"rpt_{uuid.uuid4().hex[:8]}"
+    summary_meta = {
+        "type": "query_export",
+        "row_count": len(rows),
+        "column_count": len(headers),
+    }
+    own = conn is None
+    if own:
+        conn = db.get_connection()
+    db.create_report(
+        conn,
+        report_id=report_id,
+        job_id=None,
+        pair_id=None,
+        source_dataset="query_export",
+        target_dataset="query_export",
+        file_path=file_path,
+        file_name=filename,
+        summary=summary_meta,
+    )
+    if own:
+        conn.close()
+
     return {
+        "report_id": report_id,
         "file_path": file_path,
         "file_name": filename,
         "row_count": len(rows),
@@ -368,6 +411,7 @@ def export_column_summary_to_xlsx(
     summary_result: Dict[str, Any],
     top_n: int,
     filename: Optional[str] = None,
+    conn=None,
 ) -> Dict[str, Any]:
     """Write column Top-N + blanks summary rows to an XLSX report."""
     from openpyxl import Workbook
@@ -380,7 +424,7 @@ def export_column_summary_to_xlsx(
         filename=filename,
         default_stem=f"column_summary_{dataset_id}",
     )
-    file_path = os.path.join(_reports_dir(), filename)
+    file_path = os.path.join(_reports_dir(conn), filename)
 
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -439,7 +483,33 @@ def export_column_summary_to_xlsx(
         ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
 
     wb.save(file_path)
+
+    report_id = f"rpt_{uuid.uuid4().hex[:8]}"
+    summary_meta = {
+        "type": "column_summary",
+        "dataset": dataset_id,
+        "column_count": len(summaries),
+        "top_n": top_n,
+    }
+    own = conn is None
+    if own:
+        conn = db.get_connection()
+    db.create_report(
+        conn,
+        report_id=report_id,
+        job_id=None,
+        pair_id=None,
+        source_dataset=dataset_id,
+        target_dataset=dataset_id,
+        file_path=file_path,
+        file_name=filename,
+        summary=summary_meta,
+    )
+    if own:
+        conn.close()
+
     return {
+        "report_id": report_id,
         "file_path": file_path,
         "file_name": filename,
         "dataset": dataset_id,

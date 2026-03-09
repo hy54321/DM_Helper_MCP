@@ -364,27 +364,38 @@ def compare_field(
         )
         key_sel = ", ".join(f"s.{quote(k)}" for k in key_columns)
 
-        total_diffs = duck.execute(
-            f"""
-            SELECT COUNT(*) FROM {sv} s
-            INNER JOIN {tv} t ON {join_on}
-            WHERE CAST(s.{qf} AS VARCHAR) IS DISTINCT FROM CAST(t.{qf} AS VARCHAR)
-            """
-        ).fetchone()[0]
-
         rows = duck.execute(
             f"""
-            SELECT {key_sel},
-                   CAST(s.{qf} AS VARCHAR) AS source_value,
-                   CAST(t.{qf} AS VARCHAR) AS target_value
-            FROM {sv} s
-            INNER JOIN {tv} t ON {join_on}
-            WHERE CAST(s.{qf} AS VARCHAR) IS DISTINCT FROM CAST(t.{qf} AS VARCHAR)
-            LIMIT {limit}
+            WITH diff AS (
+                SELECT {key_sel},
+                       CAST(s.{qf} AS VARCHAR) AS source_value,
+                       CAST(t.{qf} AS VARCHAR) AS target_value
+                FROM {sv} s
+                INNER JOIN {tv} t ON {join_on}
+                WHERE CAST(s.{qf} AS VARCHAR) IS DISTINCT FROM CAST(t.{qf} AS VARCHAR)
+            ),
+            ranked AS (
+                SELECT *,
+                       COUNT(*) OVER () AS total_differences,
+                       ROW_NUMBER() OVER () AS rn
+                FROM diff
+            )
+            SELECT {", ".join(quote(k) for k in key_columns)},
+                   source_value,
+                   target_value,
+                   total_differences
+            FROM ranked
+            WHERE rn <= {limit}
             """
-        )
-        headers = [d[0] for d in rows.description]
-        diff_rows = [dict(zip(headers, r)) for r in rows.fetchall()]
+        ).fetchall()
+
+        total_diffs = rows[0][len(key_columns) + 2] if rows else 0
+        diff_rows = []
+        for r in rows:
+            entry = {key_columns[i]: r[i] for i in range(len(key_columns))}
+            entry["source_value"] = r[len(key_columns)]
+            entry["target_value"] = r[len(key_columns) + 1]
+            diff_rows.append(entry)
 
     return {
         "source": source_id,

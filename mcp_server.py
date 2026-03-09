@@ -7,7 +7,7 @@ reports, SQL preview) via FastMCP (stdio transport).
 
 import json
 import os
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,6 +17,7 @@ from server import profile as prof
 from server import comparison as comp
 from server import reports as rpt
 from server import jobs as job_svc
+from server import relationships as rel
 from server.query_engine import connect, format_results, quote
 from server.sql_guard import validate as sql_validate
 
@@ -28,6 +29,126 @@ DMH_MCP_MODE = os.getenv("DMH_MCP_MODE", "prod").strip().lower()
 DEBUG_MODE = DMH_MCP_MODE == "debug"
 
 mcp = FastMCP("DMHelperMCP", log_level="ERROR")
+
+
+def _split_csv_fields(value: Optional[str]) -> List[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def _normalize_field_mappings(mappings: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for mapping in mappings or []:
+        source_field = str(mapping.get("source_field") or mapping.get("source") or "").strip()
+        target_field = str(mapping.get("target_field") or mapping.get("target") or "").strip()
+        if not source_field or not target_field:
+            continue
+        sig = (source_field, target_field)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        normalized.append({"source_field": source_field, "target_field": target_field})
+    return normalized
+
+
+def _resolve_single_mapping(field_name: str, mappings: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    field_name = field_name.strip()
+    if not field_name:
+        return None
+
+    exact_source = [m for m in mappings if m["source_field"] == field_name]
+    if len(exact_source) == 1:
+        return exact_source[0]
+
+    exact_target = [m for m in mappings if m["target_field"] == field_name]
+    if len(exact_target) == 1:
+        return exact_target[0]
+
+    lookup = field_name.lower()
+    ci_source = [m for m in mappings if m["source_field"].lower() == lookup]
+    if len(ci_source) == 1:
+        return ci_source[0]
+
+    ci_target = [m for m in mappings if m["target_field"].lower() == lookup]
+    if len(ci_target) == 1:
+        return ci_target[0]
+
+    return None
+
+
+def _resolve_requested_mappings(
+    requested_fields: List[str],
+    pair_mappings: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    if not pair_mappings:
+        return [{"source_field": field, "target_field": field} for field in requested_fields]
+
+    if not requested_fields:
+        return pair_mappings
+
+    resolved: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for field in requested_fields:
+        mapping = _resolve_single_mapping(field, pair_mappings)
+        if not mapping:
+            mapping = {"source_field": field, "target_field": field}
+        sig = (mapping["source_field"], mapping["target_field"])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        resolved.append(mapping)
+    return resolved
+
+
+def _resolve_pair_context(
+    source_dataset_id: str,
+    target_dataset_id: str,
+    key_fields: List[str],
+    compare_fields: Optional[List[str]],
+    pair_id: Optional[str] = None,
+) -> tuple[
+    Optional[str],
+    List[str],
+    Optional[List[str]],
+    Optional[List[Dict[str, str]]],
+    Optional[List[Dict[str, str]]],
+]:
+    pair = cat.get_pair(pair_id) if pair_id else cat.get_pair_by_datasets(source_dataset_id, target_dataset_id)
+    if pair_id and not pair:
+        return f"Pair '{pair_id}' not found.", key_fields, compare_fields, None, None
+    if pair and (
+        pair.get("source_dataset") != source_dataset_id or pair.get("target_dataset") != target_dataset_id
+    ):
+        return (
+            (
+                f"Pair '{pair.get('id')}' belongs to source '{pair.get('source_dataset')}' and "
+                f"target '{pair.get('target_dataset')}', not '{source_dataset_id}' -> '{target_dataset_id}'."
+            ),
+            key_fields,
+            compare_fields,
+            None,
+            None,
+        )
+
+    key_pair_mappings = _normalize_field_mappings((pair or {}).get("key_mappings"))
+    compare_pair_mappings = _normalize_field_mappings((pair or {}).get("compare_mappings"))
+
+    resolved_key_mappings: Optional[List[Dict[str, str]]] = None
+    resolved_compare_mappings: Optional[List[Dict[str, str]]] = None
+    resolved_key_fields = key_fields
+    resolved_compare_fields = compare_fields
+
+    if key_pair_mappings:
+        resolved_key_mappings = _resolve_requested_mappings(key_fields, key_pair_mappings)
+        resolved_key_fields = [m["source_field"] for m in resolved_key_mappings]
+
+    if compare_pair_mappings:
+        requested_compare = compare_fields or []
+        resolved_compare_mappings = _resolve_requested_mappings(requested_compare, compare_pair_mappings)
+        if compare_fields is not None:
+            resolved_compare_fields = [m["source_field"] for m in resolved_compare_mappings]
+
+    return None, resolved_key_fields, resolved_compare_fields, resolved_key_mappings, resolved_compare_mappings
 
 # ═══════════════════════════════════════════════════════════════
 #  5.1 — Catalog tools
@@ -315,7 +436,7 @@ def list_table_pairs(
 
     compact = [
         {
-            "id": p["id"],
+            "pair_id": p["id"],
             "source_dataset": p["source_dataset"],
             "target_dataset": p["target_dataset"],
             "source_file": p["source_file"],
@@ -402,6 +523,88 @@ def list_key_presets(pair_id: str) -> str:
 
 
 @mcp.tool()
+def link_related_tables(
+    side: str = "target",
+    min_confidence: float = 0.9,
+    suggest_only: bool = False,
+) -> str:
+    """Discover high-confidence same-side dataset relationships and optionally persist them."""
+    result = rel.link_related_tables(
+        side=side,
+        min_confidence=min_confidence,
+        suggest_only=suggest_only,
+    )
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_dataset_links(
+    dataset_id: str,
+) -> str:
+    """Return compact relationship links for a dataset to guide SQL join construction."""
+    conn = db.get_connection()
+    ds = db.get_dataset(conn, dataset_id)
+    if not ds:
+        conn.close()
+        return json.dumps({"error": f"Dataset '{dataset_id}' not found."})
+
+    rels = db.list_relationships(
+        conn,
+        side=ds["side"],
+        dataset_id=dataset_id,
+        active_only=True,
+        limit=5000,
+    )
+    conn.close()
+
+    relations: list[dict[str, Any]] = []
+    for r in rels:
+        left_fields = r.get("left_fields") or ([r["left_field"]] if r.get("left_field") else [])
+        right_fields = r.get("right_fields") or ([r["right_field"]] if r.get("right_field") else [])
+        if r["left_dataset"] == dataset_id:
+            dataset_fields = left_fields
+            linked_fields = right_fields
+            linked_dataset_id = r["right_dataset"]
+        else:
+            dataset_fields = right_fields
+            linked_fields = left_fields
+            linked_dataset_id = r["left_dataset"]
+
+        pair_count = min(len(dataset_fields), len(linked_fields))
+        if pair_count <= 0:
+            continue
+        dataset_fields = dataset_fields[:pair_count]
+        linked_fields = linked_fields[:pair_count]
+        field_pairs = [
+            {"dataset_field": dataset_fields[i], "linked_dataset_field": linked_fields[i]}
+            for i in range(pair_count)
+        ]
+        join_predicate_sql = " AND ".join(
+            f'a.{quote(p["dataset_field"])} = b.{quote(p["linked_dataset_field"])}'
+            for p in field_pairs
+        )
+
+        relations.append(
+            {
+                "linked_dataset": linked_dataset_id,
+                "field_pairs": field_pairs,
+                "confidence": r["confidence"],
+                "join_predicate_sql": join_predicate_sql,
+            }
+        )
+
+    relations.sort(key=lambda x: (x["confidence"], x["linked_dataset"]), reverse=True)
+
+    return json.dumps(
+        {
+            "dataset": dataset_id,
+            "relations": relations,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
 def schema_diff(
     source_dataset_id: str,
     target_dataset_id: str,
@@ -424,19 +627,30 @@ def start_comparison_job(
     pair_id: Optional[str] = None,
     compare_fields: Optional[str] = None,
 ) -> str:
-    """Start a comparison job. key_fields and compare_fields: comma-separated column names."""
-    keys = [k.strip() for k in key_fields.split(",") if k.strip()]
-    comp_cols = (
-        [c.strip() for c in compare_fields.split(",") if c.strip()]
-        if compare_fields
-        else None
+    """Start a comparison job. key/compare fields can be source or target names when pair mappings exist."""
+    keys = _split_csv_fields(key_fields)
+    comp_cols = _split_csv_fields(compare_fields) if compare_fields else None
+    err, keys, comp_cols, key_mappings, compare_mappings = _resolve_pair_context(
+        source_dataset_id=source_dataset_id,
+        target_dataset_id=target_dataset_id,
+        key_fields=keys,
+        compare_fields=comp_cols,
+        pair_id=pair_id,
     )
+    if err:
+        return json.dumps({"error": err})
     result = job_svc.start_comparison_job(
         source_id=source_dataset_id,
         target_id=target_dataset_id,
         key_columns=keys,
+        key_mappings=key_mappings,
         pair_id=pair_id,
         compare_columns=comp_cols,
+        compare_mappings=compare_mappings,
+        options={
+            "key_mappings": key_mappings or [],
+            "compare_mappings": compare_mappings or [],
+        },
     )
     return json.dumps(result, indent=2, default=str)
 
@@ -446,21 +660,29 @@ def compare_tables(
     source_dataset_id: str,
     target_dataset_id: str,
     key_fields: str,
+    pair_id: Optional[str] = None,
     compare_fields: Optional[str] = None,
     sample_limit: int = 10,
 ) -> str:
-    """Quick ad-hoc comparison (no job). Returns summary + sample diffs. key_fields: comma-separated."""
-    keys = [k.strip() for k in key_fields.split(",") if k.strip()]
-    comp_cols = (
-        [c.strip() for c in compare_fields.split(",") if c.strip()]
-        if compare_fields
-        else None
+    """Quick ad-hoc comparison. key/compare fields can be source or target names when pair mappings exist."""
+    keys = _split_csv_fields(key_fields)
+    comp_cols = _split_csv_fields(compare_fields) if compare_fields else None
+    err, keys, comp_cols, key_mappings, compare_mappings = _resolve_pair_context(
+        source_dataset_id=source_dataset_id,
+        target_dataset_id=target_dataset_id,
+        key_fields=keys,
+        compare_fields=comp_cols,
+        pair_id=pair_id,
     )
+    if err:
+        return json.dumps({"error": err})
     result = comp.compare_datasets(
         source_id=source_dataset_id,
         target_id=target_dataset_id,
         key_columns=keys,
         compare_columns=comp_cols,
+        key_mappings=key_mappings,
+        compare_mappings=compare_mappings,
         sample_limit=sample_limit,
     )
     return json.dumps(result, indent=2, default=str)
@@ -508,10 +730,11 @@ def cancel_job(job_id: str) -> str:
 
 
 @mcp.tool()
-def list_reports() -> str:
-    """List all generated XLSX reports."""
+def list_reports(limit: int = 5) -> str:
+    """List recent generated XLSX reports (default: last 5)."""
+    limit = max(1, min(int(limit), 500))
     conn = db.get_connection()
-    reports = db.list_reports(conn)
+    reports = db.list_reports(conn, limit=limit)
     conn.close()
     return json.dumps(reports, indent=2)
 

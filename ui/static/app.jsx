@@ -31,12 +31,14 @@ function App() {
 
   const [sourceFolder, setSourceFolder] = useState("");
   const [targetFolder, setTargetFolder] = useState("");
+  const [reportFolder, setReportFolder] = useState("");
   const [includeRowCounts, setIncludeRowCounts] = useState(false);
 
   const [datasets, setDatasets] = useState([]);
   const [pairs, setPairs] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [reports, setReports] = useState([]);
+  const [relationships, setRelationships] = useState([]);
 
   const [profileDataset, setProfileDataset] = useState("");
   const [profileColumn, setProfileColumn] = useState("");
@@ -55,23 +57,39 @@ function App() {
   const [mappingSearch, setMappingSearch] = useState("");
   const [compareResult, setCompareResult] = useState(null);
   const [jobSummary, setJobSummary] = useState(null);
+  const [relationshipSide, setRelationshipSide] = useState("target");
+  const [relationshipId, setRelationshipId] = useState("");
+  const [leftDatasetId, setLeftDatasetId] = useState("");
+  const [leftField, setLeftField] = useState("");
+  const [leftExtraFields, setLeftExtraFields] = useState("");
+  const [rightDatasetId, setRightDatasetId] = useState("");
+  const [rightField, setRightField] = useState("");
+  const [rightExtraFields, setRightExtraFields] = useState("");
+  const [relationshipConfidence, setRelationshipConfidence] = useState(0.95);
+  const [relationshipMethod, setRelationshipMethod] = useState("manual");
+  const [relationshipActive, setRelationshipActive] = useState(true);
+  const [autoLinkConfidence, setAutoLinkConfidence] = useState(0.9);
+  const [autoLinkSuggestOnly, setAutoLinkSuggestOnly] = useState(false);
 
   async function refreshBootstrap() {
     setError("");
     try {
-      const [folders, ds, pr, jb, rp] = await Promise.all([
+      const [folders, ds, pr, jb, rp, rels] = await Promise.all([
         api("/api/settings/folders"),
         api("/api/datasets"),
         api("/api/pairs"),
         api("/api/jobs"),
         api("/api/reports"),
+        api("/api/relationships?limit=500"),
       ]);
       setSourceFolder(folders.source_folder || "");
       setTargetFolder(folders.target_folder || "");
+      setReportFolder(folders.report_folder || "");
       setDatasets(ds || []);
       setPairs(pr || []);
       setJobs(jb || []);
       setReports(rp || []);
+      setRelationships(rels || []);
       if (ds?.length && !profileDataset) {
         setProfileDataset(ds[0].id);
       }
@@ -106,6 +124,20 @@ function App() {
       }
     }
   }, [sourceDataset, targetDataset, pairs, pairId]);
+
+  useEffect(() => {
+    const sideDatasetIds = new Set(datasets.filter((d) => d.side === relationshipSide).map((d) => d.id));
+    if (leftDatasetId && !sideDatasetIds.has(leftDatasetId)) {
+      setLeftDatasetId("");
+      setLeftField("");
+      setLeftExtraFields("");
+    }
+    if (rightDatasetId && !sideDatasetIds.has(rightDatasetId)) {
+      setRightDatasetId("");
+      setRightField("");
+      setRightExtraFields("");
+    }
+  }, [relationshipSide, leftDatasetId, rightDatasetId, datasets]);
 
   useEffect(() => {
     if (!pairId) return;
@@ -165,6 +197,7 @@ function App() {
         body: JSON.stringify({
           source_folder: sourceFolder || null,
           target_folder: targetFolder || null,
+          report_folder: reportFolder,
           include_row_counts: includeRowCounts,
         }),
       });
@@ -178,21 +211,53 @@ function App() {
     }
   }
 
+  async function onSaveFolders() {
+    setError("");
+    setStatus("Saving folder settings...");
+    try {
+      const saved = await api("/api/settings/folders", {
+        method: "POST",
+        body: JSON.stringify({
+          source_folder: sourceFolder,
+          target_folder: targetFolder,
+          report_folder: reportFolder,
+        }),
+      });
+      setSourceFolder(saved.source_folder || "");
+      setTargetFolder(saved.target_folder || "");
+      setReportFolder(saved.report_folder || "");
+      setStatus("Folder settings saved.");
+    } catch (err) {
+      setError(err.message);
+      setStatus("Saving folder settings failed.");
+    }
+  }
+
   async function onBrowseFolder(kind) {
     setError("");
-    const current = kind === "source" ? sourceFolder : targetFolder;
+    const current = kind === "source" ? sourceFolder : kind === "target" ? targetFolder : reportFolder;
     try {
       const path = current ? `?initial=${encodeURIComponent(current)}` : "";
       const res = await api(`/api/system/browse-folder${path}`);
       if (!res?.folder) {
         return;
       }
-      if (kind === "source") {
-        setSourceFolder(res.folder);
-      } else {
-        setTargetFolder(res.folder);
-      }
-      setStatus(`${kind === "source" ? "Source" : "Target"} folder selected.`);
+      const nextSource = kind === "source" ? res.folder : sourceFolder;
+      const nextTarget = kind === "target" ? res.folder : targetFolder;
+      const nextReport = kind === "report" ? res.folder : reportFolder;
+      const saved = await api("/api/settings/folders", {
+        method: "POST",
+        body: JSON.stringify({
+          source_folder: nextSource,
+          target_folder: nextTarget,
+          report_folder: nextReport,
+        }),
+      });
+      setSourceFolder(saved.source_folder || "");
+      setTargetFolder(saved.target_folder || "");
+      setReportFolder(saved.report_folder || "");
+      const label = kind === "source" ? "Source" : kind === "target" ? "Target" : "Report";
+      setStatus(`${label} folder selected.`);
     } catch (err) {
       setError(err.message);
     }
@@ -413,8 +478,143 @@ function App() {
     }
   }
 
+  function clearRelationshipForm() {
+    setRelationshipId("");
+    setLeftDatasetId("");
+    setLeftField("");
+    setLeftExtraFields("");
+    setRightDatasetId("");
+    setRightField("");
+    setRightExtraFields("");
+    setRelationshipConfidence(0.95);
+    setRelationshipMethod("manual");
+    setRelationshipActive(true);
+  }
+
+  function parseCommaFields(value) {
+    return (value || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter((x) => x);
+  }
+
+  function relationshipFieldLabel(row, side) {
+    const list =
+      side === "left"
+        ? row.left_fields || (row.left_field ? [row.left_field] : [])
+        : row.right_fields || (row.right_field ? [row.right_field] : []);
+    return list.length ? list.join(" + ") : "";
+  }
+
+  function editRelationship(row) {
+    setRelationshipId(String(row.id || ""));
+    setRelationshipSide(row.side || "target");
+    setLeftDatasetId(row.left_dataset || "");
+    const lf = row.left_fields || (row.left_field ? [row.left_field] : []);
+    setLeftField(lf[0] || "");
+    setLeftExtraFields(lf.slice(1).join(", "));
+    setRightDatasetId(row.right_dataset || "");
+    const rf = row.right_fields || (row.right_field ? [row.right_field] : []);
+    setRightField(rf[0] || "");
+    setRightExtraFields(rf.slice(1).join(", "));
+    setRelationshipConfidence(Number(row.confidence || 0.95));
+    setRelationshipMethod(row.method || "manual");
+    setRelationshipActive(!!row.active);
+    setTab("relationships");
+  }
+
+  async function saveRelationship() {
+    const leftFields = [leftField, ...parseCommaFields(leftExtraFields)].filter((x) => x);
+    const rightFields = [rightField, ...parseCommaFields(rightExtraFields)].filter((x) => x);
+    if (!leftDatasetId || !rightDatasetId || !leftFields.length || !rightFields.length) {
+      setError("Select left/right datasets and fields.");
+      return;
+    }
+    if (leftFields.length !== rightFields.length) {
+      setError("Left and right field counts must match for composite relationships.");
+      return;
+    }
+    setError("");
+    setStatus(relationshipId ? "Updating relationship..." : "Creating relationship...");
+    const payload = {
+      side: relationshipSide,
+      left_dataset: leftDatasetId,
+      left_field: leftFields[0],
+      left_fields: leftFields,
+      right_dataset: rightDatasetId,
+      right_field: rightFields[0],
+      right_fields: rightFields,
+      confidence: Number(relationshipConfidence),
+      method: relationshipMethod || "manual",
+      active: !!relationshipActive,
+    };
+    try {
+      if (relationshipId) {
+        await api(`/api/relationships/${encodeURIComponent(relationshipId)}`, {
+          method: "PUT",
+          body: JSON.stringify(payload),
+        });
+      } else {
+        await api("/api/relationships", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+      }
+      await refreshBootstrap();
+      clearRelationshipForm();
+      setStatus("Relationship saved.");
+    } catch (err) {
+      setError(err.message);
+      setStatus("Saving relationship failed.");
+    }
+  }
+
+  async function removeRelationship(id) {
+    if (!confirm(`Delete relationship ${id}?`)) return;
+    setError("");
+    setStatus("Deleting relationship...");
+    try {
+      await api(`/api/relationships/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await refreshBootstrap();
+      setStatus(`Deleted relationship ${id}.`);
+    } catch (err) {
+      setError(err.message);
+      setStatus("Delete relationship failed.");
+    }
+  }
+
+  async function runAutoLink() {
+    setError("");
+    setStatus(autoLinkSuggestOnly ? "Suggesting related table links..." : "Auto-linking related tables...");
+    try {
+      const res = await api("/api/relationships/link-related", {
+        method: "POST",
+        body: JSON.stringify({
+          side: relationshipSide,
+          min_confidence: Number(autoLinkConfidence),
+          suggest_only: autoLinkSuggestOnly,
+        }),
+      });
+      if (!autoLinkSuggestOnly) {
+        await refreshBootstrap();
+      }
+      setStatus(
+        `${autoLinkSuggestOnly ? "Suggestion run complete" : "Auto-link complete"}. Suggested=${res.suggested_count}, Applied=${res.applied_count}.`
+      );
+    } catch (err) {
+      setError(err.message);
+      setStatus("Auto-link failed.");
+    }
+  }
+
   const sourceOptions = datasets.filter((d) => d.side === "source");
   const targetOptions = datasets.filter((d) => d.side === "target");
+  const relationshipDatasets = datasets.filter((d) => d.side === relationshipSide);
+  const leftDatasetObj = relationshipDatasets.find((d) => d.id === leftDatasetId);
+  const rightDatasetObj = relationshipDatasets.find((d) => d.id === rightDatasetId);
+  const leftFieldOptions = leftDatasetObj?.columns || [];
+  const rightFieldOptions = rightDatasetObj?.columns || [];
+  const filteredRelationships = relationships.filter((r) => r.side === relationshipSide);
   const selectedSource = sourceOptions.find((d) => d.id === sourceDataset);
   const selectedTarget = targetOptions.find((d) => d.id === targetDataset);
   const pairOptions = pairs.filter(
@@ -452,6 +652,9 @@ function App() {
             <button className={`tab ${tab === "reports" ? "active" : ""}`} onClick={() => setTab("reports")}>
               Reports
             </button>
+            <button className={`tab ${tab === "relationships" ? "active" : ""}`} onClick={() => setTab("relationships")}>
+              Relationships
+            </button>
           </div>
         </aside>
         <main className="content">
@@ -487,6 +690,15 @@ function App() {
                   </button>
                 </div>
               </div>
+              <div className="col-6">
+                <label>Report folder</label>
+                <div className="field-with-action">
+                  <input value={reportFolder} onChange={(e) => setReportFolder(e.target.value)} placeholder="C:\data\reports" />
+                  <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("report")}>
+                    Browse
+                  </button>
+                </div>
+              </div>
               <div className="col-3">
                 <label>Options</label>
                 <div className="toggle-inline">
@@ -502,6 +714,11 @@ function App() {
               <div className="col-3">
                 <button className="refresh-catalog-btn" onClick={onRefreshCatalog}>
                   Refresh Catalog
+                </button>
+              </div>
+              <div className="col-3">
+                <button className="secondary" onClick={onSaveFolders}>
+                  Save Folder Settings
                 </button>
               </div>
               <div className="col-3">
@@ -887,6 +1104,216 @@ function App() {
                             <button className="secondary">Download</button>
                           </a>
                           <button className="danger" onClick={() => onDeleteReport(r.id)}>
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      ) : null}
+
+      {tab === "relationships" ? (
+        <>
+          <div className="card">
+            <div className="row">
+              <div className="col-2">
+                <label>Side</label>
+                <select value={relationshipSide} onChange={(e) => setRelationshipSide(e.target.value)}>
+                  <option value="source">source</option>
+                  <option value="target">target</option>
+                </select>
+              </div>
+              <div className="col-3">
+                <label>Auto-link min confidence</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.01"
+                  value={autoLinkConfidence}
+                  onChange={(e) => setAutoLinkConfidence(e.target.value)}
+                />
+              </div>
+              <div className="col-2">
+                <label>Mode</label>
+                <label className="toggle-inline">
+                  <input
+                    className="check-input"
+                    type="checkbox"
+                    checked={autoLinkSuggestOnly}
+                    onChange={(e) => setAutoLinkSuggestOnly(e.target.checked)}
+                  />
+                  <span>Suggest only</span>
+                </label>
+              </div>
+              <div className="col-2">
+                <label>&nbsp;</label>
+                <button className="auto-link-btn" onClick={runAutoLink}>
+                  Auto-link
+                </button>
+              </div>
+              <div className="col-2">
+                <label>&nbsp;</label>
+                <button className="secondary" onClick={refreshBootstrap}>
+                  Refresh
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <h3>{relationshipId ? `Edit Relationship #${relationshipId}` : "Create Relationship"}</h3>
+            <div className="row">
+              <div className="col-3">
+                <label>Left dataset</label>
+                <select
+                  value={leftDatasetId}
+                  onChange={(e) => {
+                    setLeftDatasetId(e.target.value);
+                    setLeftField("");
+                    setLeftExtraFields("");
+                  }}
+                >
+                  <option value="">Select...</option>
+                  {relationshipDatasets.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-3">
+                <label>Left field</label>
+                <select value={leftField} onChange={(e) => setLeftField(e.target.value)}>
+                  <option value="">Select...</option>
+                  {leftFieldOptions.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-3">
+                <label>Right dataset</label>
+                <select
+                  value={rightDatasetId}
+                  onChange={(e) => {
+                    setRightDatasetId(e.target.value);
+                    setRightField("");
+                    setRightExtraFields("");
+                  }}
+                >
+                  <option value="">Select...</option>
+                  {relationshipDatasets.map((d) => (
+                    <option key={d.id} value={d.id}>
+                      {d.id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-3">
+                <label>Right field</label>
+                <select value={rightField} onChange={(e) => setRightField(e.target.value)}>
+                  <option value="">Select...</option>
+                  {rightFieldOptions.map((c) => (
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="row">
+              <div className="col-6">
+                <label>Additional left fields (comma-separated, same order as right)</label>
+                <input
+                  placeholder="e.g. LINENUM, INVENTDIMID"
+                  value={leftExtraFields}
+                  onChange={(e) => setLeftExtraFields(e.target.value)}
+                />
+              </div>
+              <div className="col-6">
+                <label>Additional right fields (comma-separated, same order as left)</label>
+                <input
+                  placeholder="e.g. LINENUM, INVENTDIMID"
+                  value={rightExtraFields}
+                  onChange={(e) => setRightExtraFields(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="row">
+              <div className="col-2">
+                <label>Confidence</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.001"
+                  value={relationshipConfidence}
+                  onChange={(e) => setRelationshipConfidence(e.target.value)}
+                />
+              </div>
+              <div className="col-3">
+                <label>Method</label>
+                <input value={relationshipMethod} onChange={(e) => setRelationshipMethod(e.target.value)} />
+              </div>
+              <div className="col-2">
+                <label>Active</label>
+                <select value={relationshipActive ? "1" : "0"} onChange={(e) => setRelationshipActive(e.target.value === "1")}>
+                  <option value="1">Yes</option>
+                  <option value="0">No</option>
+                </select>
+              </div>
+              <div className="col-2">
+                <label>&nbsp;</label>
+                <button onClick={saveRelationship}>{relationshipId ? "Update" : "Create"}</button>
+              </div>
+              <div className="col-2">
+                <label>&nbsp;</label>
+                <button className="secondary" onClick={clearRelationshipForm}>
+                  Clear
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="card">
+            <h3>Relationships ({filteredRelationships.length})</h3>
+            <div className="scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Left</th>
+                    <th>Right</th>
+                    <th>Confidence</th>
+                    <th>Method</th>
+                    <th>Active</th>
+                    <th>Updated</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredRelationships.map((r) => (
+                    <tr key={r.id}>
+                      <td>{r.id}</td>
+                      <td>{`${r.left_dataset}.${relationshipFieldLabel(r, "left")}`}</td>
+                      <td>{`${r.right_dataset}.${relationshipFieldLabel(r, "right")}`}</td>
+                      <td>{r.confidence}</td>
+                      <td>{r.method}</td>
+                      <td>{r.active ? "Yes" : "No"}</td>
+                      <td>{r.updated_at}</td>
+                      <td>
+                        <div className="actions">
+                          <button className="secondary" onClick={() => editRelationship(r)}>
+                            Edit
+                          </button>
+                          <button className="danger" onClick={() => removeRelationship(r.id)}>
                             Delete
                           </button>
                         </div>

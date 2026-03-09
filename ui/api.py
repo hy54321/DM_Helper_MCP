@@ -15,6 +15,7 @@ from server import comparison as comp
 from server import db
 from server import jobs as job_svc
 from server import profile as prof
+from server import relationships as rel
 from server.query_engine import connect, quote
 from server.sql_guard import validate as sql_validate
 
@@ -22,7 +23,14 @@ from server.sql_guard import validate as sql_validate
 class RefreshCatalogRequest(BaseModel):
     source_folder: Optional[str] = None
     target_folder: Optional[str] = None
+    report_folder: Optional[str] = None
     include_row_counts: bool = False
+
+
+class SaveFoldersRequest(BaseModel):
+    source_folder: str = ""
+    target_folder: str = ""
+    report_folder: str = ""
 
 
 class PairOverrideRequest(BaseModel):
@@ -73,6 +81,25 @@ class QuickCompareRequest(BaseModel):
     sample_limit: int = Field(default=10, ge=1, le=100)
 
 
+class RelationshipUpsertRequest(BaseModel):
+    side: str = Field(default="target")
+    left_dataset: str
+    left_field: str = ""
+    left_fields: Optional[List[str]] = None
+    right_dataset: str
+    right_field: str = ""
+    right_fields: Optional[List[str]] = None
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    method: str = Field(default="manual")
+    active: bool = True
+
+
+class RelationshipLinkRequest(BaseModel):
+    side: str = Field(default="target")
+    min_confidence: float = Field(default=0.9, ge=0, le=1)
+    suggest_only: bool = False
+
+
 def _clean_field_mappings(mappings: Optional[List[Dict[str, str]]]) -> Optional[List[Dict[str, str]]]:
     if not mappings:
         return None
@@ -92,6 +119,45 @@ def _datasets_or_404() -> List[Dict[str, Any]]:
     if not datasets:
         raise HTTPException(status_code=400, detail="No datasets loaded. Run catalog refresh first.")
     return datasets
+
+
+def _validate_relationship_payload(conn, payload: RelationshipUpsertRequest) -> tuple[List[str], List[str]]:
+    side = (payload.side or "").strip().lower()
+    if side not in ("source", "target"):
+        raise HTTPException(status_code=400, detail="side must be 'source' or 'target'.")
+
+    left = db.get_dataset(conn, payload.left_dataset)
+    right = db.get_dataset(conn, payload.right_dataset)
+    if not left:
+        raise HTTPException(status_code=404, detail=f"Left dataset '{payload.left_dataset}' not found.")
+    if not right:
+        raise HTTPException(status_code=404, detail=f"Right dataset '{payload.right_dataset}' not found.")
+    if left["side"] != side or right["side"] != side:
+        raise HTTPException(status_code=400, detail="Both datasets must belong to the selected side.")
+    left_fields = [f.strip() for f in (payload.left_fields or []) if f and f.strip()]
+    right_fields = [f.strip() for f in (payload.right_fields or []) if f and f.strip()]
+    if not left_fields and payload.left_field.strip():
+        left_fields = [payload.left_field.strip()]
+    if not right_fields and payload.right_field.strip():
+        right_fields = [payload.right_field.strip()]
+    if not left_fields or not right_fields:
+        raise HTTPException(status_code=400, detail="At least one left and right field are required.")
+    if len(left_fields) != len(right_fields):
+        raise HTTPException(status_code=400, detail="left_fields and right_fields must have the same length.")
+
+    for fld in left_fields:
+        if fld not in left["columns"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{fld}' not found in dataset '{payload.left_dataset}'.",
+            )
+    for fld in right_fields:
+        if fld not in right["columns"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Field '{fld}' not found in dataset '{payload.right_dataset}'.",
+            )
+    return left_fields, right_fields
 
 
 app = FastAPI(title="DM Helper Admin UI", version="0.1.0")
@@ -117,8 +183,24 @@ def get_folders() -> Dict[str, str]:
     conn = db.get_connection()
     source = db.get_meta(conn, "source_folder", "") or ""
     target = db.get_meta(conn, "target_folder", "") or ""
+    report = db.get_meta(conn, "report_folder", "") or ""
     conn.close()
-    return {"source_folder": source, "target_folder": target}
+    return {"source_folder": source, "target_folder": target, "report_folder": report}
+
+
+@app.post("/api/settings/folders")
+def save_folders(req: SaveFoldersRequest) -> Dict[str, str]:
+    source = (req.source_folder or "").strip()
+    target = (req.target_folder or "").strip()
+    report = (req.report_folder or "").strip()
+    conn = db.get_connection()
+    try:
+        db.set_meta(conn, "source_folder", source, commit=False)
+        db.set_meta(conn, "target_folder", target, commit=False)
+        db.set_meta(conn, "report_folder", report, commit=False)
+    finally:
+        conn.close()
+    return {"source_folder": source, "target_folder": target, "report_folder": report}
 
 
 @app.get("/api/system/browse-folder")
@@ -149,11 +231,18 @@ def browse_folder(initial: Optional[str] = None) -> Dict[str, str]:
 
 @app.post("/api/catalog/refresh")
 def refresh_catalog(req: RefreshCatalogRequest) -> Dict[str, Any]:
-    return cat.refresh_catalog(
-        source_folder=req.source_folder,
-        target_folder=req.target_folder,
-        include_row_counts=req.include_row_counts,
-    )
+    conn = db.get_connection()
+    try:
+        if req.report_folder is not None:
+            db.set_meta(conn, "report_folder", (req.report_folder or "").strip(), commit=False)
+        return cat.refresh_catalog(
+            source_folder=req.source_folder,
+            target_folder=req.target_folder,
+            include_row_counts=req.include_row_counts,
+            conn=conn,
+        )
+    finally:
+        conn.close()
 
 
 @app.get("/api/datasets")
@@ -355,6 +444,92 @@ def save_key_preset(pair_id: str, req: SaveKeyPresetRequest) -> Dict[str, Any]:
     return {"preset_id": preset_id, "pair_id": pair_id, "name": req.name, "key_fields": fields}
 
 
+@app.get("/api/relationships")
+def list_relationships(
+    side: Optional[str] = None,
+    dataset_id: Optional[str] = None,
+    active_only: bool = False,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    conn = db.get_connection()
+    rows = db.list_relationships(
+        conn,
+        side=side,
+        dataset_id=dataset_id,
+        active_only=active_only,
+        limit=limit,
+    )
+    conn.close()
+    return rows
+
+
+@app.post("/api/relationships")
+def create_relationship(req: RelationshipUpsertRequest) -> Dict[str, Any]:
+    conn = db.get_connection()
+    left_fields, right_fields = _validate_relationship_payload(conn, req)
+    row = db.upsert_relationship(
+        conn,
+        side=req.side.strip().lower(),
+        left_dataset=req.left_dataset,
+        left_field=left_fields[0],
+        left_fields=left_fields,
+        right_dataset=req.right_dataset,
+        right_field=right_fields[0],
+        right_fields=right_fields,
+        confidence=req.confidence,
+        method=req.method.strip() or "manual",
+        active=req.active,
+    )
+    conn.close()
+    return row
+
+
+@app.put("/api/relationships/{relationship_id}")
+def update_relationship(relationship_id: int, req: RelationshipUpsertRequest) -> Dict[str, Any]:
+    conn = db.get_connection()
+    if not db.get_relationship(conn, relationship_id):
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Relationship '{relationship_id}' not found.")
+    left_fields, right_fields = _validate_relationship_payload(conn, req)
+    row = db.update_relationship(
+        conn,
+        relationship_id=relationship_id,
+        side=req.side.strip().lower(),
+        left_dataset=req.left_dataset,
+        left_field=left_fields[0],
+        right_dataset=req.right_dataset,
+        right_field=right_fields[0],
+        confidence=req.confidence,
+        method=req.method.strip() or "manual",
+        active=req.active,
+        left_fields=left_fields,
+        right_fields=right_fields,
+    )
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Relationship '{relationship_id}' not found.")
+    return row
+
+
+@app.delete("/api/relationships/{relationship_id}")
+def delete_relationship(relationship_id: int) -> Dict[str, Any]:
+    conn = db.get_connection()
+    ok = db.delete_relationship(conn, relationship_id)
+    conn.close()
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Relationship '{relationship_id}' not found.")
+    return {"deleted": relationship_id}
+
+
+@app.post("/api/relationships/link-related")
+def link_related_tables(req: RelationshipLinkRequest) -> Dict[str, Any]:
+    return rel.link_related_tables(
+        side=req.side,
+        min_confidence=req.min_confidence,
+        suggest_only=req.suggest_only,
+    )
+
+
 @app.get("/api/schema-diff")
 def schema_diff(source_dataset_id: str, target_dataset_id: str) -> Dict[str, Any]:
     return cat.schema_diff(source_dataset_id, target_dataset_id)
@@ -456,9 +631,10 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
 
 
 @app.get("/api/reports")
-def list_reports() -> List[Dict[str, Any]]:
+def list_reports(limit: int = 5) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 500))
     conn = db.get_connection()
-    rows = db.list_reports(conn)
+    rows = db.list_reports(conn, limit=limit)
     conn.close()
     return rows
 

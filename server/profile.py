@@ -112,6 +112,7 @@ def column_value_summary(
     if not ds:
         return {"error": f"Dataset '{dataset_id}' not found."}
 
+    top_n = max(1, min(int(top_n), HARD_CAP))
     columns = [column] if column else ds["columns"]
     datasets = [ds]
 
@@ -119,6 +120,13 @@ def column_value_summary(
 
     with connect(datasets) as duck:
         view = quote(dataset_id)
+        table_ref = view
+        try:
+            temp_table = quote("__tmp_column_value_summary")
+            duck.execute(f"CREATE TEMP TABLE {temp_table} AS SELECT * FROM {view}")
+            table_ref = temp_table
+        except Exception:
+            table_ref = view
 
         for col in columns:
             if col not in ds["columns"]:
@@ -128,25 +136,40 @@ def column_value_summary(
             try:
                 rows = duck.execute(
                     f"""
-                    SELECT CAST({qc} AS VARCHAR) AS value,
-                           COUNT(*) AS cnt
-                    FROM {view}
-                    GROUP BY {qc}
+                    WITH grouped AS (
+                        SELECT
+                            CAST({qc} AS VARCHAR) AS value,
+                            COUNT(*) AS cnt
+                        FROM {table_ref}
+                        GROUP BY {qc}
+                    ),
+                    ranked AS (
+                        SELECT
+                            value,
+                            cnt,
+                            SUM(
+                                CASE
+                                    WHEN value IS NULL OR TRIM(value) = '' THEN cnt
+                                    ELSE 0
+                                END
+                            ) OVER () AS blank_or_null_count,
+                            ROW_NUMBER() OVER (ORDER BY cnt DESC) AS rn
+                        FROM grouped
+                    )
+                    SELECT value, cnt, blank_or_null_count
+                    FROM ranked
+                    WHERE rn <= {top_n}
                     ORDER BY cnt DESC
-                    LIMIT {int(top_n)}
                     """
                 ).fetchall()
-                blank_row = duck.execute(
-                    f"""
-                    SELECT COUNT(*) FROM {view}
-                    WHERE TRIM(CAST({qc} AS VARCHAR)) = '' OR {qc} IS NULL
-                    """
-                ).fetchone()
+                blank_or_null_count = 0
+                if rows and rows[0][2] is not None:
+                    blank_or_null_count = rows[0][2]
                 result["summaries"].append(
                     {
                         "column": col,
                         "top_values": [{"value": r[0], "count": r[1]} for r in rows],
-                        "blank_or_null_count": blank_row[0] if blank_row else 0,
+                        "blank_or_null_count": blank_or_null_count,
                     }
                 )
             except Exception as exc:
@@ -312,30 +335,37 @@ def find_duplicates(
         )
         rows = duck.execute(
             f"""
-            SELECT {sel}, COUNT(*) AS dup_count
-            FROM {view}
-            GROUP BY {grp}
-            HAVING COUNT(*) > 1
+            WITH dup AS (
+                SELECT {sel}, COUNT(*) AS dup_count
+                FROM {view}
+                GROUP BY {grp}
+                HAVING COUNT(*) > 1
+            ),
+            ranked AS (
+                SELECT
+                    *,
+                    COUNT(*) OVER () AS total_dup_groups,
+                    ROW_NUMBER() OVER (ORDER BY dup_count DESC) AS rn
+                FROM dup
+            )
+            SELECT {grp}, dup_count, total_dup_groups
+            FROM ranked
+            WHERE rn <= {limit}
             ORDER BY dup_count DESC
-            LIMIT {limit}
             """
         ).fetchall()
 
-        total_dup_groups = duck.execute(
-            f"""
-            SELECT COUNT(*) FROM (
-                SELECT {grp} FROM {view}
-                GROUP BY {grp}
-                HAVING COUNT(*) > 1
-            )
-            """
-        ).fetchone()[0]
-
     dup_rows = []
+    total_dup_groups = 0
+    if rows:
+        total_dup_groups = rows[0][len(key_columns) + 1] or 0
+
     for r in rows:
         entry = {key_columns[i]: r[i] for i in range(len(key_columns))}
-        entry["duplicate_count"] = r[len(key_columns)]
-        dup_rows.append(entry)
+        dup_count = r[len(key_columns)]
+        if dup_count is not None:
+            entry["duplicate_count"] = dup_count
+            dup_rows.append(entry)
 
     return {
         "dataset": dataset_id,
@@ -442,35 +472,56 @@ def suggest_keys(
     with connect(datasets) as duck:
         src_view = quote(src["id"])
         tgt_view = quote(tgt["id"])
+        src_table = src_view
+        tgt_table = tgt_view
 
+        # Materialize source/target once to avoid repeatedly scanning files.
+        try:
+            src_temp = quote("__tmp_suggest_keys_src")
+            tgt_temp = quote("__tmp_suggest_keys_tgt")
+            duck.execute(f"CREATE TEMP TABLE {src_temp} AS SELECT * FROM {src_view}")
+            duck.execute(f"CREATE TEMP TABLE {tgt_temp} AS SELECT * FROM {tgt_view}")
+            src_table = src_temp
+            tgt_table = tgt_temp
+        except Exception:
+            src_table = src_view
+            tgt_table = tgt_view
+
+        src_total = duck.execute(f"SELECT COUNT(*) FROM {src_table}").fetchone()[0]
+        tgt_total = duck.execute(f"SELECT COUNT(*) FROM {tgt_table}").fetchone()[0]
+        if src_total == 0 or tgt_total == 0:
+            return {
+                "pair_id": pair_id,
+                "source": src["id"],
+                "target": tgt["id"],
+                "candidates": [],
+            }
+
+        src_exprs: List[str] = []
+        tgt_exprs: List[str] = []
         for col in common:
             qc = quote(col)
+            src_exprs.append(
+                f"SUM(CASE WHEN TRIM(CAST({qc} AS VARCHAR)) <> '' THEN 1 ELSE 0 END) "
+                f"AS {quote(f'{col}__non_blank')}"
+            )
+            src_exprs.append(f"COUNT(DISTINCT {qc}) AS {quote(f'{col}__distinct')}")
+            tgt_exprs.append(
+                f"SUM(CASE WHEN TRIM(CAST({qc} AS VARCHAR)) <> '' THEN 1 ELSE 0 END) "
+                f"AS {quote(f'{col}__non_blank')}"
+            )
+            tgt_exprs.append(f"COUNT(DISTINCT {qc}) AS {quote(f'{col}__distinct')}")
+
+        src_stats = duck.execute(f"SELECT {', '.join(src_exprs)} FROM {src_table}").fetchone()
+        tgt_stats = duck.execute(f"SELECT {', '.join(tgt_exprs)} FROM {tgt_table}").fetchone()
+
+        for i, col in enumerate(common):
+            qc = quote(col)
             try:
-                # Source stats
-                sr = duck.execute(
-                    f"""
-                    SELECT COUNT(*) AS total,
-                           COUNT({qc}) AS non_null,
-                           COUNT(DISTINCT {qc}) AS distinct_count
-                    FROM {src_view}
-                    """
-                ).fetchone()
-
-                # Target stats
-                tr = duck.execute(
-                    f"""
-                    SELECT COUNT(*) AS total,
-                           COUNT({qc}) AS non_null,
-                           COUNT(DISTINCT {qc}) AS distinct_count
-                    FROM {tgt_view}
-                    """
-                ).fetchone()
-
-                src_total, src_nn, src_dist = sr[0], sr[1], sr[2]
-                tgt_total, tgt_nn, tgt_dist = tr[0], tr[1], tr[2]
-
-                if src_total == 0 or tgt_total == 0:
-                    continue
+                src_non_blank = src_stats[i * 2]
+                src_dist = src_stats[i * 2 + 1]
+                tgt_non_blank = tgt_stats[i * 2]
+                tgt_dist = tgt_stats[i * 2 + 1]
 
                 # Uniqueness score (0-1)
                 src_uniq = src_dist / src_total if src_total else 0
@@ -478,35 +529,25 @@ def suggest_keys(
                 uniq_score = (src_uniq + tgt_uniq) / 2
 
                 # Completeness score (0-1)
-                src_comp = src_nn / src_total if src_total else 0
-                tgt_comp = tgt_nn / tgt_total if tgt_total else 0
+                src_comp = src_non_blank / src_total if src_total else 0
+                tgt_comp = tgt_non_blank / tgt_total if tgt_total else 0
                 comp_score = (src_comp + tgt_comp) / 2
 
                 # Overlap score: intersection of distinct values / union
                 overlap_row = duck.execute(
                     f"""
                     SELECT COUNT(*) FROM (
-                        SELECT DISTINCT CAST({qc} AS VARCHAR) FROM {src_view}
+                        SELECT DISTINCT CAST({qc} AS VARCHAR) FROM {src_table}
                         WHERE {qc} IS NOT NULL
                         INTERSECT
-                        SELECT DISTINCT CAST({qc} AS VARCHAR) FROM {tgt_view}
+                        SELECT DISTINCT CAST({qc} AS VARCHAR) FROM {tgt_table}
                         WHERE {qc} IS NOT NULL
                     )
                     """
                 ).fetchone()
-                union_row = duck.execute(
-                    f"""
-                    SELECT COUNT(*) FROM (
-                        SELECT DISTINCT CAST({qc} AS VARCHAR) FROM {src_view}
-                        WHERE {qc} IS NOT NULL
-                        UNION
-                        SELECT DISTINCT CAST({qc} AS VARCHAR) FROM {tgt_view}
-                        WHERE {qc} IS NOT NULL
-                    )
-                    """
-                ).fetchone()
+                union_count = (src_dist + tgt_dist - overlap_row[0]) if overlap_row else 0
                 overlap_score = (
-                    overlap_row[0] / union_row[0] if union_row[0] else 0
+                    overlap_row[0] / union_count if union_count else 0
                 )
 
                 # Combined score
