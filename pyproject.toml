@@ -10,7 +10,17 @@ dependencies = [
     "fastapi>=0.115.0",
     "mcp[cli]>=1.8.0",
     "openpyxl>=3.1.0",
+    "pywebview>=5.4",
     "prompt-toolkit>=3.0.51",
     "python-dotenv>=1.1.0",
     "uvicorn>=0.34.0",
+    "cryptography>=44.0.0",
 ]
+
+[project.optional-dependencies]
+desktop-build = [
+    "pyinstaller>=6.10.0",
+]
+
+[project.scripts]
+dm-helper-desktop = "desktop_app:main"

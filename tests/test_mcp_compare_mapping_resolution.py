@@ -64,6 +64,20 @@ PAIR = {
 
 
 class TestMcpCompareMappingResolution(unittest.TestCase):
+    @patch("mcp_server.cat.refresh_catalog")
+    def test_refresh_catalog_tool_uses_saved_folders_only(self, mock_refresh):
+        mock_refresh.return_value = {"ok": True}
+
+        result = mcp_server.refresh_catalog(include_row_counts=True)
+
+        parsed = json.loads(result)
+        self.assertEqual(parsed, {"ok": True})
+        mock_refresh.assert_called_once_with(include_row_counts=True)
+
+    def test_refresh_catalog_tool_rejects_folder_arguments(self):
+        with self.assertRaises(TypeError):
+            mcp_server.refresh_catalog(source_folder="C:/tmp/source")
+
     @patch("mcp_server.comp.compare_datasets")
     @patch("mcp_server.cat.get_pair_by_datasets")
     def test_compare_tables_resolves_source_key_names(self, mock_get_pair, mock_compare):

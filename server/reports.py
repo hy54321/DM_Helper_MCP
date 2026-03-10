@@ -338,11 +338,12 @@ def export_query_to_xlsx(
     headers: List[str],
     rows: List[list],
     filename: Optional[str] = None,
+    sql_query: Optional[str] = None,
     conn=None,
 ) -> Dict[str, Any]:
     """Write arbitrary query results to an XLSX file."""
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles import Alignment, Font, PatternFill
 
     filename = _normalize_report_filename(
         filename=filename,
@@ -373,6 +374,14 @@ def export_query_to_xlsx(
             except Exception:
                 pass
         ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+
+    sql_sheet = wb.create_sheet("SQL")
+    sql_sheet.append(["SQL Query"])
+    sql_sheet["A1"].font = header_font
+    sql_sheet["A1"].fill = header_fill
+    sql_sheet["A2"] = (sql_query or "").strip()
+    sql_sheet["A2"].alignment = Alignment(wrap_text=True, vertical="top")
+    sql_sheet.column_dimensions["A"].width = 120
 
     wb.save(file_path)
 

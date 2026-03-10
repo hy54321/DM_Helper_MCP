@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+import csv
+import json
 import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, IO, List, Optional
+from urllib.parse import urlparse, urlunparse
 
+import logging
+
+from anthropic import Anthropic
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from mcp_server import mcp as _mcp_instance
 from server import catalog as cat
 from server import comparison as comp
 from server import db
@@ -18,6 +32,34 @@ from server import profile as prof
 from server import relationships as rel
 from server.query_engine import connect, quote
 from server.sql_guard import validate as sql_validate
+
+_log = logging.getLogger(__name__)
+
+# ── MCP tool bridge helpers ───────────────────────────────────────────────────
+_MAX_TOOL_ROUNDS = 25  # safeguard against infinite tool loops
+
+
+def _get_anthropic_tools() -> List[Dict[str, Any]]:
+    """Return MCP-registered tools in the Anthropic tool-definition format."""
+    tools: List[Dict[str, Any]] = []
+    for tool in _mcp_instance._tool_manager._tools.values():
+        tools.append({
+            "name": tool.name,
+            "description": tool.description or "",
+            "input_schema": tool.parameters,
+        })
+    return tools
+
+
+def _call_mcp_tool(name: str, arguments: Dict[str, Any]) -> str:
+    """Invoke a registered MCP tool function by *name* and return its string result."""
+    tool = _mcp_instance._tool_manager._tools.get(name)
+    if not tool:
+        return json.dumps({"error": f"Tool '{name}' not found."})
+    try:
+        return tool.fn(**arguments)
+    except Exception as exc:
+        return json.dumps({"error": f"Tool '{name}' failed: {exc}"})
 
 
 class RefreshCatalogRequest(BaseModel):
@@ -100,6 +142,766 @@ class RelationshipLinkRequest(BaseModel):
     suggest_only: bool = False
 
 
+class SaveAppSettingsRequest(BaseModel):
+    theme: str = "light"
+    anthropic_api_key: Optional[str] = None
+    model: str = ""
+    claude_instructions: str = ""
+
+
+class ValidateAnthropicKeyRequest(BaseModel):
+    api_key: str = ""
+
+
+class LookupAnthropicModelsRequest(BaseModel):
+    api_key: str = ""
+
+
+class ClaudeChatHistoryMessage(BaseModel):
+    role: str = "user"
+    content: str = ""
+
+
+class ClaudeChatRequest(BaseModel):
+    message: str = ""
+    history: List[ClaudeChatHistoryMessage] = Field(default_factory=list)
+
+
+@dataclass
+class ManagedService:
+    process: subprocess.Popen
+    log_handle: IO[str]
+    log_file: str
+    started_at: str
+    service_url: Optional[str] = None
+    log_offset: int = 0
+
+
+_DESKTOP_SERVICES = ("mcp_server", "mcp_inspector", "ngrok")
+_SERVICE_LOCK = threading.RLock()
+_SERVICE_STATE: Dict[str, ManagedService] = {}
+_SERVICE_ERRORS: Dict[str, str] = {name: "" for name in _DESKTOP_SERVICES}
+_ALLOWED_THEMES = {"light", "dark"}
+_SETTINGS_THEME_KEY = "ui_theme"
+_SETTINGS_ANTHROPIC_API_KEY = "anthropic_api_key_encrypted"
+_SETTINGS_ANTHROPIC_MODEL_KEY = "anthropic_model"
+_SETTINGS_ANTHROPIC_MODELS_CACHE_KEY = "anthropic_models_cache_json"
+_SETTINGS_ANTHROPIC_ACTIVATED_KEY = "anthropic_api_key_activated"
+_SETTINGS_CLAUDE_INSTRUCTIONS_KEY = "claude_system_instructions"
+_SETTINGS_ENCRYPTION_KEY_FILE = ".dmh_settings.key"
+
+
+def _desktop_mode_enabled() -> bool:
+    return os.getenv("DMH_DESKTOP_MODE", "0") == "1"
+
+
+def _app_base_dir() -> Path:
+    raw = os.getenv("DMH_APP_BASE_DIR", "").strip()
+    if raw:
+        return Path(raw).resolve()
+    return Path.cwd()
+
+
+def _iso_utc_now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _mcp_port() -> int:
+    for key in ("DMH_MCP_PORT", "MCP_PORT", "FASTMCP_PORT"):
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if 1 <= value <= 65535:
+            return value
+    return 8000
+
+
+def _resolve_ngrok_executable(base_dir: Path) -> str:
+    configured = os.getenv("NGROK_PATH", "").strip()
+    if configured:
+        path = Path(configured)
+        if path.exists():
+            return str(path)
+        raise RuntimeError(f"NGROK_PATH does not exist: {configured}")
+
+    local_name = "ngrok.exe" if os.name == "nt" else "ngrok"
+    local_path = base_dir / local_name
+    if local_path.exists():
+        return str(local_path)
+
+    path_lookup = shutil.which("ngrok")
+    if path_lookup:
+        return path_lookup
+
+    raise RuntimeError("ngrok executable not found. Place ngrok.exe next to the app or set NGROK_PATH.")
+
+
+def _resolve_npx_executable() -> str:
+    for name in ("npx.cmd", "npx.exe", "npx"):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise RuntimeError("npx not found. Install Node.js or add npx to PATH.")
+
+
+def _extract_inspector_url_from_log(log_file: str, min_offset: int = 0) -> Optional[str]:
+    try:
+        with open(log_file, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            start = max(size - 65536, 0, int(min_offset))
+            handle.seek(start, os.SEEK_SET)
+            payload = handle.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+    # Prefer URLs explicitly printed by inspector startup output.
+    ready_urls = re.findall(
+        r"MCP Inspector is up and running at:\s*(https?://(?:localhost|127\.0\.0\.1):\d+(?:/\?[^ \r\n]+)?)",
+        payload,
+        flags=re.IGNORECASE,
+    )
+    if ready_urls:
+        return ready_urls[-1]
+
+    token_urls = re.findall(
+        r"https?://localhost:\d+/\?MCP_PROXY_AUTH_TOKEN=[^ \r\n]+",
+        payload,
+    )
+    if token_urls:
+        return token_urls[-1]
+
+    base_urls = re.findall(r"https?://localhost:\d+", payload)
+    if base_urls:
+        return base_urls[-1]
+    return None
+
+
+def _wait_for_inspector_url(
+    log_file: str, timeout_seconds: float = 8.0, min_offset: int = 0
+) -> Optional[str]:
+    import time
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        url = _extract_inspector_url_from_log(log_file, min_offset=min_offset)
+        if url:
+            return url
+        time.sleep(0.2)
+    return None
+
+
+def _wait_for_http_ready(url: str, timeout_seconds: float = 8.0) -> bool:
+    import time
+    import urllib.error
+    import urllib.request
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=1.5) as response:
+                if 200 <= response.status < 500:
+                    return True
+        except urllib.error.HTTPError as exc:
+            if 200 <= int(getattr(exc, "code", 0)) < 500:
+                return True
+            time.sleep(0.2)
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.2)
+    return False
+
+
+def _mcp_server_url() -> str:
+    return f"http://127.0.0.1:{_mcp_port()}/mcp"
+
+
+def _inspector_base_url() -> str:
+    return "http://localhost:6274"
+
+
+def _append_mcp_suffix(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+
+    path = (parsed.path or "").rstrip("/")
+    if not path.endswith("/mcp"):
+        path = f"{path}/mcp" if path else "/mcp"
+
+    return urlunparse(parsed._replace(path=path))
+
+
+def _discover_ngrok_public_mcp_url(timeout_seconds: float = 1.5) -> str:
+    import urllib.error
+    import urllib.request
+
+    for port in (4040, 4041):
+        api_url = f"http://127.0.0.1:{port}/api/tunnels"
+        try:
+            with urllib.request.urlopen(api_url, timeout=timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+        except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+            continue
+
+        tunnels = payload.get("tunnels") if isinstance(payload, dict) else None
+        if not isinstance(tunnels, list):
+            continue
+
+        https_url = ""
+        fallback_url = ""
+        for item in tunnels:
+            if not isinstance(item, dict):
+                continue
+            public_url = str(item.get("public_url") or "").strip()
+            if not public_url:
+                continue
+            if public_url.startswith("https://"):
+                https_url = public_url
+                break
+            if not fallback_url:
+                fallback_url = public_url
+
+        chosen = https_url or fallback_url
+        if chosen:
+            with_suffix = _append_mcp_suffix(chosen)
+            if with_suffix:
+                return with_suffix
+
+    return ""
+
+
+def _is_port_listening(host: str, port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.4)
+        return sock.connect_ex((host, port)) == 0
+
+
+def _service_command(service_name: str) -> tuple[List[str], Dict[str, str]]:
+    base_dir = _app_base_dir()
+    mcp_port = str(_mcp_port())
+    env_overrides: Dict[str, str] = {}
+
+    if service_name == "mcp_server":
+        if getattr(sys, "frozen", False):
+            command = [sys.executable, "--service", "mcp-server"]
+        else:
+            command = [sys.executable, str(base_dir / "mcp_server.py")]
+        env_overrides = {
+            "MCP_TRANSPORT": "streamable-http",
+            "FASTMCP_HOST": os.getenv("FASTMCP_HOST", "127.0.0.1"),
+            "FASTMCP_PORT": mcp_port,
+            "DMH_MCP_MODE": os.getenv("DMH_MCP_MODE", "prod"),
+        }
+        return command, env_overrides
+
+    if service_name == "mcp_inspector":
+        npx_exe = _resolve_npx_executable()
+        server_url = f"http://127.0.0.1:{mcp_port}/mcp"
+        command = [
+            npx_exe,
+            "@modelcontextprotocol/inspector",
+            "--transport",
+            "http",
+            "--server-url",
+            server_url,
+        ]
+        env_overrides = {
+            "MCP_AUTO_OPEN_ENABLED": "false",
+        }
+        return command, env_overrides
+
+    if service_name == "ngrok":
+        ngrok_exe = _resolve_ngrok_executable(base_dir)
+        command = [ngrok_exe, "http", mcp_port]
+        return command, {}
+
+    raise ValueError(f"Unsupported service '{service_name}'")
+
+
+def _cleanup_if_exited(service_name: str) -> None:
+    service = _SERVICE_STATE.get(service_name)
+    if not service:
+        return
+    return_code = service.process.poll()
+    if return_code is None:
+        return
+    _SERVICE_ERRORS[service_name] = f"Exited with code {return_code}. Check logs."
+    try:
+        service.log_handle.close()
+    except Exception:
+        pass
+    _SERVICE_STATE.pop(service_name, None)
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    pid = process.pid
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except Exception:
+            pass
+    try:
+        process.terminate()
+        process.wait(timeout=8)
+    except Exception:
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _list_listening_pids_on_port(port: int) -> List[int]:
+    if port < 1 or port > 65535:
+        return []
+
+    pids: List[int] = []
+    if os.name == "nt":
+        # Prefer PowerShell TCP connection API first; it is more robust than netstat parsing.
+        ps_script = (
+            "$ErrorActionPreference='SilentlyContinue';"
+            f"Get-NetTCPConnection -LocalPort {port} -State Listen | "
+            "Select-Object -ExpandProperty OwningProcess"
+        )
+        try:
+            output = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            for row in output.splitlines():
+                row = row.strip()
+                if row.isdigit():
+                    pids.append(int(row))
+            if pids:
+                return sorted(set(pids))
+        except Exception:
+            pass
+
+        try:
+            output = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return []
+
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            if parts[0].upper() != "TCP":
+                continue
+            local_addr = parts[1]
+            pid_text = parts[-1]
+            match = re.search(r":(\d+)$", local_addr)
+            if not match:
+                continue
+            try:
+                line_port = int(match.group(1))
+                pid = int(pid_text)
+            except Exception:
+                continue
+            if line_port == port and pid > 0:
+                pids.append(pid)
+        return sorted(set(pids))
+
+    # Best-effort non-Windows fallback.
+    try:
+        output = subprocess.check_output(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        for row in output.splitlines():
+            row = row.strip()
+            if row.isdigit():
+                pids.append(int(row))
+    except Exception:
+        pass
+    return sorted(set(pids))
+
+
+def _list_process_pids_by_name(process_names: List[str]) -> List[int]:
+    names = {str(name or "").strip().lower() for name in process_names if str(name or "").strip()}
+    if not names:
+        return []
+
+    pids: List[int] = []
+    if os.name == "nt":
+        try:
+            output = subprocess.check_output(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return []
+        for row in csv.reader(output.splitlines()):
+            if len(row) < 2:
+                continue
+            image_name = str(row[0] or "").strip().lower()
+            pid_text = str(row[1] or "").strip()
+            if image_name in names and pid_text.isdigit():
+                pids.append(int(pid_text))
+        return sorted(set(pids))
+
+    try:
+        output = subprocess.check_output(
+            ["ps", "-eo", "pid=,comm="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    for line in output.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, command_name = parts
+        if not pid_text.isdigit():
+            continue
+        name = command_name.strip().lower()
+        if name in names:
+            pids.append(int(pid_text))
+    return sorted(set(pids))
+
+
+def _list_ngrok_pids() -> List[int]:
+    return _list_process_pids_by_name(["ngrok.exe", "ngrok"])
+
+
+def _terminate_pid_tree(pid: int) -> bool:
+    if pid <= 0 or pid == os.getpid():
+        return False
+
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:
+            return False
+
+    try:
+        os.kill(pid, 15)
+        return True
+    except Exception:
+        return False
+
+
+def _extract_port_from_url(service_url: Optional[str]) -> Optional[int]:
+    raw = (service_url or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+        if port and 1 <= int(port) <= 65535:
+            return int(port)
+    except Exception:
+        return None
+    return None
+
+
+def _ports_for_force_stop(service_name: str, hinted_url: Optional[str] = None) -> List[int]:
+    if service_name == "mcp_server":
+        return [_mcp_port()]
+    if service_name == "mcp_inspector":
+        ports: List[int] = []
+        hinted_port = _extract_port_from_url(hinted_url)
+        if hinted_port:
+            ports.append(hinted_port)
+        ports.extend([6277, 6274])
+        return sorted(set(p for p in ports if 1 <= p <= 65535))
+    if service_name == "ngrok":
+        return [4040, 4041]
+    return []
+
+
+def _force_stop_service(service_name: str) -> Dict[str, Any]:
+    if service_name not in _DESKTOP_SERVICES:
+        raise ValueError(f"Unsupported service '{service_name}'")
+
+    with _SERVICE_LOCK:
+        hinted_url: Optional[str] = None
+        if service_name == "mcp_inspector":
+            current = _SERVICE_STATE.get(service_name)
+            hinted_url = current.service_url if current else None
+            if not hinted_url:
+                hinted_url = _extract_inspector_url_from_log(
+                    str(_app_base_dir() / "logs" / "mcp_inspector.log")
+                ) or _inspector_base_url()
+
+        # Stop managed process first (if this app started it).
+        _stop_service(service_name)
+
+        killed_pids: List[int] = []
+        checked_ports = _ports_for_force_stop(service_name, hinted_url=hinted_url)
+        for port in checked_ports:
+            port_pids = _list_listening_pids_on_port(port)
+            for pid in port_pids:
+                if _terminate_pid_tree(pid):
+                    killed_pids.append(pid)
+        if service_name == "ngrok":
+            for pid in _list_ngrok_pids():
+                if _terminate_pid_tree(pid):
+                    killed_pids.append(pid)
+
+        # Re-evaluate and refresh state after force kill attempts.
+        snapshot = _service_snapshot(service_name)
+        if killed_pids:
+            _SERVICE_ERRORS[service_name] = ""
+            snapshot["last_error"] = ""
+        return {
+            "service": snapshot,
+            "killed_pids": sorted(set(killed_pids)),
+            "checked_ports": checked_ports,
+        }
+
+
+def _service_snapshot(service_name: str) -> Dict[str, Any]:
+    if service_name not in _DESKTOP_SERVICES:
+        raise ValueError(f"Unsupported service '{service_name}'")
+    with _SERVICE_LOCK:
+        _cleanup_if_exited(service_name)
+        service = _SERVICE_STATE.get(service_name)
+        running = bool(service and service.process.poll() is None)
+        external_pid: Optional[int] = None
+        service_url = service.service_url if service else None
+        if running and service_name == "mcp_server":
+            service_url = _mcp_server_url()
+        if running and service_name == "mcp_inspector" and service and not service_url:
+            service_url = _extract_inspector_url_from_log(service.log_file, min_offset=service.log_offset)
+            if service_url:
+                service.service_url = service_url
+        if not running and service_name == "mcp_server":
+            mcp_url = _mcp_server_url()
+            if _wait_for_http_ready(mcp_url, timeout_seconds=0.8):
+                running = True
+                service_url = mcp_url
+                if not _SERVICE_ERRORS.get(service_name):
+                    _SERVICE_ERRORS[service_name] = (
+                        "MCP server is already running in another process; reusing existing endpoint."
+                    )
+        if not running and service_name == "mcp_inspector":
+            inspector_base = _inspector_base_url()
+            if _wait_for_http_ready(inspector_base, timeout_seconds=0.8):
+                running = True
+                service_url = _extract_inspector_url_from_log(
+                    str(_app_base_dir() / "logs" / "mcp_inspector.log")
+                ) or inspector_base
+                if not _SERVICE_ERRORS.get(service_name):
+                    _SERVICE_ERRORS[service_name] = (
+                        "MCP inspector is already running in another process; reusing existing endpoint."
+                    )
+        if not running and service_name == "ngrok":
+            ngrok_pids = _list_ngrok_pids()
+            if ngrok_pids:
+                running = True
+                external_pid = ngrok_pids[0]
+                if not _SERVICE_ERRORS.get(service_name):
+                    _SERVICE_ERRORS[service_name] = (
+                        "ngrok is already running in another process; reusing existing tunnel process."
+                    )
+        if running and service_name == "ngrok":
+            ngrok_url = _discover_ngrok_public_mcp_url(timeout_seconds=1.0)
+            if ngrok_url:
+                service_url = ngrok_url
+                if service and service.process.poll() is None:
+                    service.service_url = ngrok_url
+        if service_name == "mcp_inspector" and not service_url:
+            service_url = "http://localhost:6274"
+        reported_port: Optional[int] = None
+        if service_name == "mcp_server":
+            reported_port = _mcp_port()
+        elif service_name == "ngrok":
+            reported_port = _mcp_port()
+        elif service_name == "mcp_inspector":
+            reported_port = _extract_port_from_url(service_url) or 6274
+        return {
+            "name": service_name,
+            "running": running,
+            "pid": service.process.pid if running and service else external_pid,
+            "started_at": service.started_at if running and service else None,
+            "log_file": service.log_file if service else None,
+            "last_error": _SERVICE_ERRORS.get(service_name, ""),
+            "port": reported_port,
+            "service_url": service_url,
+        }
+
+
+def _start_service(service_name: str) -> Dict[str, Any]:
+    if service_name not in _DESKTOP_SERVICES:
+        raise ValueError(f"Unsupported service '{service_name}'")
+
+    with _SERVICE_LOCK:
+        _cleanup_if_exited(service_name)
+        current = _SERVICE_STATE.get(service_name)
+        if current and current.process.poll() is None:
+            return _service_snapshot(service_name)
+
+        if service_name == "mcp_server":
+            mcp_url = _mcp_server_url()
+            if _wait_for_http_ready(mcp_url, timeout_seconds=1.0):
+                return _service_snapshot(service_name)
+            mcp_port = _mcp_port()
+            if _is_port_listening("127.0.0.1", mcp_port):
+                raise RuntimeError(
+                    f"Port {mcp_port} is already in use by another process; unable to start managed MCP server."
+                )
+
+        if service_name == "mcp_inspector":
+            inspector_base = _inspector_base_url()
+            if _wait_for_http_ready(inspector_base, timeout_seconds=1.0):
+                return _service_snapshot(service_name)
+            if _is_port_listening("127.0.0.1", 6277):
+                raise RuntimeError(
+                    "Inspector proxy port 6277 is already in use by another process; unable to start managed inspector."
+                )
+            _start_service("mcp_server")
+            mcp_url = _mcp_server_url()
+            if not _wait_for_http_ready(mcp_url, timeout_seconds=10.0):
+                raise RuntimeError(f"MCP server did not become ready at {mcp_url}.")
+        if service_name == "ngrok":
+            if _list_ngrok_pids():
+                return _service_snapshot(service_name)
+
+        command, env_overrides = _service_command(service_name)
+        base_dir = _app_base_dir()
+        log_dir = base_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{service_name}.log"
+        log_handle = open(log_file, "a", encoding="utf-8")
+        log_offset = log_handle.tell()
+        log_handle.write(f"\n[{_iso_utc_now()}] START {' '.join(command)}\n")
+        log_handle.flush()
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        env = os.environ.copy()
+        env.update(env_overrides)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(base_dir),
+                env=env,
+                stdout=log_handle,
+                stderr=log_handle,
+                creationflags=creation_flags,
+            )
+        except Exception:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+            raise
+        service = ManagedService(
+            process=process,
+            log_handle=log_handle,
+            log_file=str(log_file),
+            started_at=_iso_utc_now(),
+            service_url=None,
+            log_offset=log_offset,
+        )
+        _SERVICE_STATE[service_name] = service
+        if service_name == "mcp_server":
+            mcp_url = _mcp_server_url()
+            if not _wait_for_http_ready(mcp_url, timeout_seconds=10.0):
+                _cleanup_if_exited(service_name)
+                raise RuntimeError(f"MCP server did not become ready at {mcp_url}. Check logs.")
+        if service_name == "mcp_inspector":
+            inspector_url = (
+                _wait_for_inspector_url(str(log_file), min_offset=log_offset) or "http://localhost:6274"
+            )
+            if not _wait_for_http_ready(inspector_url, timeout_seconds=10.0):
+                _cleanup_if_exited(service_name)
+                raise RuntimeError(f"MCP inspector did not become ready at {inspector_url}. Check logs.")
+            service.service_url = inspector_url
+        _SERVICE_ERRORS[service_name] = ""
+        return _service_snapshot(service_name)
+
+
+def _stop_service(service_name: str) -> Dict[str, Any]:
+    if service_name not in _DESKTOP_SERVICES:
+        raise ValueError(f"Unsupported service '{service_name}'")
+
+    with _SERVICE_LOCK:
+        if service_name == "mcp_server":
+            _stop_service("mcp_inspector")
+
+        _cleanup_if_exited(service_name)
+        service = _SERVICE_STATE.get(service_name)
+        if not service:
+            if service_name == "mcp_inspector":
+                inspector_base = _inspector_base_url()
+                if _wait_for_http_ready(inspector_base, timeout_seconds=1.0):
+                    _SERVICE_ERRORS[service_name] = (
+                        "MCP inspector is running externally and cannot be stopped from this app instance."
+                    )
+            if service_name == "ngrok":
+                if _list_ngrok_pids():
+                    _SERVICE_ERRORS[service_name] = (
+                        "ngrok is running externally and cannot be stopped from this app instance."
+                    )
+            if service_name == "mcp_server":
+                mcp_url = _mcp_server_url()
+                if _wait_for_http_ready(mcp_url, timeout_seconds=1.0):
+                    _SERVICE_ERRORS[service_name] = (
+                        "MCP server is running externally and cannot be stopped from this app instance."
+                    )
+            return _service_snapshot(service_name)
+
+        try:
+            _terminate_process_tree(service.process)
+        finally:
+            try:
+                service.log_handle.write(f"[{_iso_utc_now()}] STOP\n")
+                service.log_handle.flush()
+            except Exception:
+                pass
+            try:
+                service.log_handle.close()
+            except Exception:
+                pass
+            _SERVICE_STATE.pop(service_name, None)
+
+        return _service_snapshot(service_name)
+
+
+def stop_managed_services() -> None:
+    for service_name in list(_DESKTOP_SERVICES):
+        try:
+            _stop_service(service_name)
+        except Exception:
+            pass
+
+
 def _clean_field_mappings(mappings: Optional[List[Dict[str, str]]]) -> Optional[List[Dict[str, str]]]:
     if not mappings:
         return None
@@ -119,6 +921,239 @@ def _datasets_or_404() -> List[Dict[str, Any]]:
     if not datasets:
         raise HTTPException(status_code=400, detail="No datasets loaded. Run catalog refresh first.")
     return datasets
+
+
+def _get_saved_folders() -> Dict[str, str]:
+    conn = db.get_connection()
+    try:
+        source = (db.get_meta(conn, "source_folder", "") or "").strip()
+        target = (db.get_meta(conn, "target_folder", "") or "").strip()
+        report = (db.get_meta(conn, "report_folder", "") or "").strip()
+        return {"source_folder": source, "target_folder": target, "report_folder": report}
+    finally:
+        conn.close()
+
+
+def _normalize_theme(theme: str) -> str:
+    val = (theme or "").strip().lower()
+    if val in _ALLOWED_THEMES:
+        return val
+    return "light"
+
+
+def _settings_encryption_key_file_path() -> Path:
+    return _app_base_dir() / _SETTINGS_ENCRYPTION_KEY_FILE
+
+
+def _settings_cipher() -> Fernet:
+    env_key = os.getenv("DMH_SETTINGS_ENCRYPTION_KEY", "").strip()
+    if env_key:
+        try:
+            return Fernet(env_key.encode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError("DMH_SETTINGS_ENCRYPTION_KEY is invalid.") from exc
+
+    key_file = _settings_encryption_key_file_path()
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    if key_file.exists():
+        raw_key = key_file.read_text(encoding="utf-8").strip()
+        try:
+            return Fernet(raw_key.encode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Settings key file is invalid: {key_file}. Remove it and re-enter the API key."
+            ) from exc
+
+    key = Fernet.generate_key()
+    key_file.write_text(key.decode("utf-8"), encoding="utf-8")
+    if os.name != "nt":
+        try:
+            os.chmod(key_file, 0o600)
+        except Exception:
+            pass
+    return Fernet(key)
+
+
+def _encrypt_secret(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    token = _settings_cipher().encrypt(raw.encode("utf-8"))
+    return token.decode("utf-8")
+
+
+def _decrypt_secret(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    try:
+        token = _settings_cipher().decrypt(raw.encode("utf-8"))
+    except InvalidToken as exc:
+        raise RuntimeError("Stored secret could not be decrypted with current settings key.") from exc
+    return token.decode("utf-8")
+
+
+def _mask_secret(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 8:
+        return "*" * len(raw)
+    return f"{raw[:6]}...{raw[-4:]}"
+
+
+def _read_stored_anthropic_key(conn) -> tuple[str, bool]:
+    encrypted = (db.get_meta(conn, _SETTINGS_ANTHROPIC_API_KEY, "") or "").strip()
+    if not encrypted:
+        return "", False
+    try:
+        return _decrypt_secret(encrypted), True
+    except RuntimeError:
+        return "", True
+
+
+def _require_stored_anthropic_key(conn) -> str:
+    key, configured = _read_stored_anthropic_key(conn)
+    if key:
+        return key
+    if configured:
+        raise RuntimeError("Stored Anthropic API key cannot be decrypted. Please set it again.")
+    return ""
+
+
+def _list_anthropic_models(api_key: str, limit: int = 100) -> List[Dict[str, str]]:
+    key = (api_key or "").strip()
+    if not key:
+        raise RuntimeError("Anthropic API key is required.")
+
+    try:
+        client = Anthropic(api_key=key, timeout=20.0)
+        page = client.models.list(limit=max(1, min(int(limit), 100)))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to fetch Anthropic models: {exc}") from exc
+
+    raw_items = getattr(page, "data", None)
+    if raw_items is None:
+        raw_items = list(page)
+
+    models: List[Dict[str, str]] = []
+    for item in raw_items or []:
+        model_id = str(getattr(item, "id", "") or "").strip()
+        if not model_id:
+            continue
+        display_name = str(getattr(item, "display_name", "") or model_id).strip() or model_id
+        models.append({"id": model_id, "display_name": display_name})
+
+    models.sort(key=lambda row: row["id"].lower())
+    return models
+
+
+def _load_cached_models(conn) -> List[Dict[str, str]]:
+    raw = (db.get_meta(conn, _SETTINGS_ANTHROPIC_MODELS_CACHE_KEY, "") or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    models: List[Dict[str, str]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        display_name = str(item.get("display_name") or model_id).strip() or model_id
+        models.append({"id": model_id, "display_name": display_name})
+    return models
+
+
+def _save_cached_models(conn, models: List[Dict[str, str]]) -> None:
+    db.set_meta(conn, _SETTINGS_ANTHROPIC_MODELS_CACHE_KEY, json.dumps(models), commit=False)
+
+
+def _is_anthropic_key_activated(conn) -> bool:
+    raw = (db.get_meta(conn, _SETTINGS_ANTHROPIC_ACTIVATED_KEY, "0") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _set_anthropic_key_activated(conn, activated: bool) -> None:
+    db.set_meta(conn, _SETTINGS_ANTHROPIC_ACTIVATED_KEY, "1" if activated else "0", commit=False)
+
+
+def _prepare_claude_history(history: List[ClaudeChatHistoryMessage]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for item in history or []:
+        role = (item.role or "").strip().lower()
+        if role not in ("user", "assistant"):
+            continue
+        content = (item.content or "").strip()
+        if not content:
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def _text_from_anthropic_message(message: Any) -> str:
+    parts: List[str] = []
+    for block in getattr(message, "content", []) or []:
+        if getattr(block, "type", "") != "text":
+            continue
+        text = str(getattr(block, "text", "") or "").strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _get_saved_app_settings() -> Dict[str, Any]:
+    conn = db.get_connection()
+    try:
+        theme = _normalize_theme((db.get_meta(conn, _SETTINGS_THEME_KEY, "light") or "light"))
+        model = (db.get_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, "") or "").strip()
+        claude_instructions = (db.get_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, "") or "").strip()
+        models = _load_cached_models(conn)
+        key, configured = _read_stored_anthropic_key(conn)
+        needs_reset = bool(configured and not key)
+        activated = bool(configured and key and _is_anthropic_key_activated(conn))
+        masked = _mask_secret(key) if key else ("configured" if needs_reset else "")
+        return {
+            "theme": theme,
+            "model": model,
+            "models": models,
+            "anthropic_api_key_set": configured,
+            "anthropic_api_key_masked": masked,
+            "anthropic_api_key_needs_reset": needs_reset,
+            "anthropic_api_key_activated": activated,
+            "claude_instructions": claude_instructions,
+        }
+    finally:
+        conn.close()
+
+
+def _validate_service_start_folders(service_name: str) -> None:
+    if service_name not in ("mcp_server", "mcp_inspector"):
+        return
+
+    folders = _get_saved_folders()
+    source = folders["source_folder"]
+    target = folders["target_folder"]
+    report = folders["report_folder"]
+    if not source or not target or not report:
+        raise RuntimeError(
+            "Select source, target, and report folders first in Catalog before starting MCP server or inspector."
+        )
+
+    invalid: List[str] = []
+    if not os.path.isdir(source):
+        invalid.append(f"source: {source}")
+    if not os.path.isdir(target):
+        invalid.append(f"target: {target}")
+    if not os.path.isdir(report):
+        invalid.append(f"report: {report}")
+    if invalid:
+        raise RuntimeError("Configured folders do not exist: " + "; ".join(invalid))
 
 
 def _validate_relationship_payload(conn, payload: RelationshipUpsertRequest) -> tuple[List[str], List[str]]:
@@ -178,14 +1213,69 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/system/services")
+def list_system_services() -> Dict[str, Any]:
+    services = {name: _service_snapshot(name) for name in _DESKTOP_SERVICES}
+    return {
+        "desktop_mode": _desktop_mode_enabled(),
+        "services": services,
+        "ui": {
+            "running": True,
+            "host": os.getenv("UI_HOST", "127.0.0.1"),
+            "port": os.getenv("UI_PORT", "8001"),
+        },
+    }
+
+
+@app.post("/api/system/services/{service_name}/start")
+def start_system_service(service_name: str) -> Dict[str, Any]:
+    if not _desktop_mode_enabled():
+        raise HTTPException(status_code=400, detail="Service controls are available only in desktop mode.")
+    if service_name not in _DESKTOP_SERVICES:
+        raise HTTPException(status_code=404, detail=f"Unknown service '{service_name}'.")
+    try:
+        _validate_service_start_folders(service_name)
+    except RuntimeError as exc:
+        _SERVICE_ERRORS[service_name] = str(exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return {"service": _start_service(service_name)}
+    except Exception as exc:
+        _SERVICE_ERRORS[service_name] = str(exc)
+        raise HTTPException(status_code=500, detail=f"Failed to start {service_name}: {exc}")
+
+
+@app.post("/api/system/services/{service_name}/stop")
+def stop_system_service(service_name: str) -> Dict[str, Any]:
+    if not _desktop_mode_enabled():
+        raise HTTPException(status_code=400, detail="Service controls are available only in desktop mode.")
+    if service_name not in _DESKTOP_SERVICES:
+        raise HTTPException(status_code=404, detail=f"Unknown service '{service_name}'.")
+    try:
+        return {"service": _stop_service(service_name)}
+    except Exception as exc:
+        _SERVICE_ERRORS[service_name] = str(exc)
+        raise HTTPException(status_code=500, detail=f"Failed to stop {service_name}: {exc}")
+
+
+@app.post("/api/system/services/{service_name}/force-stop")
+def force_stop_system_service(service_name: str) -> Dict[str, Any]:
+    if not _desktop_mode_enabled():
+        raise HTTPException(status_code=400, detail="Service controls are available only in desktop mode.")
+    if service_name not in _DESKTOP_SERVICES:
+        raise HTTPException(status_code=404, detail=f"Unknown service '{service_name}'.")
+    if service_name not in ("mcp_server", "mcp_inspector", "ngrok"):
+        raise HTTPException(status_code=400, detail=f"Force stop is not supported for '{service_name}'.")
+    try:
+        return _force_stop_service(service_name)
+    except Exception as exc:
+        _SERVICE_ERRORS[service_name] = str(exc)
+        raise HTTPException(status_code=500, detail=f"Failed to force stop {service_name}: {exc}")
+
+
 @app.get("/api/settings/folders")
 def get_folders() -> Dict[str, str]:
-    conn = db.get_connection()
-    source = db.get_meta(conn, "source_folder", "") or ""
-    target = db.get_meta(conn, "target_folder", "") or ""
-    report = db.get_meta(conn, "report_folder", "") or ""
-    conn.close()
-    return {"source_folder": source, "target_folder": target, "report_folder": report}
+    return _get_saved_folders()
 
 
 @app.post("/api/settings/folders")
@@ -201,6 +1291,194 @@ def save_folders(req: SaveFoldersRequest) -> Dict[str, str]:
     finally:
         conn.close()
     return {"source_folder": source, "target_folder": target, "report_folder": report}
+
+
+@app.get("/api/settings/app")
+def get_app_settings() -> Dict[str, Any]:
+    return _get_saved_app_settings()
+
+
+@app.post("/api/settings/app")
+def save_app_settings(req: SaveAppSettingsRequest) -> Dict[str, Any]:
+    theme = _normalize_theme(req.theme)
+    model = (req.model or "").strip()
+    claude_instructions = (req.claude_instructions or "").strip()
+    api_key_input = req.anthropic_api_key
+
+    conn = db.get_connection()
+    try:
+        db.set_meta(conn, _SETTINGS_THEME_KEY, theme, commit=False)
+        db.set_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, model, commit=False)
+        db.set_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, claude_instructions, commit=False)
+        if api_key_input is not None:
+            encrypted = _encrypt_secret((api_key_input or "").strip())
+            db.set_meta(conn, _SETTINGS_ANTHROPIC_API_KEY, encrypted, commit=False)
+            _set_anthropic_key_activated(conn, False)
+    finally:
+        conn.close()
+
+    return _get_saved_app_settings()
+
+
+@app.post("/api/settings/anthropic/validate")
+def validate_anthropic_key(req: ValidateAnthropicKeyRequest) -> Dict[str, Any]:
+    key = (req.api_key or "").strip()
+    stored_key = ""
+    should_activate = False
+    conn = db.get_connection()
+    try:
+        stored_key, _ = _read_stored_anthropic_key(conn)
+        if key:
+            effective_key = key
+            should_activate = bool(stored_key and stored_key == key)
+        else:
+            effective_key = _require_stored_anthropic_key(conn)
+            should_activate = True
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+    if not effective_key:
+        raise HTTPException(status_code=400, detail="No Anthropic API key provided or stored.")
+
+    try:
+        models = _list_anthropic_models(effective_key, limit=1)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if should_activate:
+        conn = db.get_connection()
+        try:
+            _set_anthropic_key_activated(conn, True)
+        finally:
+            conn.close()
+
+    activated = bool(should_activate)
+    return {
+        "valid": True,
+        "message": (
+            "Anthropic API key is valid and activated."
+            if activated
+            else "Anthropic API key is valid. Save this key first, then validate again to activate."
+        ),
+        "activated": activated,
+        "sample_model": models[0]["id"] if models else None,
+        "app_settings": _get_saved_app_settings(),
+    }
+
+
+@app.post("/api/settings/anthropic/models")
+def lookup_anthropic_models(req: LookupAnthropicModelsRequest) -> Dict[str, Any]:
+    provided_key = (req.api_key or "").strip()
+    selected_model = ""
+    conn = db.get_connection()
+    try:
+        selected_model = (db.get_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, "") or "").strip()
+        if provided_key:
+            effective_key = provided_key
+        else:
+            effective_key = _require_stored_anthropic_key(conn)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+    if not effective_key:
+        raise HTTPException(status_code=400, detail="No Anthropic API key provided or stored.")
+
+    try:
+        models = _list_anthropic_models(effective_key, limit=100)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    conn = db.get_connection()
+    try:
+        _save_cached_models(conn, models)
+    finally:
+        conn.close()
+
+    return {"models": models, "selected_model": selected_model}
+
+
+@app.post("/api/claude/chat")
+def claude_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
+    user_message = (req.message or "").strip()
+    if not user_message:
+        raise HTTPException(status_code=400, detail="Message is required.")
+
+    conn = db.get_connection()
+    try:
+        model = (db.get_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, "") or "").strip()
+        api_key = _require_stored_anthropic_key(conn)
+        activated = _is_anthropic_key_activated(conn)
+        claude_instructions = (db.get_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, "") or "").strip()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No stored Anthropic API key found. Save one in Settings.")
+    if not activated:
+        raise HTTPException(status_code=400, detail="Anthropic API key must be validated before using Claude chat.")
+    if not model:
+        raise HTTPException(status_code=400, detail="No Anthropic model selected. Choose one in Settings.")
+
+    history = _prepare_claude_history(req.history)
+    messages: List[Dict[str, Any]] = [*history, {"role": "user", "content": user_message}]
+    tools = _get_anthropic_tools()
+
+    try:
+        client = Anthropic(api_key=api_key, timeout=120.0)
+
+        for _round in range(_MAX_TOOL_ROUNDS):
+            request_payload: Dict[str, Any] = {
+                "model": model,
+                "max_tokens": 8096,
+                "messages": messages,
+            }
+            if claude_instructions:
+                request_payload["system"] = claude_instructions
+            if tools:
+                request_payload["tools"] = tools
+
+            response = client.messages.create(**request_payload)
+
+            # Append the full assistant message (text + tool_use blocks)
+            messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason != "tool_use":
+                break
+
+            # Execute every tool_use block and build the tool results
+            tool_results: List[Dict[str, Any]] = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                _log.info("Calling MCP tool: %s(%s)", block.name, block.input)
+                result_text = _call_mcp_tool(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Claude chat failed: {exc}")
+
+    assistant_text = _text_from_anthropic_message(response)
+    if not assistant_text:
+        assistant_text = "(Tools executed but Claude returned no text summary.)"
+
+    return {
+        "message": {"role": "assistant", "content": assistant_text},
+        "model": model,
+    }
 
 
 @app.get("/api/system/browse-folder")
@@ -631,8 +1909,11 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
 
 
 @app.get("/api/reports")
-def list_reports(limit: int = 5) -> List[Dict[str, Any]]:
-    limit = max(1, min(int(limit), 500))
+def list_reports(limit: int = 0) -> List[Dict[str, Any]]:
+    if int(limit) > 0:
+        limit = max(1, min(int(limit), 5000))
+    else:
+        limit = 0
     conn = db.get_connection()
     rows = db.list_reports(conn, limit=limit)
     conn.close()
@@ -660,6 +1941,34 @@ def download_report(report_id: str):
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Report file not found: {path}")
     return FileResponse(path, filename=report["file_name"])
+
+
+@app.post("/api/reports/{report_id}/open")
+def open_report(report_id: str) -> Dict[str, Any]:
+    if not _desktop_mode_enabled():
+        raise HTTPException(status_code=400, detail="Opening report files is available only in desktop mode.")
+
+    conn = db.get_connection()
+    report = db.get_report(conn, report_id)
+    conn.close()
+    if not report:
+        raise HTTPException(status_code=404, detail=f"Report '{report_id}' not found.")
+
+    path = report["file_path"]
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Report file not found: {path}")
+
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open report file: {exc}")
+
+    return {"opened": report_id, "file_path": path}
 
 
 @app.delete("/api/reports/{report_id}")

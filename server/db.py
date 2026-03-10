@@ -25,11 +25,17 @@ def _app_base_dir() -> str:
 
 
 def _default_db_path() -> str:
+    override = os.getenv("DMH_DB_PATH", "").strip()
+    if override:
+        return os.path.abspath(override)
     return os.path.join(_app_base_dir(), "dm_helper.db")
 
 
 def get_connection(path: str | None = None) -> sqlite3.Connection:
     db_path = path or _default_db_path()
+    db_dir = os.path.dirname(os.path.abspath(db_path))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -659,12 +665,17 @@ def get_report_by_job(conn: sqlite3.Connection, job_id: str) -> Optional[Dict[st
     return _row_to_report(row)
 
 
-def list_reports(conn: sqlite3.Connection, limit: int = 5) -> List[Dict[str, Any]]:
-    limit = max(1, min(int(limit), 500))
-    rows = conn.execute(
-        "SELECT * FROM reports ORDER BY created_at DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
+def list_reports(conn: sqlite3.Connection, limit: int = 0) -> List[Dict[str, Any]]:
+    if int(limit) > 0:
+        capped_limit = max(1, min(int(limit), 5000))
+        rows = conn.execute(
+            "SELECT * FROM reports ORDER BY created_at DESC LIMIT ?",
+            (capped_limit,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM reports ORDER BY created_at DESC"
+        ).fetchall()
     return [_row_to_report(r) for r in rows]
 
 

@@ -157,14 +157,10 @@ def _resolve_pair_context(
 
 @mcp.tool()
 def refresh_catalog(
-    source_folder: Optional[str] = None,
-    target_folder: Optional[str] = None,
     include_row_counts: bool = False,
 ) -> str:
-    """Scan source/target folders, register datasets, and auto-pair (name + field overlap fallback)."""
+    """Scan saved source/target folders, register datasets, and auto-pair (name + field overlap fallback)."""
     result = cat.refresh_catalog(
-        source_folder=source_folder,
-        target_folder=target_folder,
         include_row_counts=include_row_counts,
     )
     return json.dumps(result, indent=2)
@@ -295,7 +291,7 @@ def export_query(
         except Exception as exc:
             return json.dumps({"error": str(exc)})
 
-    report = rpt.export_query_to_xlsx(headers, rows, filename=filename)
+    report = rpt.export_query_to_xlsx(headers, rows, filename=filename, sql_query=sql)
     return json.dumps(report, indent=2)
 
 

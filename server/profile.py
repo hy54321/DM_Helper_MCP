@@ -204,32 +204,53 @@ def combo_value_summary(
     missing = [c for c in columns if c not in ds["columns"]]
     if missing:
         return {"error": f"Columns not found: {missing}"}
+    top_n = max(1, min(int(top_n), HARD_CAP))
 
     datasets = [ds]
     with connect(datasets) as duck:
         view = quote(dataset_id)
-        sel = ", ".join(f"CAST({quote(c)} AS VARCHAR) AS {quote(c)}" for c in columns)
-        grp = ", ".join(quote(c) for c in columns)
+        transformed_aliases = [f"c_{idx}" for idx in range(len(columns))]
+        sel = ", ".join(
+            f"CASE WHEN {quote(c)} IS NULL OR TRIM(CAST({quote(c)} AS VARCHAR)) = '' THEN '' "
+            f"ELSE TRIM(CAST({quote(c)} AS VARCHAR)) END AS {quote(alias)}"
+            for c, alias in zip(columns, transformed_aliases)
+        )
+        grp = ", ".join(quote(alias) for alias in transformed_aliases)
         rows = duck.execute(
             f"""
-            SELECT {sel}, COUNT(*) AS cnt
-            FROM {view}
+            WITH normalized AS (
+                SELECT {sel}
+                FROM {view}
+            )
+            SELECT {grp}, COUNT(*) AS cnt
+            FROM normalized
             GROUP BY {grp}
-            ORDER BY cnt DESC
-            LIMIT {int(top_n)}
             """
         ).fetchall()
 
-    result_rows = []
+    counts: Dict[str, int] = {}
+    blank_or_null_count = 0
     for r in rows:
-        combo = {columns[i]: r[i] for i in range(len(columns))}
-        combo["count"] = r[len(columns)]
-        result_rows.append(combo)
+        values = [r[i] if r[i] is not None else "" for i in range(len(columns))]
+        count = int(r[len(columns)] or 0)
+        if not any(v != "" for v in values):
+            blank_or_null_count += count
+            continue
+        combo_key = " - ".join(values)
+        counts[combo_key] = counts.get(combo_key, 0) + count
+
+    sorted_items = sorted(counts.items(), key=lambda item: (-item[1], item[0].lower()))
+    top_items = sorted_items[:top_n]
+    result_rows = [{"value": value, "count": cnt} for value, cnt in top_items]
 
     return {
         "dataset": dataset_id,
         "columns": columns,
+        "column": " - ".join(columns),
+        "top_values": [{"value": v, "count": c} for v, c in top_items],
+        "blank_or_null_count": blank_or_null_count,
         "combos": result_rows,
+        "top_n": top_n,
     }
 
 

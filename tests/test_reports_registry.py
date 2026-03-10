@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from openpyxl import load_workbook
+
 from server import db
 from server import reports
 
@@ -36,11 +38,13 @@ class TestReportsRegistry(unittest.TestCase):
         self.assertEqual(len(rows_all), 7)
 
     def test_export_query_registers_report_and_returns_report_id(self) -> None:
+        sql = "SELECT id, name FROM source_customers ORDER BY id"
         with patch("server.reports._reports_dir", return_value=self.tmp.name):
             result = reports.export_query_to_xlsx(
                 headers=["id", "name"],
                 rows=[["1", "Alice"], ["2", "Bob"]],
                 filename="query_test.xlsx",
+                sql_query=sql,
                 conn=self.conn,
             )
 
@@ -53,6 +57,11 @@ class TestReportsRegistry(unittest.TestCase):
         self.assertIsNotNone(stored)
         self.assertEqual(stored["source_dataset"], "query_export")
         self.assertEqual(stored["target_dataset"], "query_export")
+
+        wb = load_workbook(result["file_path"])
+        self.assertIn("SQL", wb.sheetnames)
+        self.assertEqual(wb["SQL"]["A1"].value, "SQL Query")
+        self.assertEqual(wb["SQL"]["A2"].value, sql)
 
     def test_export_column_summary_registers_report_and_returns_report_id(self) -> None:
         summary_result = {

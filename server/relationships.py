@@ -240,6 +240,10 @@ def _sig(side: str, left_ds: str, left_field: str, right_ds: str, right_field: s
     return (side, left_ds, left_field, right_ds, right_field)
 
 
+def _pair_sig(left_ds: str, right_ds: str) -> Tuple[str, str]:
+    return tuple(sorted((left_ds, right_ds)))
+
+
 def link_related_tables(
     side: str = "target",
     min_confidence: float = 0.9,
@@ -275,11 +279,12 @@ def link_related_tables(
             "relationships": [],
         }
 
-    existing = db.list_relationships(conn, side=side, limit=5000)
+    existing = db.list_relationships(conn, side=side, active_only=True, limit=5000)
     existing_sigs = {
         _sig(r["side"], r["left_dataset"], r["left_field"], r["right_dataset"], r["right_field"])
         for r in existing
     }
+    existing_pair_sigs = {_pair_sig(r["left_dataset"], r["right_dataset"]) for r in existing}
 
     suggestions: List[Dict[str, Any]] = []
     applied: List[Dict[str, Any]] = []
@@ -288,6 +293,8 @@ def link_related_tables(
         for j in range(i + 1, len(datasets)):
             left_ds = datasets[i]
             right_ds = datasets[j]
+            if _pair_sig(left_ds["id"], right_ds["id"]) in existing_pair_sigs:
+                continue
             left_cols = left_ds.get("columns", []) or []
             right_cols = right_ds.get("columns", []) or []
             if not left_cols or not right_cols:
