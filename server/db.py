@@ -475,6 +475,11 @@ def delete_all_pairs(conn: sqlite3.Connection) -> int:
     return cur.rowcount
 
 
+def delete_pair(conn: sqlite3.Connection, pair_id: str) -> int:
+    cur = conn.execute("DELETE FROM pairs WHERE id = ?", (pair_id,))
+    conn.commit()
+    return cur.rowcount
+
 # ── Key presets ─────────────────────────────────────────────────
 
 def save_key_preset(
@@ -955,3 +960,4 @@ def delete_relationship(conn: sqlite3.Connection, relationship_id: int) -> bool:
     )
     conn.commit()
     return cur.rowcount > 0
+

@@ -115,8 +115,8 @@ class PairOverrideRequest(BaseModel):
     source_dataset_id: str
     target_dataset_id: str
     enabled: bool = True
-    key_mappings: Optional[List[Dict[str, str]]] = None
-    compare_mappings: Optional[List[Dict[str, str]]] = None
+    key_mappings: Optional[List[Dict[str, Any]]] = None
+    compare_mappings: Optional[List[Dict[str, Any]]] = None
 
 
 class SaveKeyPresetRequest(BaseModel):
@@ -152,8 +152,8 @@ class StartCompareRequest(BaseModel):
     key_fields: List[str] = Field(default_factory=list)
     pair_id: Optional[str] = None
     compare_fields: Optional[List[str]] = None
-    key_mappings: Optional[List[Dict[str, str]]] = None
-    compare_mappings: Optional[List[Dict[str, str]]] = None
+    key_mappings: Optional[List[Dict[str, Any]]] = None
+    compare_mappings: Optional[List[Dict[str, Any]]] = None
 
 
 class QuickCompareRequest(BaseModel):
@@ -161,8 +161,8 @@ class QuickCompareRequest(BaseModel):
     target_dataset_id: str
     key_fields: List[str] = Field(default_factory=list)
     compare_fields: Optional[List[str]] = None
-    key_mappings: Optional[List[Dict[str, str]]] = None
-    compare_mappings: Optional[List[Dict[str, str]]] = None
+    key_mappings: Optional[List[Dict[str, Any]]] = None
+    compare_mappings: Optional[List[Dict[str, Any]]] = None
     sample_limit: int = Field(default=10, ge=1, le=100)
 
 
@@ -1123,15 +1123,32 @@ def stop_managed_services() -> None:
             pass
 
 
-def _clean_field_mappings(mappings: Optional[List[Dict[str, str]]]) -> Optional[List[Dict[str, str]]]:
+def _clean_field_mappings(
+    mappings: Optional[List[Dict[str, Any]]],
+    preserve_metadata: bool = False,
+) -> Optional[List[Dict[str, Any]]]:
     if not mappings:
         return None
-    cleaned: List[Dict[str, str]] = []
+    cleaned: List[Dict[str, Any]] = []
     for m in mappings:
         src = (m.get("source_field") or m.get("source") or "").strip()
         tgt = (m.get("target_field") or m.get("target") or "").strip()
         if src and tgt:
-            cleaned.append({"source_field": src, "target_field": tgt})
+            row: Dict[str, Any] = {"source_field": src, "target_field": tgt}
+            if preserve_metadata:
+                origin_mode = str(m.get("origin_mode") or "manual").strip().lower() or "manual"
+                row["origin_mode"] = origin_mode
+                conf = m.get("confidence")
+                try:
+                    conf_value = float(conf) if conf is not None else None
+                except Exception:
+                    conf_value = None
+                row["confidence"] = conf_value
+                row["is_key_pair"] = bool(m.get("is_key_pair", False))
+                row["low_cardinality"] = bool(m.get("low_cardinality", False))
+                row["use_key"] = bool(m.get("use_key", False))
+                row["use_compare"] = bool(m.get("use_compare", True))
+            cleaned.append(row)
     return cleaned or None
 
 
@@ -2339,8 +2356,8 @@ def upsert_pair_override(req: PairOverrideRequest) -> Dict[str, Any]:
         source_id=req.source_dataset_id,
         target_id=req.target_dataset_id,
         enabled=req.enabled,
-        key_mappings=_clean_field_mappings(req.key_mappings),
-        compare_mappings=_clean_field_mappings(req.compare_mappings),
+        key_mappings=_clean_field_mappings(req.key_mappings, preserve_metadata=True),
+        compare_mappings=_clean_field_mappings(req.compare_mappings, preserve_metadata=True),
     )
 
 
@@ -2351,32 +2368,48 @@ def resolve_pair(source_dataset_id: str, target_dataset_id: str) -> Dict[str, An
 
 
 @app.get("/api/pairs/quick-map")
-def quick_map_pair(source_dataset_id: str, target_dataset_id: str) -> Dict[str, Any]:
-    src = cat.get_dataset(source_dataset_id)
-    tgt = cat.get_dataset(target_dataset_id)
-    if not src:
-        raise HTTPException(status_code=404, detail=f"Source dataset '{source_dataset_id}' not found.")
-    if not tgt:
-        raise HTTPException(status_code=404, detail=f"Target dataset '{target_dataset_id}' not found.")
-
-    tgt_lookup = {c.lower(): c for c in tgt["columns"]}
-    compare_mappings: List[Dict[str, str]] = []
-    for s_col in src["columns"]:
-        t_col = tgt_lookup.get(s_col.lower())
-        if t_col:
-            compare_mappings.append({"source_field": s_col, "target_field": t_col})
-
-    return {
-        "source_dataset_id": source_dataset_id,
-        "target_dataset_id": target_dataset_id,
-        "match_count": len(compare_mappings),
-        "compare_mappings": compare_mappings,
-    }
+def quick_map_pair(
+    source_dataset_id: str,
+    target_dataset_id: str,
+    mode: str = "name",
+    min_confidence: float = 0.75,
+    max_mappings: int = 200,
+) -> Dict[str, Any]:
+    result = cat.suggest_field_mappings(
+        source_id=source_dataset_id,
+        target_id=target_dataset_id,
+        mode=mode,
+        min_confidence=min_confidence,
+        max_mappings=max_mappings,
+    )
+    if "error" in result:
+        message = str(result["error"])
+        status_code = 400
+        if "not found" in message.lower():
+            status_code = 404
+        raise HTTPException(status_code=status_code, detail=message)
+    return result
 
 
 @app.get("/api/pairs/{pair_id}/suggest-keys")
 def suggest_keys(pair_id: str) -> Dict[str, Any]:
     return prof.suggest_keys(pair_id)
+
+
+@app.delete("/api/pairs/{pair_id}/key-mappings")
+def delete_pair_key_mappings(pair_id: str) -> Dict[str, Any]:
+    result = cat.clear_pair_key_mappings(pair_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=str(result["error"]))
+    return result
+
+
+@app.delete("/api/pairs/{pair_id}")
+def delete_pair(pair_id: str) -> Dict[str, Any]:
+    result = cat.delete_pair(pair_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=str(result["error"]))
+    return result
 
 
 @app.get("/api/pairs/{pair_id}/key-presets")

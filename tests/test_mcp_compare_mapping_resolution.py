@@ -10,7 +10,11 @@ if "mcp.server.fastmcp" not in sys.modules:
 
     class _FakeFastMCP:
         def __init__(self, *_args, **_kwargs):
-            pass
+            class _FakeToolManager:
+                def __init__(self):
+                    self._tools = {}
+
+            self._tool_manager = _FakeToolManager()
 
         def tool(self):
             def _decorator(fn):

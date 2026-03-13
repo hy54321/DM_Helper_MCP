@@ -326,6 +326,22 @@ function App() {
   const [compareSampleTab, setCompareSampleTab] = useState("added");
   const [quickMapChoiceOpen, setQuickMapChoiceOpen] = useState(false);
   const [quickMapPendingMappings, setQuickMapPendingMappings] = useState([]);
+  const [quickMapPendingLabel, setQuickMapPendingLabel] = useState("suggested");
+  const [pairKeyDeleteModal, setPairKeyDeleteModal] = useState({
+    open: false,
+    pairId: "",
+    sourceDataset: "",
+    targetDataset: "",
+    keyCount: 0,
+    busy: false,
+  });
+  const [pairDeleteModal, setPairDeleteModal] = useState({
+    open: false,
+    pairId: "",
+    sourceDataset: "",
+    targetDataset: "",
+    busy: false,
+  });
   const [jobSummary, setJobSummary] = useState(null);
   const [sqlText, setSqlText] = useState("");
   const [sqlLimit, setSqlLimit] = useState(100);
@@ -583,12 +599,19 @@ function App() {
       const sourceField = m.source_field || m.source;
       const targetField = m.target_field || m.target;
       if (!sourceField || !targetField) continue;
-      rows.push({
-        source_field: sourceField,
-        target_field: targetField,
-        use_key: keySig.has(`${sourceField}|||${targetField}`),
-        use_compare: true,
-      });
+      rows.push(
+        mappingRowFromPayload(
+          {
+            ...m,
+            source_field: sourceField,
+            target_field: targetField,
+          },
+          {
+            use_key: keySig.has(`${sourceField}|||${targetField}`),
+            use_compare: true,
+          }
+        )
+      );
     }
     for (const m of pair.key_mappings || []) {
       const sourceField = m.source_field || m.source;
@@ -596,7 +619,19 @@ function App() {
       if (!sourceField || !targetField) continue;
       const exists = rows.some((r) => r.source_field === sourceField && r.target_field === targetField);
       if (!exists) {
-        rows.push({ source_field: sourceField, target_field: targetField, use_key: true, use_compare: false });
+        rows.push(
+          mappingRowFromPayload(
+            {
+              ...m,
+              source_field: sourceField,
+              target_field: targetField,
+            },
+            {
+              use_key: true,
+              use_compare: false,
+            }
+          )
+        );
       }
     }
     setFieldMappings(rows);
@@ -1174,20 +1209,39 @@ function App() {
     return String(name || "").trim().toLowerCase();
   }
 
-  function buildQuickMappings(sourceCols, targetCols) {
-    const targetLookup = new Map(targetCols.map((c) => [normalizeFieldName(c), c]));
-    const results = [];
-    for (const sourceField of sourceCols) {
-      const targetField = targetLookup.get(normalizeFieldName(sourceField));
-      if (!targetField) continue;
-      results.push({
-        source_field: sourceField,
-        target_field: targetField,
-        use_key: false,
-        use_compare: true,
-      });
+  function normalizeOriginMode(value) {
+    const mode = String(value || "").trim().toLowerCase();
+    if (mode === "name" || mode === "content" || mode === "manual") {
+      return mode;
     }
-    return results;
+    return "manual";
+  }
+
+  function normalizeConfidence(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(0, Math.min(1, n));
+  }
+
+  function mappingRowFromPayload(mapping, defaults = {}) {
+    const sourceField = mapping?.source_field || mapping?.source || "";
+    const targetField = mapping?.target_field || mapping?.target || "";
+    const originMode = normalizeOriginMode(mapping?.origin_mode || defaults.origin_mode || "manual");
+    const confidence = originMode === "content" ? normalizeConfidence(mapping?.confidence) : null;
+    const keyHint = Boolean(mapping?.is_key_pair || mapping?.key_pair || mapping?.key_candidate);
+    const useKeyDefault = defaults.use_key !== undefined ? Boolean(defaults.use_key) : false;
+    const useCompareDefault = defaults.use_compare !== undefined ? Boolean(defaults.use_compare) : true;
+    return {
+      source_field: sourceField,
+      target_field: targetField,
+      use_key: mapping?.use_key === undefined ? useKeyDefault || keyHint : Boolean(mapping.use_key),
+      use_compare: mapping?.use_compare === undefined ? useCompareDefault : Boolean(mapping.use_compare),
+      origin_mode: originMode,
+      confidence,
+      is_key_pair: keyHint,
+      low_cardinality: Boolean(mapping?.low_cardinality),
+    };
   }
 
   function hasExistingMappings(rows = fieldMappings) {
@@ -1221,49 +1275,112 @@ function App() {
     if (mode === "cancel") {
       setQuickMapChoiceOpen(false);
       setQuickMapPendingMappings([]);
-      setStatus("Quick map cancelled.");
+      setQuickMapPendingLabel("suggested");
+      setStatus("Mapping suggestion cancelled.");
       return;
     }
     if (mode === "override") {
       setFieldMappings(mapped);
       setQuickMapChoiceOpen(false);
       setQuickMapPendingMappings([]);
-      setStatus(`Quick-mapped ${mapped.length} same-name field(s). Existing mappings were overridden.`);
+      setQuickMapPendingLabel("suggested");
+      setStatus(`Applied ${mapped.length} ${quickMapPendingLabel} mapping(s). Existing mappings were overridden.`);
       return;
     }
     const { merged, addedCount, existingCount } = mergeQuickMappings(fieldMappings, mapped);
     setFieldMappings(merged);
     setQuickMapChoiceOpen(false);
     setQuickMapPendingMappings([]);
+    setQuickMapPendingLabel("suggested");
     setStatus(
-      `Quick-mapped ${mapped.length} same-name field(s). Added ${addedCount} new mapping(s); kept ${existingCount} existing row(s).`
+      `Applied ${mapped.length} ${quickMapPendingLabel} mapping(s). Added ${addedCount} new mapping(s); kept ${existingCount} existing row(s).`
     );
   }
 
-  function applyQuickMappings() {
+  async function applyNameMappings() {
     setError("");
-    const src = datasets.find((d) => d.id === sourceDataset);
-    const tgt = datasets.find((d) => d.id === targetDataset);
-    if (!src || !tgt) {
+    if (!sourceDataset || !targetDataset) {
       setError("Select source and target datasets first.");
       return;
     }
-    const mapped = buildQuickMappings(src.columns || [], tgt.columns || []);
-    if (!mapped.length) {
-      setStatus("No same-name fields found to quick-map.");
+    setStatus("Suggesting name-based mappings...");
+    try {
+      const result = await api(
+        `/api/pairs/quick-map?source_dataset_id=${encodeURIComponent(sourceDataset)}&target_dataset_id=${encodeURIComponent(
+          targetDataset
+        )}&mode=name`
+      );
+      const mapped = Array.isArray(result?.compare_mappings)
+        ? result.compare_mappings.map((m) => mappingRowFromPayload(m, { use_compare: true }))
+        : [];
+      if (!mapped.length) {
+        setStatus("No same-name fields found.");
+        return;
+      }
+      if (pairId || hasExistingMappings()) {
+        setQuickMapPendingMappings(mapped);
+        setQuickMapPendingLabel("name-based");
+        setQuickMapChoiceOpen(true);
+        return;
+      }
+      setFieldMappings(mapped);
+      const keyMarked = mapped.filter((m) => m.use_key).length;
+      setStatus(`Suggested ${mapped.length} name-based mapping(s). Key-marked: ${keyMarked}.`);
+    } catch (err) {
+      setError(err.message);
+      setStatus("Name-based mapping suggestion failed.");
+    }
+  }
+
+  async function applyContentAwareMappings() {
+    setError("");
+    if (!sourceDataset || !targetDataset) {
+      setError("Select source and target datasets first.");
       return;
     }
-    if (pairId || hasExistingMappings()) {
-      setQuickMapPendingMappings(mapped);
-      setQuickMapChoiceOpen(true);
-      return;
+    setStatus("Suggesting content-aware mappings...");
+    try {
+      const result = await api(
+        `/api/pairs/quick-map?source_dataset_id=${encodeURIComponent(sourceDataset)}&target_dataset_id=${encodeURIComponent(
+          targetDataset
+        )}&mode=content&min_confidence=0.6`
+      );
+      const mapped = Array.isArray(result?.compare_mappings)
+        ? result.compare_mappings.map((m) => mappingRowFromPayload(m, { use_compare: true }))
+        : [];
+      if (!mapped.length) {
+        setStatus("No high-confidence content-aware mappings found.");
+        return;
+      }
+      if (pairId || hasExistingMappings()) {
+        setQuickMapPendingMappings(mapped);
+        setQuickMapPendingLabel("content-aware");
+        setQuickMapChoiceOpen(true);
+        return;
+      }
+      setFieldMappings(mapped);
+      const keyMarked = mapped.filter((m) => m.use_key).length;
+      setStatus(`Suggested ${mapped.length} content-aware mapping(s). Key-marked: ${keyMarked}.`);
+    } catch (err) {
+      setError(err.message);
+      setStatus("Content-aware mapping suggestion failed.");
     }
-    setFieldMappings(mapped);
-    setStatus(`Quick-mapped ${mapped.length} same-name field(s). Mark key fields as needed.`);
   }
 
   function addMappingRow() {
-    setFieldMappings((prev) => [...prev, { source_field: "", target_field: "", use_key: false, use_compare: true }]);
+    setFieldMappings((prev) => [
+      ...prev,
+      {
+        source_field: "",
+        target_field: "",
+        use_key: false,
+        use_compare: true,
+        origin_mode: "manual",
+        confidence: null,
+        is_key_pair: false,
+        low_cardinality: false,
+      },
+    ]);
   }
 
   function removeMappingRow(index) {
@@ -1271,17 +1388,159 @@ function App() {
   }
 
   function updateMappingRow(index, patch) {
-    setFieldMappings((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+    const normalizedPatch = { ...patch };
+    if (Object.prototype.hasOwnProperty.call(normalizedPatch, "origin_mode")) {
+      normalizedPatch.origin_mode = normalizeOriginMode(normalizedPatch.origin_mode);
+      if (normalizedPatch.origin_mode !== "content") {
+        normalizedPatch.confidence = null;
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(normalizedPatch, "confidence")) {
+      normalizedPatch.confidence = normalizeConfidence(normalizedPatch.confidence);
+    }
+    setFieldMappings((prev) =>
+      prev.map((row, i) => {
+        if (i !== index) return row;
+        return { ...row, ...normalizedPatch };
+      })
+    );
+  }
+
+  function closePairKeyDeleteModal() {
+    setPairKeyDeleteModal((prev) => {
+      if (prev.busy) return prev;
+      return {
+        open: false,
+        pairId: "",
+        sourceDataset: "",
+        targetDataset: "",
+        keyCount: 0,
+        busy: false,
+      };
+    });
+  }
+
+  function onDeletePairKeyMappings(pair) {
+    if (!pair?.id) return;
+    const keyCount = Array.isArray(pair.key_mappings) ? pair.key_mappings.length : 0;
+    if (!keyCount) {
+      setStatus(`Pair ${pair.id} has no saved key mappings to clear.`);
+      return;
+    }
+    setPairKeyDeleteModal({
+      open: true,
+      pairId: pair.id,
+      sourceDataset: pair.source_dataset || "",
+      targetDataset: pair.target_dataset || "",
+      keyCount,
+      busy: false,
+    });
+  }
+
+  async function confirmDeletePairKeyMappings() {
+    if (!pairKeyDeleteModal.pairId || pairKeyDeleteModal.busy) return;
+    setPairKeyDeleteModal((prev) => ({ ...prev, busy: true }));
+    setError("");
+    setStatus(`Clearing key mappings from ${pairKeyDeleteModal.pairId}...`);
+    try {
+      const result = await api(`/api/pairs/${encodeURIComponent(pairKeyDeleteModal.pairId)}/key-mappings`, {
+        method: "DELETE",
+      });
+      await refreshBootstrap();
+      setStatus(`Cleared key mappings for ${result.pair_id}.`);
+      setPairKeyDeleteModal({
+        open: false,
+        pairId: "",
+        sourceDataset: "",
+        targetDataset: "",
+        keyCount: 0,
+        busy: false,
+      });
+    } catch (err) {
+      setError(err.message);
+      setStatus("Clearing key mappings failed.");
+      setPairKeyDeleteModal((prev) => ({ ...prev, busy: false }));
+    }
+  }
+
+  function closePairDeleteModal() {
+    setPairDeleteModal((prev) => {
+      if (prev.busy) return prev;
+      return {
+        open: false,
+        pairId: "",
+        sourceDataset: "",
+        targetDataset: "",
+        busy: false,
+      };
+    });
+  }
+
+  function onDeletePair(pair) {
+    if (!pair?.id) return;
+    setPairDeleteModal({
+      open: true,
+      pairId: pair.id,
+      sourceDataset: pair.source_dataset || "",
+      targetDataset: pair.target_dataset || "",
+      busy: false,
+    });
+  }
+
+  async function confirmDeletePair() {
+    if (!pairDeleteModal.pairId || pairDeleteModal.busy) return;
+    setPairDeleteModal((prev) => ({ ...prev, busy: true }));
+    setError("");
+    setStatus(`Deleting pair ${pairDeleteModal.pairId}...`);
+    try {
+      const result = await api(`/api/pairs/${encodeURIComponent(pairDeleteModal.pairId)}`, {
+        method: "DELETE",
+      });
+      await refreshBootstrap();
+      if (pairId === result.pair_id) {
+        setPairId("");
+      }
+      setStatus(`Deleted pair ${result.pair_id}.`);
+      setPairDeleteModal({
+        open: false,
+        pairId: "",
+        sourceDataset: "",
+        targetDataset: "",
+        busy: false,
+      });
+    } catch (err) {
+      setError(err.message);
+      setStatus("Deleting pair failed.");
+      setPairDeleteModal((prev) => ({ ...prev, busy: false }));
+    }
   }
 
   async function savePairMappings() {
     if (!sourceDataset || !targetDataset) return;
     const keyMappings = fieldMappings
       .filter((m) => m.use_key && m.source_field && m.target_field)
-      .map((m) => ({ source_field: m.source_field, target_field: m.target_field }));
+      .map((m) => ({
+        source_field: m.source_field,
+        target_field: m.target_field,
+        origin_mode: normalizeOriginMode(m.origin_mode),
+        confidence: normalizeOriginMode(m.origin_mode) === "content" ? normalizeConfidence(m.confidence) : null,
+        is_key_pair: !!m.is_key_pair,
+        low_cardinality: !!m.low_cardinality,
+        use_key: !!m.use_key,
+        use_compare: !!m.use_compare,
+      }));
     const compareMappings = fieldMappings
       .filter((m) => m.use_compare && m.source_field && m.target_field)
-      .map((m) => ({ source_field: m.source_field, target_field: m.target_field }));
+      .map((m) => ({
+        source_field: m.source_field,
+        target_field: m.target_field,
+        origin_mode: normalizeOriginMode(m.origin_mode),
+        confidence: normalizeOriginMode(m.origin_mode) === "content" ? normalizeConfidence(m.confidence) : null,
+        is_key_pair: !!m.is_key_pair,
+        low_cardinality: !!m.low_cardinality,
+        use_key: !!m.use_key,
+        use_compare: !!m.use_compare,
+      }));
     if (!keyMappings.length) {
       setError("Select at least one key mapping before saving.");
       return;
@@ -1763,7 +2022,7 @@ function App() {
     .map((m, idx) => ({ m, idx }))
     .filter(({ m }) => {
       if (!mappingQuery) return true;
-      return `${m.source_field || ""} ${m.target_field || ""}`.toLowerCase().includes(mappingQuery);
+      return `${m.source_field || ""} ${m.target_field || ""} ${m.origin_mode || ""}`.toLowerCase().includes(mappingQuery);
     });
   const sourceFolderTrimmed = String(sourceFolder || "").trim();
   const targetFolderTrimmed = String(targetFolder || "").trim();
@@ -2665,20 +2924,50 @@ function App() {
                     <th>Pair ID</th>
                     <th>Source Dataset</th>
                     <th>Target Dataset</th>
+                    <th>Key Mappings</th>
                     <th>Auto</th>
                     <th>Enabled</th>
+                    <th>Action</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {pairs.map((p) => (
-                    <tr key={p.id}>
-                      <td>{p.id}</td>
-                      <td>{p.source_dataset}</td>
-                      <td>{p.target_dataset}</td>
-                      <td>{String(p.auto_matched)}</td>
-                      <td>{String(p.enabled)}</td>
-                    </tr>
-                  ))}
+                  {pairs.map((p) => {
+                    const keyCount = Array.isArray(p.key_mappings) ? p.key_mappings.length : 0;
+                    return (
+                      <tr key={p.id}>
+                        <td>{p.id}</td>
+                        <td>{p.source_dataset}</td>
+                        <td>{p.target_dataset}</td>
+                        <td>{keyCount}</td>
+                        <td>{String(p.auto_matched)}</td>
+                        <td>{String(p.enabled)}</td>
+                        <td>
+                          <div style={{ display: "flex", gap: 6, flexWrap: "nowrap", whiteSpace: "nowrap" }}>
+                            <button
+                              type="button"
+                              className="secondary"
+                              onClick={() => onDeletePairKeyMappings(p)}
+                              title={
+                                keyCount > 0
+                                  ? `Clear ${keyCount} saved key mapping(s) for this pair.`
+                                  : "This pair has no saved key mappings."
+                              }
+                            >
+                              Clear Mappings
+                            </button>
+                            <button
+                              type="button"
+                              className="danger"
+                              onClick={() => onDeletePair(p)}
+                              title="Delete this source-target pair."
+                            >
+                              Delete Pair
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -3070,6 +3359,8 @@ function App() {
                       <tr>
                         <th>Source field</th>
                         <th>Target field</th>
+                        <th>Origin mode</th>
+                        <th>Confidence</th>
                         <th>Use as key</th>
                         <th>Use in compare</th>
                         <th>Action</th>
@@ -3106,6 +3397,17 @@ function App() {
                               </select>
                             </td>
                             <td>
+                              <select
+                                value={normalizeOriginMode(m.origin_mode)}
+                                onChange={(e) => updateMappingRow(idx, { origin_mode: e.target.value })}
+                              >
+                                <option value="manual">manual</option>
+                                <option value="name">name</option>
+                                <option value="content">content</option>
+                              </select>
+                            </td>
+                            <td>{normalizeOriginMode(m.origin_mode) === "content" && m.confidence !== null ? Number(m.confidence).toFixed(3) : "-"}</td>
+                            <td>
                               <input
                                 type="checkbox"
                                 className="check-input"
@@ -3130,7 +3432,7 @@ function App() {
                         ))
                       ) : (
                         <tr>
-                          <td colSpan={5}>
+                          <td colSpan={7}>
                             {fieldMappings.length
                               ? "No rows match your search."
                               : "No mappings yet. Use quick map or add rows manually."}
@@ -3143,8 +3445,11 @@ function App() {
               </div>
               <div className="col-12">
                 <div className="actions actions-right">
-                  <button type="button" className="secondary" onClick={applyQuickMappings}>
-                    Quick Map Matching Names
+                  <button type="button" className="secondary" onClick={applyNameMappings}>
+                    Suggest By Name
+                  </button>
+                  <button type="button" className="secondary" onClick={applyContentAwareMappings}>
+                    Suggest By Content
                   </button>
                   <button type="button" className="secondary" onClick={addMappingRow}>
                     Add Mapping Row
@@ -3761,7 +4066,7 @@ function App() {
           <div className="modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
             <h4 style={{ margin: "0 0 6px" }}>Existing mappings detected</h4>
             <div className="sub" style={{ margin: 0 }}>
-              Quick map found {quickMapPendingMappings.length} same-name field(s). Choose how to apply these mappings.
+              Mapping suggestion found {quickMapPendingMappings.length} {quickMapPendingLabel} field pairing(s). Choose how to apply these mappings.
             </div>
             <div className="actions actions-right modal-actions">
               <button type="button" className="secondary" onClick={() => applyQuickMappingsChoice("cancel")}>
@@ -3772,6 +4077,61 @@ function App() {
               </button>
               <button type="button" onClick={() => applyQuickMappingsChoice("override")}>
                 Override Existing Values
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {pairKeyDeleteModal.open ? (
+        <div className="modal-backdrop" onClick={closePairKeyDeleteModal}>
+          <div className="modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ margin: "0 0 6px" }}>Clear Key Mappings</h4>
+            <div className="sub" style={{ margin: "0 0 8px" }}>
+              Remove saved key mappings for this pair.
+            </div>
+            <div className="folder-config-delete-name">{pairKeyDeleteModal.pairId}</div>
+            <div className="sub" style={{ margin: "8px 0 0" }}>
+              Source: {pairKeyDeleteModal.sourceDataset || "-"} | Target: {pairKeyDeleteModal.targetDataset || "-"}
+            </div>
+            <div className="sub" style={{ margin: "6px 0 0" }}>
+              Key mappings to remove: {pairKeyDeleteModal.keyCount}. Compare mappings will stay unchanged.
+            </div>
+            <div className="actions actions-right modal-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={closePairKeyDeleteModal}
+                disabled={pairKeyDeleteModal.busy}
+              >
+                Cancel
+              </button>
+              <button type="button" className="danger" onClick={confirmDeletePairKeyMappings} disabled={pairKeyDeleteModal.busy}>
+                {pairKeyDeleteModal.busy ? "Clearing..." : "Clear Mappings"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {pairDeleteModal.open ? (
+        <div className="modal-backdrop" onClick={closePairDeleteModal}>
+          <div className="modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ margin: "0 0 6px" }}>Delete Pair</h4>
+            <div className="sub" style={{ margin: "0 0 8px" }}>
+              This will remove the pair from the catalog.
+            </div>
+            <div className="folder-config-delete-name">{pairDeleteModal.pairId}</div>
+            <div className="sub" style={{ margin: "8px 0 0" }}>
+              Source: {pairDeleteModal.sourceDataset || "-"} | Target: {pairDeleteModal.targetDataset || "-"}
+            </div>
+            <div className="sub" style={{ margin: "6px 0 0" }}>
+              Saved key/compare mappings and key presets for this pair will be removed.
+            </div>
+            <div className="actions actions-right modal-actions">
+              <button type="button" className="secondary" onClick={closePairDeleteModal} disabled={pairDeleteModal.busy}>
+                Cancel
+              </button>
+              <button type="button" className="danger" onClick={confirmDeletePair} disabled={pairDeleteModal.busy}>
+                {pairDeleteModal.busy ? "Deleting..." : "Delete Pair"}
               </button>
             </div>
           </div>
