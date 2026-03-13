@@ -103,6 +103,14 @@ class SaveFoldersRequest(BaseModel):
     report_folder: str = ""
 
 
+class SaveFolderConfigRequest(BaseModel):
+    name: str = ""
+    source_folder: str = ""
+    target_folder: str = ""
+    report_folder: str = ""
+    set_active: bool = True
+
+
 class PairOverrideRequest(BaseModel):
     source_dataset_id: str
     target_dataset_id: str
@@ -231,6 +239,8 @@ _SETTINGS_NGROK_AUTHTOKEN_KEY = "ngrok_authtoken_encrypted"
 _SETTINGS_MCP_AUTH_MODE_KEY = "mcp_auth_mode"
 _SETTINGS_MCP_API_KEY_KEY = "mcp_api_key_encrypted"
 _MCP_API_KEY_HEADER_NAME = "x-api-key"
+_SETTINGS_FOLDER_CONFIGS_KEY = "folder_configs_json"
+_SETTINGS_ACTIVE_FOLDER_CONFIG_KEY = "active_folder_config_id"
 _SETTINGS_ENCRYPTION_KEY_FILE = ".protoquery_settings.key"
 _LEGACY_SETTINGS_ENCRYPTION_KEY_FILE = ".dmh_settings.key"
 
@@ -1134,15 +1144,96 @@ def _datasets_or_404() -> List[Dict[str, Any]]:
     return datasets
 
 
+def _get_saved_folders_from_conn(conn) -> Dict[str, str]:
+    source = (db.get_meta(conn, "source_folder", "") or "").strip()
+    target = (db.get_meta(conn, "target_folder", "") or "").strip()
+    report = (db.get_meta(conn, "report_folder", "") or "").strip()
+    return {"source_folder": source, "target_folder": target, "report_folder": report}
+
+
 def _get_saved_folders() -> Dict[str, str]:
     conn = db.get_connection()
     try:
-        source = (db.get_meta(conn, "source_folder", "") or "").strip()
-        target = (db.get_meta(conn, "target_folder", "") or "").strip()
-        report = (db.get_meta(conn, "report_folder", "") or "").strip()
-        return {"source_folder": source, "target_folder": target, "report_folder": report}
+        return _get_saved_folders_from_conn(conn)
     finally:
         conn.close()
+
+
+def _normalize_folder_config_name(value: str) -> str:
+    name = re.sub(r"\s+", " ", str(value or "").strip())
+    if not name:
+        raise HTTPException(status_code=400, detail="Folder configuration name is required.")
+    if len(name) > 80:
+        raise HTTPException(status_code=400, detail="Folder configuration name is too long (max 80 characters).")
+    return name
+
+
+def _load_folder_configs_from_conn(conn) -> List[Dict[str, str]]:
+    raw = (db.get_meta(conn, _SETTINGS_FOLDER_CONFIGS_KEY, "") or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+
+    configs: List[Dict[str, str]] = []
+    seen_ids = set()
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        config_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if not config_id or not name or config_id in seen_ids:
+            continue
+        configs.append(
+            {
+                "id": config_id,
+                "name": name,
+                "source_folder": str(item.get("source_folder") or "").strip(),
+                "target_folder": str(item.get("target_folder") or "").strip(),
+                "report_folder": str(item.get("report_folder") or "").strip(),
+                "created_at": str(item.get("created_at") or "").strip(),
+                "updated_at": str(item.get("updated_at") or "").strip(),
+            }
+        )
+        seen_ids.add(config_id)
+
+    configs.sort(key=lambda c: (c["name"].lower(), c["id"]))
+    return configs
+
+
+def _save_folder_configs_to_conn(conn, configs: List[Dict[str, str]], active_id: str) -> str:
+    valid_ids = {cfg["id"] for cfg in configs}
+    next_active = active_id if active_id in valid_ids else ""
+    db.set_meta(conn, _SETTINGS_FOLDER_CONFIGS_KEY, json.dumps(configs), commit=False)
+    db.set_meta(conn, _SETTINGS_ACTIVE_FOLDER_CONFIG_KEY, next_active, commit=False)
+    return next_active
+
+
+def _find_matching_folder_config_id(
+    configs: List[Dict[str, str]],
+    source_folder: str,
+    target_folder: str,
+    report_folder: str,
+) -> str:
+    for cfg in configs:
+        if (
+            cfg["source_folder"] == source_folder
+            and cfg["target_folder"] == target_folder
+            and cfg["report_folder"] == report_folder
+        ):
+            return cfg["id"]
+    return ""
+
+
+def _folder_configs_payload(conn) -> Dict[str, Any]:
+    configs = _load_folder_configs_from_conn(conn)
+    active_id = (db.get_meta(conn, _SETTINGS_ACTIVE_FOLDER_CONFIG_KEY, "") or "").strip()
+    next_active = _save_folder_configs_to_conn(conn, configs, active_id)
+    return {"configs": configs, "active_id": next_active}
 
 
 def _normalize_theme(theme: str) -> str:
@@ -1629,9 +1720,124 @@ def save_folders(req: SaveFoldersRequest) -> Dict[str, str]:
         db.set_meta(conn, "source_folder", source, commit=False)
         db.set_meta(conn, "target_folder", target, commit=False)
         db.set_meta(conn, "report_folder", report, commit=False)
+        configs = _load_folder_configs_from_conn(conn)
+        matching_id = _find_matching_folder_config_id(configs, source, target, report)
+        _save_folder_configs_to_conn(conn, configs, matching_id)
     finally:
         conn.close()
     return {"source_folder": source, "target_folder": target, "report_folder": report}
+
+
+@app.get("/api/settings/folder-configs")
+def list_folder_configs() -> Dict[str, Any]:
+    conn = db.get_connection()
+    try:
+        return _folder_configs_payload(conn)
+    finally:
+        conn.close()
+
+
+@app.post("/api/settings/folder-configs")
+def save_folder_config(req: SaveFolderConfigRequest) -> Dict[str, Any]:
+    name = _normalize_folder_config_name(req.name)
+    source = (req.source_folder or "").strip()
+    target = (req.target_folder or "").strip()
+    report = (req.report_folder or "").strip()
+    set_active = bool(req.set_active)
+
+    conn = db.get_connection()
+    try:
+        now = _iso_utc_now()
+        configs = _load_folder_configs_from_conn(conn)
+        existing = next((cfg for cfg in configs if cfg["name"].casefold() == name.casefold()), None)
+        created = existing is None
+        if existing:
+            existing["name"] = name
+            existing["source_folder"] = source
+            existing["target_folder"] = target
+            existing["report_folder"] = report
+            existing["updated_at"] = now
+            saved_id = existing["id"]
+        else:
+            saved_id = f"cfg_{secrets.token_hex(6)}"
+            configs.append(
+                {
+                    "id": saved_id,
+                    "name": name,
+                    "source_folder": source,
+                    "target_folder": target,
+                    "report_folder": report,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+        configs.sort(key=lambda c: (c["name"].lower(), c["id"]))
+
+        active_id = (db.get_meta(conn, _SETTINGS_ACTIVE_FOLDER_CONFIG_KEY, "") or "").strip()
+        if set_active:
+            db.set_meta(conn, "source_folder", source, commit=False)
+            db.set_meta(conn, "target_folder", target, commit=False)
+            db.set_meta(conn, "report_folder", report, commit=False)
+            active_id = saved_id
+        active_id = _save_folder_configs_to_conn(conn, configs, active_id)
+
+        return {
+            "configs": configs,
+            "active_id": active_id,
+            "saved_id": saved_id,
+            "saved_name": name,
+            "created": created,
+            "folders": _get_saved_folders_from_conn(conn),
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/api/settings/folder-configs/{config_id}/apply")
+def apply_folder_config(config_id: str) -> Dict[str, Any]:
+    config_id = (config_id or "").strip()
+    conn = db.get_connection()
+    try:
+        configs = _load_folder_configs_from_conn(conn)
+        selected = next((cfg for cfg in configs if cfg["id"] == config_id), None)
+        if not selected:
+            raise HTTPException(status_code=404, detail=f"Folder configuration '{config_id}' not found.")
+
+        db.set_meta(conn, "source_folder", selected["source_folder"], commit=False)
+        db.set_meta(conn, "target_folder", selected["target_folder"], commit=False)
+        db.set_meta(conn, "report_folder", selected["report_folder"], commit=False)
+        active_id = _save_folder_configs_to_conn(conn, configs, selected["id"])
+        return {
+            "configs": configs,
+            "active_id": active_id,
+            "applied_id": selected["id"],
+            "applied_name": selected["name"],
+            "folders": _get_saved_folders_from_conn(conn),
+        }
+    finally:
+        conn.close()
+
+
+@app.delete("/api/settings/folder-configs/{config_id}")
+def delete_folder_config(config_id: str) -> Dict[str, Any]:
+    config_id = (config_id or "").strip()
+    conn = db.get_connection()
+    try:
+        configs = _load_folder_configs_from_conn(conn)
+        selected = next((cfg for cfg in configs if cfg["id"] == config_id), None)
+        if not selected:
+            raise HTTPException(status_code=404, detail=f"Folder configuration '{config_id}' not found.")
+        configs = [cfg for cfg in configs if cfg["id"] != config_id]
+        active_id = (db.get_meta(conn, _SETTINGS_ACTIVE_FOLDER_CONFIG_KEY, "") or "").strip()
+        next_active = _save_folder_configs_to_conn(conn, configs, active_id)
+        return {
+            "configs": configs,
+            "active_id": next_active,
+            "deleted_id": selected["id"],
+            "deleted_name": selected["name"],
+        }
+    finally:
+        conn.close()
 
 
 @app.get("/api/settings/app")
@@ -1943,12 +2149,22 @@ def refresh_catalog(req: RefreshCatalogRequest) -> Dict[str, Any]:
     try:
         if req.report_folder is not None:
             db.set_meta(conn, "report_folder", (req.report_folder or "").strip(), commit=False)
-        return cat.refresh_catalog(
+        result = cat.refresh_catalog(
             source_folder=req.source_folder,
             target_folder=req.target_folder,
             include_row_counts=req.include_row_counts,
             conn=conn,
         )
+        saved_folders = _get_saved_folders_from_conn(conn)
+        configs = _load_folder_configs_from_conn(conn)
+        matching_id = _find_matching_folder_config_id(
+            configs,
+            saved_folders["source_folder"],
+            saved_folders["target_folder"],
+            saved_folders["report_folder"],
+        )
+        _save_folder_configs_to_conn(conn, configs, matching_id)
+        return result
     finally:
         conn.close()
 

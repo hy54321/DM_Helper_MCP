@@ -281,9 +281,20 @@ function App() {
     target_folder: "",
     report_folder: "",
   });
+  const [folderConfigs, setFolderConfigs] = useState([]);
+  const [activeFolderConfigId, setActiveFolderConfigId] = useState("");
+  const [selectedFolderConfigId, setSelectedFolderConfigId] = useState("");
+  const [folderConfigNameInput, setFolderConfigNameInput] = useState("");
+  const [folderConfigBusy, setFolderConfigBusy] = useState(false);
+  const [folderConfigModal, setFolderConfigModal] = useState({
+    open: false,
+    mode: "save",
+    name: "",
+    configId: "",
+    configName: "",
+  });
   const [includeRowCounts, setIncludeRowCounts] = useState(false);
   const [catalogRefreshing, setCatalogRefreshing] = useState(false);
-  const [catalogSaving, setCatalogSaving] = useState(false);
   const [catalogReloading, setCatalogReloading] = useState(false);
   const [lastCatalogRefreshAt, setLastCatalogRefreshAt] = useState("");
   const [catalogSetupCollapsed, setCatalogSetupCollapsed] = useState(false);
@@ -395,6 +406,31 @@ function App() {
     setSettingsClaudeInstructions(String(safe.claude_instructions || ""));
   }
 
+  function applyFolderConfigs(payload) {
+    const safe = payload && typeof payload === "object" ? payload : {};
+    const rawConfigs = Array.isArray(safe.configs) ? safe.configs : [];
+    const nextConfigs = rawConfigs
+      .map((item) => ({
+        id: String(item?.id || "").trim(),
+        name: String(item?.name || "").trim(),
+        source_folder: String(item?.source_folder || "").trim(),
+        target_folder: String(item?.target_folder || "").trim(),
+        report_folder: String(item?.report_folder || "").trim(),
+        updated_at: String(item?.updated_at || ""),
+      }))
+      .filter((item) => item.id && item.name);
+    const validIds = new Set(nextConfigs.map((item) => item.id));
+    const nextActive = String(safe.active_id || "").trim();
+    const activeId = validIds.has(nextActive) ? nextActive : "";
+    setFolderConfigs(nextConfigs);
+    setActiveFolderConfigId(activeId);
+    setSelectedFolderConfigId((prev) => {
+      if (prev && validIds.has(prev)) return prev;
+      if (activeId) return activeId;
+      return nextConfigs[0]?.id || "";
+    });
+  }
+
   async function loadServices({ silent = false } = {}) {
     try {
       const state = await api("/api/system/services");
@@ -435,8 +471,9 @@ function App() {
   async function refreshBootstrap() {
     setError("");
     try {
-      const [folders, ds, pr, jb, rp, rels] = await Promise.all([
+      const [folders, folderConfigState, ds, pr, jb, rp, rels] = await Promise.all([
         api("/api/settings/folders"),
+        api("/api/settings/folder-configs"),
         api("/api/datasets"),
         api("/api/pairs"),
         api("/api/jobs"),
@@ -451,6 +488,7 @@ function App() {
         target_folder: folders.target_folder || "",
         report_folder: folders.report_folder || "",
       });
+      applyFolderConfigs(folderConfigState);
       setDatasets(ds || []);
       setPairs(pr || []);
       setJobs(jb || []);
@@ -630,33 +668,145 @@ function App() {
     }
   }
 
-  async function onSaveFolders() {
+  function onSaveFolderConfig() {
+    const suggestedName = String(folderConfigNameInput || activeFolderConfig?.name || "").trim();
+    setFolderConfigModal({
+      open: true,
+      mode: "save",
+      name: suggestedName,
+      configId: "",
+      configName: "",
+    });
+  }
+
+  function closeFolderConfigModal() {
+    if (folderConfigBusy) return;
+    setFolderConfigModal((prev) => ({
+      ...prev,
+      open: false,
+    }));
+  }
+
+  async function onConfirmSaveFolderConfig() {
+    const name = String(folderConfigModal.name || "").trim();
+    if (!name) {
+      setError("Configuration name is required.");
+      return;
+    }
     setError("");
-    setCatalogSaving(true);
-    setStatus("Saving folder settings...");
+    setFolderConfigBusy(true);
+    setStatus("Saving folder configuration...");
     try {
-      const saved = await api("/api/settings/folders", {
+      const res = await api("/api/settings/folder-configs", {
         method: "POST",
         body: JSON.stringify({
+          name,
           source_folder: sourceFolder,
           target_folder: targetFolder,
           report_folder: reportFolder,
+          set_active: true,
         }),
       });
-      setSourceFolder(saved.source_folder || "");
-      setTargetFolder(saved.target_folder || "");
-      setReportFolder(saved.report_folder || "");
+      const folders = res?.folders || {};
+      setSourceFolder(folders.source_folder || "");
+      setTargetFolder(folders.target_folder || "");
+      setReportFolder(folders.report_folder || "");
       setSavedFoldersSnapshot({
-        source_folder: saved.source_folder || "",
-        target_folder: saved.target_folder || "",
-        report_folder: saved.report_folder || "",
+        source_folder: folders.source_folder || "",
+        target_folder: folders.target_folder || "",
+        report_folder: folders.report_folder || "",
       });
-      setStatus("Folder settings saved.");
+      applyFolderConfigs(res);
+      if (res?.saved_id) {
+        setSelectedFolderConfigId(String(res.saved_id));
+      }
+      setFolderConfigNameInput(String(res?.saved_name || name));
+      setStatus(res?.created ? `Configuration "${res.saved_name}" created.` : `Configuration "${res.saved_name}" updated.`);
+      setFolderConfigModal((prev) => ({ ...prev, open: false }));
     } catch (err) {
       setError(err.message);
-      setStatus("Saving folder settings failed.");
+      setStatus("Saving configuration failed.");
     } finally {
-      setCatalogSaving(false);
+      setFolderConfigBusy(false);
+    }
+  }
+
+  async function onSelectFolderConfig(nextConfigId) {
+    const configId = String(nextConfigId || "").trim();
+    if (!configId) {
+      setError("Select a configuration to apply.");
+      return;
+    }
+    setError("");
+    setFolderConfigBusy(true);
+    setStatus("Applying folder configuration...");
+    try {
+      const res = await api(`/api/settings/folder-configs/${encodeURIComponent(configId)}/apply`, {
+        method: "POST",
+      });
+      const folders = res?.folders || {};
+      setSourceFolder(folders.source_folder || "");
+      setTargetFolder(folders.target_folder || "");
+      setReportFolder(folders.report_folder || "");
+      setSavedFoldersSnapshot({
+        source_folder: folders.source_folder || "",
+        target_folder: folders.target_folder || "",
+        report_folder: folders.report_folder || "",
+      });
+      applyFolderConfigs(res);
+      setStatus(`Configuration "${res?.applied_name || ""}" applied.`);
+    } catch (err) {
+      setError(err.message);
+      setStatus("Applying configuration failed.");
+    } finally {
+      setFolderConfigBusy(false);
+    }
+  }
+
+  function onDeleteFolderConfig() {
+    const configId = String(selectedFolderConfigId || "").trim();
+    if (!configId) {
+      setError("Select a configuration to delete.");
+      return;
+    }
+    const selectedConfig = folderConfigs.find((cfg) => cfg.id === configId);
+    const selectedName = selectedConfig?.name || configId;
+    setFolderConfigModal({
+      open: true,
+      mode: "delete",
+      name: "",
+      configId,
+      configName: selectedName,
+    });
+  }
+
+  async function onConfirmDeleteFolderConfig() {
+    const configId = String(folderConfigModal.configId || "").trim();
+    const selectedName = String(folderConfigModal.configName || configId).trim();
+    if (!configId) {
+      setError("Select a configuration to delete.");
+      return;
+    }
+    setError("");
+    setFolderConfigBusy(true);
+    setStatus("Deleting folder configuration...");
+    try {
+      const res = await api(`/api/settings/folder-configs/${encodeURIComponent(configId)}`, {
+        method: "DELETE",
+      });
+      applyFolderConfigs(res);
+      if (
+        String(folderConfigNameInput || "").trim().toLowerCase() === String(selectedName).trim().toLowerCase()
+      ) {
+        setFolderConfigNameInput("");
+      }
+      setStatus(`Configuration "${res?.deleted_name || selectedName}" deleted.`);
+      setFolderConfigModal((prev) => ({ ...prev, open: false }));
+    } catch (err) {
+      setError(err.message);
+      setStatus("Deleting configuration failed.");
+    } finally {
+      setFolderConfigBusy(false);
     }
   }
 
@@ -917,6 +1067,7 @@ function App() {
         target_folder: saved.target_folder || "",
         report_folder: saved.report_folder || "",
       });
+      applyFolderConfigs(await api("/api/settings/folder-configs"));
       const label = kind === "source" ? "Source" : kind === "target" ? "Target" : "Report";
       setStatus(`${label} folder selected.`);
     } catch (err) {
@@ -1617,6 +1768,10 @@ function App() {
   const sourceFolderTrimmed = String(sourceFolder || "").trim();
   const targetFolderTrimmed = String(targetFolder || "").trim();
   const reportFolderTrimmed = String(reportFolder || "").trim();
+  const activeFolderConfig =
+    folderConfigs.find((cfg) => cfg.id === activeFolderConfigId) ||
+    folderConfigs.find((cfg) => cfg.id === selectedFolderConfigId) ||
+    null;
   const foldersConfigured =
     sourceFolderTrimmed.length > 0 &&
     targetFolderTrimmed.length > 0 &&
@@ -2251,6 +2406,64 @@ function App() {
                 <div className="settings-panel catalog-locations-panel">
                   <div className="catalog-panel-head">
                     <h3>Data Locations</h3>
+                    <div className="catalog-panel-head-actions">
+                      <button
+                        type="button"
+                        className="secondary catalog-reload-btn"
+                        onClick={onReloadMetadata}
+                        disabled={catalogReloading || catalogRefreshing}
+                        title={catalogReloading ? "Reloading metadata..." : "Reload metadata"}
+                        aria-label={catalogReloading ? "Reloading metadata" : "Reload metadata"}
+                      >
+                        {catalogReloading ? "..." : "\u21BB"}
+                      </button>
+                    </div>
+                  </div>
+                  <div className="catalog-config-manager">
+                    <label>Folder configurations</label>
+                    <div className="catalog-config-row">
+                      <select
+                        value={selectedFolderConfigId}
+                        onChange={async (e) => {
+                          const nextId = e.target.value;
+                          setSelectedFolderConfigId(nextId);
+                          const selected = folderConfigs.find((cfg) => cfg.id === nextId);
+                          setFolderConfigNameInput(selected ? selected.name : "");
+                          if (nextId && nextId !== activeFolderConfigId) {
+                            await onSelectFolderConfig(nextId);
+                          }
+                        }}
+                        disabled={folderConfigBusy || !folderConfigs.length}
+                      >
+                        {!folderConfigs.length ? <option value="">No saved configurations yet</option> : null}
+                        {folderConfigs.map((cfg) => (
+                          <option key={cfg.id} value={cfg.id}>
+                            {cfg.name}
+                            {cfg.id === activeFolderConfigId ? " (active)" : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="danger"
+                        onClick={onDeleteFolderConfig}
+                        disabled={folderConfigBusy || !selectedFolderConfigId}
+                      >
+                        Delete
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary"
+                        onClick={onSaveFolderConfig}
+                        disabled={folderConfigBusy}
+                        title="Save current folders as a configuration"
+                      >
+                        {folderConfigBusy ? "Working..." : "Save"}
+                      </button>
+                    </div>
+                    <div className="catalog-config-meta">
+                      Active: {activeFolderConfig ? activeFolderConfig.name : "None"} | Saved: {folderConfigs.length}
+                    </div>
                   </div>
                   <div className="catalog-fields-grid">
                     <div>
@@ -2263,8 +2476,14 @@ function App() {
                           onChange={(e) => setSourceFolder(e.target.value)}
                           placeholder="C:\data\source"
                         />
-                        <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("source")}>
-                          Browse
+                        <button
+                          type="button"
+                          className="secondary browse-btn browse-icon-btn"
+                          onClick={() => onBrowseFolder("source")}
+                          title="Browse source folder"
+                          aria-label="Browse source folder"
+                        >
+                          ...
                         </button>
                       </div>
                     </div>
@@ -2278,8 +2497,14 @@ function App() {
                           onChange={(e) => setTargetFolder(e.target.value)}
                           placeholder="C:\data\target"
                         />
-                        <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("target")}>
-                          Browse
+                        <button
+                          type="button"
+                          className="secondary browse-btn browse-icon-btn"
+                          onClick={() => onBrowseFolder("target")}
+                          title="Browse target folder"
+                          aria-label="Browse target folder"
+                        >
+                          ...
                         </button>
                       </div>
                     </div>
@@ -2293,19 +2518,17 @@ function App() {
                           onChange={(e) => setReportFolder(e.target.value)}
                           placeholder="C:\data\reports"
                         />
-                        <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("report")}>
-                          Browse
+                        <button
+                          type="button"
+                          className="secondary browse-btn browse-icon-btn"
+                          onClick={() => onBrowseFolder("report")}
+                          title="Browse report folder"
+                          aria-label="Browse report folder"
+                        >
+                          ...
                         </button>
                       </div>
                     </div>
-                  </div>
-                  <div className="actions catalog-location-actions">
-                    <button className="secondary" onClick={onSaveFolders} disabled={catalogSaving || !foldersDirty}>
-                      {catalogSaving ? "Saving..." : "Save Folder Settings"}
-                    </button>
-                    <button className="secondary" onClick={onReloadMetadata} disabled={catalogReloading || catalogRefreshing}>
-                      {catalogReloading ? "Reloading..." : "Reload Metadata"}
-                    </button>
                   </div>
                 </div>
 
@@ -3483,6 +3706,56 @@ function App() {
       ) : null}
         </main>
       </div>
+      {folderConfigModal.open ? (
+        <div className="modal-backdrop" onClick={closeFolderConfigModal}>
+          <div className="modal-card folder-config-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            {folderConfigModal.mode === "delete" ? (
+              <>
+                <h4 style={{ margin: "0 0 6px" }}>Delete Folder Configuration</h4>
+                <div className="sub" style={{ margin: "0 0 8px" }}>
+                  Delete this saved configuration?
+                </div>
+                <div className="folder-config-delete-name">{folderConfigModal.configName || "-"}</div>
+                <div className="actions actions-right modal-actions">
+                  <button type="button" className="secondary" onClick={closeFolderConfigModal} disabled={folderConfigBusy}>
+                    Cancel
+                  </button>
+                  <button type="button" className="danger" onClick={onConfirmDeleteFolderConfig} disabled={folderConfigBusy}>
+                    {folderConfigBusy ? "Deleting..." : "Delete"}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h4 style={{ margin: "0 0 6px" }}>Save Folder Configuration</h4>
+                <div className="sub" style={{ margin: "0 0 8px" }}>
+                  Name this folder setup so you can switch to it later.
+                </div>
+                <label>Configuration name</label>
+                <input
+                  value={folderConfigModal.name}
+                  onChange={(e) => setFolderConfigModal((prev) => ({ ...prev, name: e.target.value }))}
+                  maxLength={80}
+                  placeholder="e.g. Mock UAT"
+                  autoFocus
+                />
+                <div className="actions actions-right modal-actions">
+                  <button type="button" className="secondary" onClick={closeFolderConfigModal} disabled={folderConfigBusy}>
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onConfirmSaveFolderConfig}
+                    disabled={folderConfigBusy || !String(folderConfigModal.name || "").trim()}
+                  >
+                    {folderConfigBusy ? "Saving..." : "Save"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
       {quickMapChoiceOpen ? (
         <div className="modal-backdrop" onClick={() => applyQuickMappingsChoice("cancel")}>
           <div className="modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>

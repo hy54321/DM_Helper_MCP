@@ -477,3 +477,130 @@ def test_claude_chat_uses_saved_key_and_model(monkeypatch, tmp_path: Path) -> No
         {"role": "user", "content": "How many rows changed?"},
     ]
     assert captured["messages"][2]["role"] == "assistant"
+
+
+def test_folder_configurations_save_list_apply(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_a = client.post(
+        "/api/settings/folder-configs",
+        json={
+            "name": "Client A",
+            "source_folder": "C:/data/client-a/source",
+            "target_folder": "C:/data/client-a/target",
+            "report_folder": "C:/data/client-a/reports",
+            "set_active": True,
+        },
+    )
+    assert save_a.status_code == 200
+    payload_a = save_a.json()
+    assert payload_a["created"] is True
+    saved_a_id = payload_a["saved_id"]
+    assert payload_a["active_id"] == saved_a_id
+    assert payload_a["folders"]["source_folder"] == "C:/data/client-a/source"
+
+    save_b = client.post(
+        "/api/settings/folder-configs",
+        json={
+            "name": "Client B",
+            "source_folder": "C:/data/client-b/source",
+            "target_folder": "C:/data/client-b/target",
+            "report_folder": "C:/data/client-b/reports",
+            "set_active": False,
+        },
+    )
+    assert save_b.status_code == 200
+    payload_b = save_b.json()
+    saved_b_id = payload_b["saved_id"]
+    assert payload_b["active_id"] == saved_a_id
+
+    list_response = client.get("/api/settings/folder-configs")
+    assert list_response.status_code == 200
+    listed = list_response.json()
+    assert len(listed["configs"]) == 2
+    assert listed["active_id"] == saved_a_id
+
+    apply_b = client.post(f"/api/settings/folder-configs/{saved_b_id}/apply")
+    assert apply_b.status_code == 200
+    apply_payload = apply_b.json()
+    assert apply_payload["active_id"] == saved_b_id
+    assert apply_payload["folders"]["source_folder"] == "C:/data/client-b/source"
+    assert apply_payload["folders"]["target_folder"] == "C:/data/client-b/target"
+    assert apply_payload["folders"]["report_folder"] == "C:/data/client-b/reports"
+
+
+def test_folder_configurations_active_syncs_with_manual_folder_save(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_cfg = client.post(
+        "/api/settings/folder-configs",
+        json={
+            "name": "QA Env",
+            "source_folder": "C:/qa/source",
+            "target_folder": "C:/qa/target",
+            "report_folder": "C:/qa/reports",
+            "set_active": False,
+        },
+    )
+    assert save_cfg.status_code == 200
+    cfg_id = save_cfg.json()["saved_id"]
+
+    manual_save = client.post(
+        "/api/settings/folders",
+        json={
+            "source_folder": "C:/qa/source",
+            "target_folder": "C:/qa/target",
+            "report_folder": "C:/qa/reports",
+        },
+    )
+    assert manual_save.status_code == 200
+
+    list_after_match = client.get("/api/settings/folder-configs")
+    assert list_after_match.status_code == 200
+    assert list_after_match.json()["active_id"] == cfg_id
+
+    manual_mismatch = client.post(
+        "/api/settings/folders",
+        json={
+            "source_folder": "C:/other/source",
+            "target_folder": "C:/other/target",
+            "report_folder": "C:/other/reports",
+        },
+    )
+    assert manual_mismatch.status_code == 200
+
+    list_after_mismatch = client.get("/api/settings/folder-configs")
+    assert list_after_mismatch.status_code == 200
+    assert list_after_mismatch.json()["active_id"] == ""
+
+
+def test_folder_configurations_delete_removes_active(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_cfg = client.post(
+        "/api/settings/folder-configs",
+        json={
+            "name": "Delete Me",
+            "source_folder": "C:/delete/source",
+            "target_folder": "C:/delete/target",
+            "report_folder": "C:/delete/reports",
+            "set_active": True,
+        },
+    )
+    assert save_cfg.status_code == 200
+    cfg_id = save_cfg.json()["saved_id"]
+    assert save_cfg.json()["active_id"] == cfg_id
+
+    delete_response = client.delete(f"/api/settings/folder-configs/{cfg_id}")
+    assert delete_response.status_code == 200
+    deleted_payload = delete_response.json()
+    assert deleted_payload["deleted_id"] == cfg_id
+    assert deleted_payload["active_id"] == ""
+
+    list_response = client.get("/api/settings/folder-configs")
+    assert list_response.status_code == 200
+    assert list_response.json()["configs"] == []
+    assert list_response.json()["active_id"] == ""
