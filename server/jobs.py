@@ -1,21 +1,177 @@
 """
 JobService.
 
-Manages comparison job lifecycle:
-queued → running → succeeded / failed / canceled.
-
-Phase 1 uses synchronous execution. The async wrapper (threading)
-can be added later for large files.
+Manages async/sync job lifecycle:
+queued -> running -> succeeded / failed / canceled.
 """
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import Future, ThreadPoolExecutor
 import uuid
 from typing import Any, Dict, List, Optional
 
 from server import db
+from server import reports as rpt
 from server.comparison import compare_full
 from server.reports import write_comparison_report
+from server.query_engine import connect
+from server.sql_guard import validate as sql_validate
+
+
+def _job_workers() -> int:
+    raw = (os.getenv("PROTOQUERY_JOB_WORKERS", "") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 1:
+                return min(value, 8)
+        except ValueError:
+            pass
+    return 2
+
+
+_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=_job_workers(), thread_name_prefix="protoquery-job")
+_JOB_FUTURES: Dict[str, Future] = {}
+
+
+def _run_comparison_job(
+    job_id: str,
+    source_id: str,
+    target_id: str,
+    key_columns: List[str],
+    key_mappings: Optional[List[Dict[str, str]]] = None,
+    pair_id: Optional[str] = None,
+    compare_columns: Optional[List[str]] = None,
+    compare_mappings: Optional[List[Dict[str, str]]] = None,
+) -> None:
+    """Execute comparison/report generation for an existing queued job."""
+    conn = db.get_connection()
+    try:
+        job = db.get_job(conn, job_id)
+        if not job or job["state"] != "queued":
+            return
+
+        db.update_job_state(conn, job_id, "running")
+
+        result = compare_full(
+            source_id=source_id,
+            target_id=target_id,
+            key_columns=key_columns,
+            compare_columns=compare_columns,
+            key_mappings=key_mappings,
+            compare_mappings=compare_mappings,
+            conn=conn,
+        )
+
+        job = db.get_job(conn, job_id)
+        if job and job["state"] == "canceled":
+            return
+
+        if "error" in result:
+            db.update_job_state(conn, job_id, "failed", error_message=result["error"])
+            return
+
+        report_result = write_comparison_report(
+            comparison_result=result,
+            job_id=job_id,
+            pair_id=pair_id,
+            conn=conn,
+        )
+        if "error" in report_result:
+            db.update_job_state(conn, job_id, "failed", error_message=report_result["error"])
+            return
+
+        progress = {
+            "added": int(report_result.get("added", 0)),
+            "removed": int(report_result.get("removed", 0)),
+            "changed": int(report_result.get("changed", 0)),
+        }
+
+        job = db.get_job(conn, job_id)
+        if job and job["state"] == "canceled":
+            return
+
+        db.update_job_state(conn, job_id, "succeeded", progress=progress)
+    except Exception as exc:
+        try:
+            job = db.get_job(conn, job_id)
+            if job and job["state"] != "canceled":
+                db.update_job_state(conn, job_id, "failed", error_message=str(exc))
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def _execute_query_export(
+    conn,
+    sql: str,
+    filename: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    ok, err = sql_validate(sql)
+    if not ok:
+        return {"error": err}
+
+    datasets = db.list_datasets(conn)
+    if not datasets:
+        return {"error": "No datasets loaded."}
+
+    with connect(datasets) as duck:
+        try:
+            result = duck.execute(sql)
+            headers = [d[0] for d in result.description]
+        except Exception as exc:
+            return {"error": str(exc)}
+
+        return rpt.export_query_to_xlsx(
+            headers=headers,
+            rows=result,
+            filename=filename,
+            sql_query=sql,
+            conn=conn,
+            job_id=job_id,
+        )
+
+
+def _run_export_query_job(
+    job_id: str,
+    sql: str,
+    filename: Optional[str] = None,
+) -> None:
+    """Execute query-export report generation for an existing queued job."""
+    conn = db.get_connection()
+    try:
+        job = db.get_job(conn, job_id)
+        if not job or job["state"] != "queued":
+            return
+
+        db.update_job_state(conn, job_id, "running")
+        report_result = _execute_query_export(conn, sql, filename=filename, job_id=job_id)
+
+        job = db.get_job(conn, job_id)
+        if job and job["state"] == "canceled":
+            return
+
+        if "error" in report_result:
+            db.update_job_state(conn, job_id, "failed", error_message=report_result["error"])
+            return
+
+        progress = {
+            "row_count": int(report_result.get("row_count", 0)),
+        }
+        db.update_job_state(conn, job_id, "succeeded", progress=progress)
+    except Exception as exc:
+        try:
+            job = db.get_job(conn, job_id)
+            if job and job["state"] != "canceled":
+                db.update_job_state(conn, job_id, "failed", error_message=str(exc))
+        except Exception:
+            pass
+    finally:
+        conn.close()
 
 
 def start_comparison_job(
@@ -29,9 +185,10 @@ def start_comparison_job(
     options: Optional[Dict[str, Any]] = None,
     conn=None,
 ) -> Dict[str, Any]:
-    """Create and immediately run a comparison job (synchronous).
+    """Create a comparison job and execute it.
 
-    Returns job metadata + report info on success or error details on failure.
+    With external connections (mainly tests), execution stays synchronous.
+    With normal app usage, execution runs in a background worker.
     """
     own = conn is None
     if own:
@@ -50,56 +207,120 @@ def start_comparison_job(
         options=options,
     )
 
-    # Run comparison
-    db.update_job_state(conn, job_id, "running")
+    if own:
+        conn.close()
 
-    try:
-        result = compare_full(
-            source_id=source_id,
-            target_id=target_id,
-            key_columns=key_columns,
-            compare_columns=compare_columns,
-            key_mappings=key_mappings,
-            compare_mappings=compare_mappings,
-            conn=conn,
-        )
+    # Keep synchronous execution for externally supplied connections
+    # (e.g. in-memory test DBs that cannot be shared across worker threads).
+    if not own:
+        db.update_job_state(conn, job_id, "running")
+        try:
+            result = compare_full(
+                source_id=source_id,
+                target_id=target_id,
+                key_columns=key_columns,
+                compare_columns=compare_columns,
+                key_mappings=key_mappings,
+                compare_mappings=compare_mappings,
+                conn=conn,
+            )
+            if "error" in result:
+                db.update_job_state(conn, job_id, "failed", error_message=result["error"])
+                return {"job_id": job_id, "state": "failed", "error": result["error"]}
+            report_result = write_comparison_report(
+                comparison_result=result,
+                job_id=job_id,
+                pair_id=pair_id,
+                conn=conn,
+            )
+            if "error" in report_result:
+                db.update_job_state(conn, job_id, "failed", error_message=report_result["error"])
+                return {"job_id": job_id, "state": "failed", "error": report_result["error"]}
+            progress = {
+                "added": int(report_result.get("added", 0)),
+                "removed": int(report_result.get("removed", 0)),
+                "changed": int(report_result.get("changed", 0)),
+            }
+            db.update_job_state(conn, job_id, "succeeded", progress=progress)
+            return {"job_id": job_id, "state": "succeeded", "progress": progress, "report": report_result}
+        except Exception as exc:
+            db.update_job_state(conn, job_id, "failed", error_message=str(exc))
+            return {"job_id": job_id, "state": "failed", "error": str(exc)}
 
-        if "error" in result:
-            db.update_job_state(conn, job_id, "failed", error_message=result["error"])
-            if own:
-                conn.close()
-            return {"job_id": job_id, "state": "failed", "error": result["error"]}
+    future = _JOB_EXECUTOR.submit(
+        _run_comparison_job,
+        job_id,
+        source_id,
+        target_id,
+        key_columns,
+        key_mappings,
+        pair_id,
+        compare_columns,
+        compare_mappings,
+    )
+    _JOB_FUTURES[job_id] = future
 
-        # Write report
-        report_result = write_comparison_report(
-            comparison_result=result,
-            job_id=job_id,
-            pair_id=pair_id,
-            conn=conn,
-        )
+    return {"job_id": job_id, "state": "queued"}
 
-        # Summary for job progress
-        progress = {
-            "added": len(result.get("added", {}).get("data", [])),
-            "removed": len(result.get("removed", {}).get("data", [])),
-            "changed": len(result.get("changed", {}).get("data", [])),
-        }
-        db.update_job_state(conn, job_id, "succeeded", progress=progress)
 
+def start_export_query_job(
+    sql: str,
+    filename: Optional[str] = None,
+    conn=None,
+) -> Dict[str, Any]:
+    """Create a query-export job and execute it."""
+    own = conn is None
+    if own:
+        conn = db.get_connection()
+
+    ok, err = sql_validate(sql)
+    if not ok:
         if own:
             conn.close()
-        return {
-            "job_id": job_id,
-            "state": "succeeded",
-            "progress": progress,
-            "report": report_result,
-        }
+        return {"error": err}
 
-    except Exception as exc:
-        db.update_job_state(conn, job_id, "failed", error_message=str(exc))
+    datasets = db.list_datasets(conn)
+    if not datasets:
         if own:
             conn.close()
-        return {"job_id": job_id, "state": "failed", "error": str(exc)}
+        return {"error": "No datasets loaded."}
+
+    job_id = f"job_{uuid.uuid4().hex[:8]}"
+    db.create_job(
+        conn,
+        job_id=job_id,
+        source_dataset="query_export",
+        target_dataset="query_export",
+        key_fields=[],
+        options={
+            "type": "query_export",
+            "filename": filename or "",
+            "sql": sql,
+        },
+    )
+
+    if own:
+        conn.close()
+
+    # Keep synchronous execution for externally supplied connections
+    # (e.g. in-memory test DBs that cannot be shared across worker threads).
+    if not own:
+        db.update_job_state(conn, job_id, "running")
+        try:
+            report_result = _execute_query_export(conn, sql, filename=filename, job_id=job_id)
+            if "error" in report_result:
+                db.update_job_state(conn, job_id, "failed", error_message=report_result["error"])
+                return {"job_id": job_id, "state": "failed", "error": report_result["error"]}
+            progress = {"row_count": int(report_result.get("row_count", 0))}
+            db.update_job_state(conn, job_id, "succeeded", progress=progress)
+            return {"job_id": job_id, "state": "succeeded", "progress": progress, "report": report_result}
+        except Exception as exc:
+            db.update_job_state(conn, job_id, "failed", error_message=str(exc))
+            return {"job_id": job_id, "state": "failed", "error": str(exc)}
+
+    future = _JOB_EXECUTOR.submit(_run_export_query_job, job_id, sql, filename)
+    _JOB_FUTURES[job_id] = future
+    return {"job_id": job_id, "state": "queued"}
 
 
 def get_job_status(job_id: str, conn=None) -> Dict[str, Any]:
@@ -176,6 +397,12 @@ def cancel_job(job_id: str, conn=None) -> Dict[str, Any]:
         return {"error": f"Job '{job_id}' already in terminal state: {job['state']}"}
 
     db.update_job_state(conn, job_id, "canceled")
+    fut = _JOB_FUTURES.get(job_id)
+    if fut is not None and not fut.running():
+        try:
+            fut.cancel()
+        except Exception:
+            pass
     if own:
         conn.close()
     return {"job_id": job_id, "state": "canceled"}

@@ -12,7 +12,7 @@ import re
 import sys
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from server import db
 
@@ -52,6 +52,34 @@ def _reports_dir(conn=None) -> str:
 _INVALID_SHEET = re.compile(r"[\\/*?\[\]:]")
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*]')
 _TIMESTAMP_SUFFIX = re.compile(r"_\d{8}_\d{6}$")
+_DEFAULT_XLSX_STREAM_THRESHOLD = 20000
+
+
+def _xlsx_stream_threshold() -> int:
+    raw = (os.getenv("PROTOQUERY_XLSX_STREAM_THRESHOLD", "") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value >= 1000:
+                return value
+        except ValueError:
+            pass
+    return _DEFAULT_XLSX_STREAM_THRESHOLD
+
+
+def _iter_rows(rows: Any, batch_size: int = 2000) -> Iterator[Any]:
+    """Iterate rows from a sequence or DB cursor-like object."""
+    if hasattr(rows, "fetchmany"):
+        while True:
+            batch = rows.fetchmany(batch_size)
+            if not batch:
+                break
+            for row in batch:
+                yield row
+        return
+
+    for row in rows:
+        yield row
 
 
 def _safe_sheet_name(name: str, max_len: int = 31) -> str:
@@ -135,6 +163,173 @@ def _flatten_changed_rows(
     return flat_headers, flat_data
 
 
+def _iter_flatten_changed_rows(
+    key_columns: List[str],
+    compare_columns: List[str],
+    changed_headers: List[str],
+    changed_data: List[List[Any]],
+    field_pairs: Optional[List[Dict[str, str]]] = None,
+):
+    """Yield changed rows in one-row-per-field format."""
+    header_index = {h: i for i, h in enumerate(changed_headers)}
+    key_indices = [header_index.get(k) for k in key_columns]
+    value_pairs: List[tuple[str, int, int]] = []
+    if field_pairs:
+        for fp in field_pairs:
+            label = fp.get("label") or f"{fp.get('source_field', '')}->{fp.get('target_field', '')}"
+            source_idx = header_index.get(fp.get("source_header", ""))
+            target_idx = header_index.get(fp.get("target_header", ""))
+            if source_idx is not None and target_idx is not None:
+                value_pairs.append((label, source_idx, target_idx))
+    else:
+        for col in compare_columns:
+            source_idx = header_index.get(f"source_{col}")
+            target_idx = header_index.get(f"target_{col}")
+            if source_idx is not None and target_idx is not None:
+                value_pairs.append((col, source_idx, target_idx))
+
+    for row in changed_data:
+        key_values = [row[i] if i is not None else "" for i in key_indices]
+        for field_name, source_idx, target_idx in value_pairs:
+            source_val = row[source_idx]
+            target_val = row[target_idx]
+            if source_val != target_val:
+                yield [*key_values, field_name, target_val, source_val]
+
+
+def _write_comparison_report_streaming(
+    comparison_result: Dict[str, Any],
+    filename: Optional[str] = None,
+    job_id: Optional[str] = None,
+    pair_id: Optional[str] = None,
+    conn=None,
+) -> Dict[str, Any]:
+    """Write comparison report in write-only mode for large datasets."""
+    from openpyxl import Workbook
+
+    source_id = comparison_result["source"]
+    target_id = comparison_result["target"]
+    key_columns = comparison_result.get("key_columns", [])
+    compare_columns = comparison_result.get("compare_columns", [])
+    schema_drift = comparison_result.get("schema_drift", {})
+    added = comparison_result.get("added", {})
+    removed = comparison_result.get("removed", {})
+    changed = comparison_result.get("changed", {})
+
+    added_headers = added.get("headers", [])
+    added_data = added.get("data", [])
+    removed_headers = removed.get("headers", [])
+    removed_data = removed.get("data", [])
+    changed_headers = changed.get("headers", [])
+    changed_data = changed.get("data", [])
+    changed_field_pairs = changed.get("field_pairs", [])
+
+    added_count = len(added_data)
+    removed_count = len(removed_data)
+    changed_count = len(changed_data)
+
+    filename = _normalize_report_filename(
+        filename=filename,
+        default_stem=f"comparison_{source_id}_vs_{target_id}",
+    )
+    file_path = os.path.join(_reports_dir(conn), filename)
+
+    wb = Workbook(write_only=True)
+
+    ws_sum = wb.create_sheet("Summary")
+    summary_rows = [
+        ("Comparison Report", ""),
+        ("", ""),
+        ("Source Dataset", source_id),
+        ("Target Dataset", target_id),
+        ("Key Columns", ", ".join(key_columns)),
+        ("Compare Columns", ", ".join(compare_columns)),
+        ("", ""),
+        ("Timestamp", datetime.now(timezone.utc).isoformat()),
+        ("", ""),
+        ("Category", "Count"),
+        ("Added (target-only)", added_count),
+        ("Removed (source-only)", removed_count),
+        ("Changed", changed_count),
+        ("", ""),
+        ("Schema Drift", ""),
+        ("Source-only columns", ", ".join(schema_drift.get("source_only", []))),
+        ("Target-only columns", ", ".join(schema_drift.get("target_only", []))),
+    ]
+    for row_data in summary_rows:
+        ws_sum.append(list(row_data))
+
+    ws_drift = wb.create_sheet("Schema_Drift")
+    ws_drift.append(["Direction", "Column"])
+    for c in schema_drift.get("source_only", []):
+        ws_drift.append(["Source only", c])
+    for c in schema_drift.get("target_only", []):
+        ws_drift.append(["Target only", c])
+
+    ws_added = wb.create_sheet("Added")
+    if added_headers:
+        ws_added.append(added_headers)
+    for row_data in added_data:
+        ws_added.append([str(v) if v is not None else "" for v in row_data])
+
+    ws_removed = wb.create_sheet("Removed")
+    if removed_headers:
+        ws_removed.append(removed_headers)
+    for row_data in removed_data:
+        ws_removed.append([str(v) if v is not None else "" for v in row_data])
+
+    ws_changed = wb.create_sheet("Changed")
+    if changed_headers and changed_data:
+        ws_changed.append([*key_columns, "Field", "Target", "Source"])
+        for row_data in _iter_flatten_changed_rows(
+            key_columns=key_columns,
+            compare_columns=compare_columns,
+            changed_headers=changed_headers,
+            changed_data=changed_data,
+            field_pairs=changed_field_pairs,
+        ):
+            ws_changed.append([str(v) if v is not None else "" for v in row_data])
+    elif changed_headers:
+        ws_changed.append(changed_headers)
+
+    wb.save(file_path)
+
+    report_id = f"rpt_{uuid.uuid4().hex[:8]}"
+    summary_meta = {
+        "added": added_count,
+        "removed": removed_count,
+        "changed": changed_count,
+        "source_only_columns": schema_drift.get("source_only", []),
+        "target_only_columns": schema_drift.get("target_only", []),
+    }
+
+    own = conn is None
+    if own:
+        conn = db.get_connection()
+    db.create_report(
+        conn,
+        report_id=report_id,
+        job_id=job_id,
+        pair_id=pair_id,
+        source_dataset=source_id,
+        target_dataset=target_id,
+        file_path=file_path,
+        file_name=filename,
+        summary=summary_meta,
+    )
+    if own:
+        conn.close()
+
+    return {
+        "report_id": report_id,
+        "file_path": file_path,
+        "file_name": filename,
+        "added": added_count,
+        "removed": removed_count,
+        "changed": changed_count,
+    }
+
+
 def write_comparison_report(
     comparison_result: Dict[str, Any],
     filename: Optional[str] = None,
@@ -165,6 +360,14 @@ def write_comparison_report(
     added_count = len(added.get("data", []))
     removed_count = len(removed.get("data", []))
     changed_count = len(changed.get("data", []))
+    if (added_count + removed_count + changed_count) >= _xlsx_stream_threshold():
+        return _write_comparison_report_streaming(
+            comparison_result=comparison_result,
+            filename=filename,
+            job_id=job_id,
+            pair_id=pair_id,
+            conn=conn,
+        )
 
     # File path
     filename = _normalize_report_filename(
@@ -336,10 +539,11 @@ def write_comparison_report(
 
 def export_query_to_xlsx(
     headers: List[str],
-    rows: List[list],
+    rows: Any,
     filename: Optional[str] = None,
     sql_query: Optional[str] = None,
     conn=None,
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Write arbitrary query results to an XLSX file."""
     from openpyxl import Workbook
@@ -354,41 +558,64 @@ def export_query_to_xlsx(
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Results"
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-    for row in rows:
-        ws.append([str(v) if v is not None else "" for v in row])
+    row_estimate: Optional[int] = None
+    if hasattr(rows, "__len__"):
+        try:
+            row_estimate = int(len(rows))
+        except Exception:
+            row_estimate = None
 
-    # Auto-fit
-    for col_cells in ws.columns:
-        max_len = 0
-        col_letter = col_cells[0].column_letter
-        for cell in col_cells[:50]:
-            try:
-                max_len = max(max_len, len(str(cell.value or "")))
-            except Exception:
-                pass
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+    use_streaming = row_estimate is None or row_estimate >= _xlsx_stream_threshold()
+    rows_written = 0
+    if use_streaming:
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet("Results")
+        ws.append(headers)
+        for row in _iter_rows(rows):
+            ws.append([str(v) if v is not None else "" for v in row])
+            rows_written += 1
 
-    sql_sheet = wb.create_sheet("SQL")
-    sql_sheet.append(["SQL Query"])
-    sql_sheet["A1"].font = header_font
-    sql_sheet["A1"].fill = header_fill
-    sql_sheet["A2"] = (sql_query or "").strip()
-    sql_sheet["A2"].alignment = Alignment(wrap_text=True, vertical="top")
-    sql_sheet.column_dimensions["A"].width = 120
+        sql_sheet = wb.create_sheet("SQL")
+        sql_sheet.append(["SQL Query"])
+        sql_sheet.append([(sql_query or "").strip()])
+        wb.save(file_path)
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Results"
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+        for row in _iter_rows(rows):
+            ws.append([str(v) if v is not None else "" for v in row])
+            rows_written += 1
 
-    wb.save(file_path)
+        # Auto-fit
+        for col_cells in ws.columns:
+            max_len = 0
+            col_letter = col_cells[0].column_letter
+            for cell in col_cells[:50]:
+                try:
+                    max_len = max(max_len, len(str(cell.value or "")))
+                except Exception:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+
+        sql_sheet = wb.create_sheet("SQL")
+        sql_sheet.append(["SQL Query"])
+        sql_sheet["A1"].font = header_font
+        sql_sheet["A1"].fill = header_fill
+        sql_sheet["A2"] = (sql_query or "").strip()
+        sql_sheet["A2"].alignment = Alignment(wrap_text=True, vertical="top")
+        sql_sheet.column_dimensions["A"].width = 120
+
+        wb.save(file_path)
 
     report_id = f"rpt_{uuid.uuid4().hex[:8]}"
     summary_meta = {
         "type": "query_export",
-        "row_count": len(rows),
+        "row_count": rows_written,
         "column_count": len(headers),
     }
     own = conn is None
@@ -397,7 +624,7 @@ def export_query_to_xlsx(
     db.create_report(
         conn,
         report_id=report_id,
-        job_id=None,
+        job_id=job_id,
         pair_id=None,
         source_dataset="query_export",
         target_dataset="query_export",
@@ -412,7 +639,7 @@ def export_query_to_xlsx(
         "report_id": report_id,
         "file_path": file_path,
         "file_name": filename,
-        "row_count": len(rows),
+        "row_count": rows_written,
     }
 
 

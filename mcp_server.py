@@ -128,6 +128,30 @@ def _resolve_requested_mappings(
     return resolved
 
 
+def _format_export_job_start(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return MCP-friendly accepted payload for queued export jobs."""
+    if not isinstance(result, dict) or "error" in result:
+        return result
+
+    job_id = str(result.get("job_id") or "").strip()
+    state = str(result.get("state") or "").strip().lower()
+    if not job_id or state not in ("queued", "running"):
+        return result
+
+    return {
+        "status": "accepted",
+        "state": state,
+        "job_id": job_id,
+        "message": f"Export started in background ({job_id}). You can keep working; refresh status to track progress.",
+        "next": {
+            "poll_tool": "get_job_status",
+            "poll_arg": job_id,
+            "suggested_poll_interval_seconds": 2,
+            "completion_tool": "get_job_summary",
+        },
+    }
+
+
 def _resolve_pair_context(
     source_dataset_id: str,
     target_dataset_id: str,
@@ -348,8 +372,13 @@ def export_query(
     sql: str,
     filename: Optional[str] = None,
     format: str = "xlsx",
+    async_job: bool = True,
 ) -> str:
-    """Run read-only SQL, save ALL rows to reports/ folder, return file path."""
+    """Run read-only SQL export. By default queues a background job."""
+    if async_job:
+        result = _format_export_job_start(job_svc.start_export_query_job(sql=sql, filename=filename))
+        return json.dumps(result, indent=2, default=str)
+
     ok, err = sql_validate(sql)
     if not ok:
         return json.dumps({"error": err})
@@ -365,11 +394,15 @@ def export_query(
         try:
             result = duck.execute(sql)
             headers = [d[0] for d in result.description]
-            rows = [list(r) for r in result.fetchall()]
+            report = rpt.export_query_to_xlsx(
+                headers=headers,
+                rows=result,
+                filename=filename,
+                sql_query=sql,
+            )
         except Exception as exc:
             return json.dumps({"error": str(exc)})
 
-    report = rpt.export_query_to_xlsx(headers, rows, filename=filename, sql_query=sql)
     return json.dumps(report, indent=2)
 
 
@@ -691,6 +724,21 @@ def schema_diff(
 # ═══════════════════════════════════════════════════════════════
 #  5.4 — Comparison and report tools
 # ═══════════════════════════════════════════════════════════════
+
+
+@mcp.tool()
+def start_export_query_job(
+    sql: str,
+    filename: Optional[str] = None,
+) -> str:
+    """Start a query export job and return immediately with job_id."""
+    result = _format_export_job_start(
+        job_svc.start_export_query_job(
+            sql=sql,
+            filename=filename,
+        )
+    )
+    return json.dumps(result, indent=2, default=str)
 
 
 @mcp.tool()

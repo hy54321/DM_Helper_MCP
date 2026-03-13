@@ -120,6 +120,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             created_at  TEXT NOT NULL
         );
 
+        CREATE INDEX IF NOT EXISTS idx_jobs_created_at
+            ON jobs(created_at DESC);
+
         -- ── Reports ────────────────────────────────────────
 
         CREATE TABLE IF NOT EXISTS reports (
@@ -134,6 +137,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             created_at  TEXT NOT NULL,
             FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE SET NULL
         );
+
+        CREATE INDEX IF NOT EXISTS idx_reports_created_at
+            ON reports(created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_reports_job_id
+            ON reports(job_id);
 
         CREATE TABLE IF NOT EXISTS dataset_relationships (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +167,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_dataset_relationships_side
             ON dataset_relationships(side);
+
+        CREATE INDEX IF NOT EXISTS idx_dataset_relationships_side_updated
+            ON dataset_relationships(side, updated_at DESC, id DESC);
 
         -- ── Meta ───────────────────────────────────────────
 

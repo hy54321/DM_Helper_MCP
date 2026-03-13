@@ -423,6 +423,90 @@ button.danger {
   min-width: 0;
 }
 
+.content-sql {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - var(--app-header-height) - var(--app-shell-top) - 34px);
+  max-height: calc(100vh - var(--app-header-height) - var(--app-shell-top) - 34px);
+  overflow: hidden;
+}
+
+.sql-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sql-shell .card {
+  margin-bottom: 0;
+}
+
+.sql-card-title {
+  margin: 0 0 6px;
+  font-size: 17px;
+  line-height: 1.1;
+}
+
+.sql-workspace-card {
+  padding: 10px 12px;
+}
+
+.sql-workspace-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.sql-query-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sql-query-input {
+  min-height: 170px;
+  height: 100%;
+}
+
+.sql-controls-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sql-controls-column > button {
+  margin-top: auto;
+}
+
+.sql-result-card {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+}
+
+.sql-result-meta {
+  margin-top: 0;
+  margin-bottom: 6px;
+}
+
+.sql-result-grid-wrap {
+  flex: 1;
+  min-height: 0;
+}
+
+.sql-result-grid.scroll {
+  height: 100%;
+  max-height: none;
+  overflow: auto;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -1429,6 +1513,24 @@ pre {
 @media (max-width: 900px) {
   .layout {
     grid-template-columns: 1fr;
+  }
+
+  .content-sql {
+    height: auto;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .sql-shell {
+    overflow: visible;
+  }
+
+  .sql-workspace-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sql-controls-column > button {
+    margin-top: 0;
   }
 
   .sidebar {

@@ -67,6 +67,29 @@ def _call_mcp_tool(name: str, arguments: Dict[str, Any]) -> str:
         return json.dumps({"error": f"Tool '{name}' failed: {exc}"})
 
 
+def _format_export_job_start(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Return UI-friendly accepted payload for queued export jobs."""
+    if not isinstance(result, dict) or "error" in result:
+        return result
+
+    job_id = str(result.get("job_id") or "").strip()
+    state = str(result.get("state") or "").strip().lower()
+    if not job_id or state not in ("queued", "running"):
+        return result
+
+    return {
+        "status": "accepted",
+        "state": state,
+        "job_id": job_id,
+        "message": f"Export started in background ({job_id}). You can keep working; refresh status to track progress.",
+        "next": {
+            "poll_endpoint": f"/api/jobs/{job_id}",
+            "summary_endpoint": f"/api/jobs/{job_id}/summary",
+            "suggested_poll_interval_seconds": 2,
+        },
+    }
+
+
 class RefreshCatalogRequest(BaseModel):
     source_folder: Optional[str] = None
     target_folder: Optional[str] = None
@@ -96,6 +119,13 @@ class SaveKeyPresetRequest(BaseModel):
 class SqlPreviewRequest(BaseModel):
     sql: str
     limit: int = Field(default=10, ge=1, le=100)
+    include_total: bool = False
+
+
+class SqlExportRequest(BaseModel):
+    sql: str
+    filename: Optional[str] = None
+    async_job: bool = True
 
 
 class FilteredPreviewRequest(BaseModel):
@@ -1999,10 +2029,12 @@ def sql_preview(req: SqlPreviewRequest) -> Dict[str, Any]:
         sql_to_run = f"{clean} LIMIT {req.limit}"
 
     with connect(datasets) as duck:
-        try:
-            total = duck.execute(f"SELECT COUNT(*) FROM ({clean}) _q").fetchone()[0]
-        except Exception:
-            total = None
+        total = None
+        if req.include_total:
+            try:
+                total = duck.execute(f"SELECT COUNT(*) FROM ({clean}) _q").fetchone()[0]
+            except Exception:
+                total = None
         result = duck.execute(sql_to_run)
         headers = [d[0] for d in result.description]
         rows = [list(r) for r in result.fetchall()]
@@ -2012,8 +2044,36 @@ def sql_preview(req: SqlPreviewRequest) -> Dict[str, Any]:
         "rows": rows,
         "row_count": len(rows),
         "total_rows": total if total is not None else len(rows),
+        "total_computed": total is not None,
         "limit_applied": req.limit,
     }
+
+
+@app.post("/api/sql/export")
+def sql_export(req: SqlExportRequest) -> Dict[str, Any]:
+    if req.async_job:
+        result = _format_export_job_start(
+            job_svc.start_export_query_job(
+                sql=req.sql,
+                filename=req.filename,
+            )
+        )
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    conn = db.get_connection()
+    try:
+        result = job_svc.start_export_query_job(
+            sql=req.sql,
+            filename=req.filename,
+            conn=conn,
+        )
+    finally:
+        conn.close()
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @app.get("/api/profile/{dataset_id}")
@@ -2309,11 +2369,8 @@ def cancel_job(job_id: str) -> Dict[str, Any]:
 
 
 @app.get("/api/reports")
-def list_reports(limit: int = 0) -> List[Dict[str, Any]]:
-    if int(limit) > 0:
-        limit = max(1, min(int(limit), 5000))
-    else:
-        limit = 0
+def list_reports(limit: int = 200) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit), 5000))
     conn = db.get_connection()
     rows = db.list_reports(conn, limit=limit)
     conn.close()

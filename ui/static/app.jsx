@@ -21,14 +21,15 @@ async function api(path, options = {}) {
   return data;
 }
 
-function DataGrid({ headers, rows, emptyMessage = "No rows." }) {
+function DataGrid({ headers, rows, emptyMessage = "No rows.", className = "" }) {
   const safeHeaders = Array.isArray(headers) ? headers : [];
   const safeRows = Array.isArray(rows) ? rows : [];
   if (!safeHeaders.length) {
     return <div style={{ color: "#5b6470" }}>{emptyMessage}</div>;
   }
+  const wrapperClass = className ? `scroll ${className}` : "scroll";
   return (
-    <div className="scroll">
+    <div className={wrapperClass}>
       <table>
         <thead>
           <tr>
@@ -315,6 +316,14 @@ function App() {
   const [quickMapChoiceOpen, setQuickMapChoiceOpen] = useState(false);
   const [quickMapPendingMappings, setQuickMapPendingMappings] = useState([]);
   const [jobSummary, setJobSummary] = useState(null);
+  const [sqlText, setSqlText] = useState("");
+  const [sqlLimit, setSqlLimit] = useState(100);
+  const [sqlIncludeTotal, setSqlIncludeTotal] = useState(false);
+  const [sqlOutputMode, setSqlOutputMode] = useState("grid");
+  const [sqlExportFilename, setSqlExportFilename] = useState("");
+  const [sqlResult, setSqlResult] = useState(null);
+  const [sqlExportJob, setSqlExportJob] = useState(null);
+  const [sqlBusy, setSqlBusy] = useState(false);
   const [relationshipSide, setRelationshipSide] = useState("target");
   const [relationshipId, setRelationshipId] = useState("");
   const [leftDatasetId, setLeftDatasetId] = useState("");
@@ -431,7 +440,7 @@ function App() {
         api("/api/datasets"),
         api("/api/pairs"),
         api("/api/jobs"),
-        api("/api/reports?limit=0"),
+        api("/api/reports?limit=200"),
         api("/api/relationships?limit=500"),
       ]);
       setSourceFolder(folders.source_folder || "");
@@ -1250,6 +1259,102 @@ function App() {
     }
   }
 
+  async function runSqlPreview() {
+    const clean = String(sqlText || "").trim();
+    if (!clean) {
+      setError("Enter a SQL query first.");
+      return;
+    }
+    setError("");
+    setSqlBusy(true);
+    setStatus("Running SQL preview...");
+    try {
+      const result = await api("/api/sql/preview", {
+        method: "POST",
+        body: JSON.stringify({
+          sql: clean,
+          limit: Math.max(1, Math.min(100, Number(sqlLimit) || 100)),
+          include_total: !!sqlIncludeTotal,
+        }),
+      });
+      setSqlResult(result);
+      setStatus("SQL preview completed.");
+    } catch (err) {
+      setError(err.message);
+      setStatus("SQL preview failed.");
+    } finally {
+      setSqlBusy(false);
+    }
+  }
+
+  async function startSqlExport() {
+    const clean = String(sqlText || "").trim();
+    if (!clean) {
+      setError("Enter a SQL query first.");
+      return;
+    }
+    setError("");
+    setSqlBusy(true);
+    setStatus("Starting SQL export job...");
+    try {
+      const result = await api("/api/sql/export", {
+        method: "POST",
+        body: JSON.stringify({
+          sql: clean,
+          filename: String(sqlExportFilename || "").trim() || null,
+          async_job: true,
+        }),
+      });
+      setSqlExportJob(result);
+      await refreshBootstrap();
+      setStatus(result?.message || `Export job queued: ${result.job_id}`);
+    } catch (err) {
+      setError(err.message);
+      setStatus("SQL export failed to start.");
+    } finally {
+      setSqlBusy(false);
+    }
+  }
+
+  async function refreshSqlExportJob() {
+    const jobId = String(sqlExportJob?.job_id || "").trim();
+    if (!jobId) {
+      return;
+    }
+    setError("");
+    setSqlBusy(true);
+    try {
+      const summary = await api(`/api/jobs/${encodeURIComponent(jobId)}/summary`);
+      setSqlExportJob(summary);
+      if (summary?.state === "succeeded") {
+        await refreshBootstrap();
+        setStatus(`Export job ${jobId} completed.`);
+      } else {
+        setStatus(`Export job ${jobId}: ${summary?.state || "unknown"}.`);
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSqlBusy(false);
+    }
+  }
+
+  async function onRunSqlAction() {
+    if (sqlOutputMode === "export") {
+      await startSqlExport();
+      return;
+    }
+    await runSqlPreview();
+  }
+
+  async function onOpenSqlExportReport() {
+    const reportId = String(sqlExportJob?.report?.id || "").trim();
+    if (!reportId) {
+      return;
+    }
+    await onOpenReport(reportId);
+  }
+
   function clearRelationshipForm() {
     setRelationshipId("");
     setLeftDatasetId("");
@@ -1532,6 +1637,10 @@ function App() {
     String(settingsModel || "").trim().length > 0 &&
     String(claudeInput || "").trim().length > 0 &&
     !claudeSending;
+  const sqlCanExecute = String(sqlText || "").trim().length > 0 && !sqlBusy;
+  const sqlGridHeaders = Array.isArray(sqlResult?.headers) ? sqlResult.headers : [];
+  const sqlGridRows = Array.isArray(sqlResult?.rows) ? sqlResult.rows : [];
+  const sqlExportState = String(sqlExportJob?.state || "");
   const desktopMode = !!serviceState.desktop_mode;
   const inspectorRunning = !!serviceState.services?.mcp_inspector?.running;
   const inspectorUrl = buildInspectorEmbedUrl(
@@ -1654,6 +1763,9 @@ function App() {
             <button className={`tab ${tab === "compare" ? "active" : ""}`} onClick={() => setTab("compare")}>
               Comparison
             </button>
+            <button className={`tab ${tab === "sql" ? "active" : ""}`} onClick={() => setTab("sql")}>
+              SQL
+            </button>
             <button className={`tab ${tab === "reports" ? "active" : ""}`} onClick={() => setTab("reports")}>
               Reports
             </button>
@@ -1678,7 +1790,7 @@ function App() {
             </button>
           </div>
         </aside>
-        <main className="content">
+        <main className={tab === "sql" ? "content content-sql" : "content"}>
       {tab === "settings" ? (
         <>
           <div className="card">
@@ -2562,6 +2674,118 @@ function App() {
             )}
           </div>
         </>
+      ) : null}
+
+      {tab === "sql" ? (
+        <div className="sql-shell">
+          <div className="card sql-workspace-card">
+            <h3 className="sql-card-title">SQL</h3>
+            <div className="sql-workspace-layout">
+              <div className="sql-query-column">
+                <label>Query</label>
+                <textarea
+                  className="sql-query-input"
+                  rows={10}
+                  value={sqlText}
+                  onChange={(e) => setSqlText(e.target.value)}
+                  placeholder="SELECT * FROM source_your_table LIMIT 100"
+                />
+              </div>
+              <div className="sql-controls-column">
+                <div>
+                  <label>Output</label>
+                  <select value={sqlOutputMode} onChange={(e) => setSqlOutputMode(e.target.value)}>
+                    <option value="grid">Print to grid (default)</option>
+                    <option value="export">Export to Excel</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Preview limit</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="100"
+                    value={sqlLimit}
+                    onChange={(e) => setSqlLimit(e.target.value)}
+                    disabled={sqlOutputMode !== "grid"}
+                  />
+                </div>
+                <div>
+                  <label>Count total rows</label>
+                  <select
+                    value={sqlIncludeTotal ? "1" : "0"}
+                    onChange={(e) => setSqlIncludeTotal(e.target.value === "1")}
+                    disabled={sqlOutputMode !== "grid"}
+                  >
+                    <option value="0">No</option>
+                    <option value="1">Yes</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Export filename (optional)</label>
+                  <input
+                    value={sqlExportFilename}
+                    onChange={(e) => setSqlExportFilename(e.target.value)}
+                    placeholder="sales_check.xlsx"
+                    disabled={sqlOutputMode !== "export"}
+                  />
+                </div>
+                <button onClick={onRunSqlAction} disabled={!sqlCanExecute}>
+                  {sqlOutputMode === "export" ? "Start Export" : "Run Query"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="card sql-result-card">
+            <h3 className="sql-card-title">Result</h3>
+            {sqlOutputMode === "grid" ? (
+              <>
+                <div className="sub sql-result-meta">
+                  Rows returned: {displayValue(sqlResult?.row_count || 0)} | Total rows: {displayValue(sqlResult?.total_rows || 0)} |{" "}
+                  Total computed: {sqlResult?.total_computed ? "Yes" : "No"}
+                </div>
+                <div className="sql-result-grid-wrap">
+                  <DataGrid
+                    className="sql-result-grid"
+                    headers={sqlGridHeaders}
+                    rows={sqlGridRows}
+                    emptyMessage="Run a SQL preview to see results."
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                {sqlExportJob?.job_id ? (
+                  <>
+                    <div className="sub sql-result-meta">
+                      Job ID: {displayValue(sqlExportJob.job_id)} | State: {displayValue(sqlExportState)}
+                    </div>
+                    <div className="actions">
+                      <button className="secondary" onClick={refreshSqlExportJob} disabled={sqlBusy}>
+                        Refresh Export Status
+                      </button>
+                      <button
+                        className="secondary"
+                        onClick={onOpenSqlExportReport}
+                        disabled={!sqlExportJob?.report?.id}
+                      >
+                        Open Export File
+                      </button>
+                    </div>
+                    {sqlExportJob?.report ? (
+                      <div className="sub" style={{ marginTop: 8 }}>
+                        Report: {displayValue(sqlExportJob.report.file_name)} ({displayValue(sqlExportJob.report.id)})
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <div style={{ color: "#5b6470" }}>Start an export job to generate an XLSX report.</div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
       ) : null}
 
       {tab === "compare" ? (
