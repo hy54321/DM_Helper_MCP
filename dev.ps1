@@ -22,7 +22,7 @@ $services = @(
         Required = $false
         Env = @{
             MCP_EXPOSE_BROAD_DISCOVERY = "1"
-            DMH_MCP_MODE = "debug"
+            PROTOQUERY_MCP_MODE = "debug"
         }
     },
     @{
@@ -34,7 +34,7 @@ $services = @(
             FASTMCP_HOST = "127.0.0.1"
             FASTMCP_PORT = $NgrokPort
             FASTMCP_LOG_LEVEL = "INFO"
-            DMH_MCP_MODE = "prod"
+            PROTOQUERY_MCP_MODE = "prod"
         }
     },
     @{

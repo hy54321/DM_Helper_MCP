@@ -4,10 +4,14 @@ import csv
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import threading
+import asyncio
+import inspect
+import httpx
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, IO, List, Optional
@@ -17,10 +21,11 @@ import logging
 
 from anthropic import Anthropic
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 from mcp_server import mcp as _mcp_instance
@@ -145,6 +150,8 @@ class RelationshipLinkRequest(BaseModel):
 class SaveAppSettingsRequest(BaseModel):
     theme: str = "light"
     anthropic_api_key: Optional[str] = None
+    ngrok_authtoken: Optional[str] = None
+    mcp_auth_mode: str = "none"
     model: str = ""
     claude_instructions: str = ""
 
@@ -169,12 +176,13 @@ class ClaudeChatRequest(BaseModel):
 
 @dataclass
 class ManagedService:
-    process: subprocess.Popen
-    log_handle: IO[str]
-    log_file: str
+    process: Optional[subprocess.Popen]
+    log_handle: Optional[IO[str]]
+    log_file: Optional[str]
     started_at: str
     service_url: Optional[str] = None
     log_offset: int = 0
+    ngrok_listener: Any = None
 
 
 _DESKTOP_SERVICES = ("mcp_server", "mcp_inspector", "ngrok")
@@ -182,21 +190,37 @@ _SERVICE_LOCK = threading.RLock()
 _SERVICE_STATE: Dict[str, ManagedService] = {}
 _SERVICE_ERRORS: Dict[str, str] = {name: "" for name in _DESKTOP_SERVICES}
 _ALLOWED_THEMES = {"light", "dark"}
+_ALLOWED_MCP_AUTH_MODES = {"none", "api"}
 _SETTINGS_THEME_KEY = "ui_theme"
 _SETTINGS_ANTHROPIC_API_KEY = "anthropic_api_key_encrypted"
 _SETTINGS_ANTHROPIC_MODEL_KEY = "anthropic_model"
 _SETTINGS_ANTHROPIC_MODELS_CACHE_KEY = "anthropic_models_cache_json"
 _SETTINGS_ANTHROPIC_ACTIVATED_KEY = "anthropic_api_key_activated"
 _SETTINGS_CLAUDE_INSTRUCTIONS_KEY = "claude_system_instructions"
-_SETTINGS_ENCRYPTION_KEY_FILE = ".dmh_settings.key"
+_SETTINGS_NGROK_AUTHTOKEN_KEY = "ngrok_authtoken_encrypted"
+_SETTINGS_MCP_AUTH_MODE_KEY = "mcp_auth_mode"
+_SETTINGS_MCP_API_KEY_KEY = "mcp_api_key_encrypted"
+_MCP_API_KEY_HEADER_NAME = "x-api-key"
+_SETTINGS_ENCRYPTION_KEY_FILE = ".protoquery_settings.key"
+_LEGACY_SETTINGS_ENCRYPTION_KEY_FILE = ".dmh_settings.key"
+
+
+def _env_with_legacy(primary: str, legacy: str, default: str = "") -> str:
+    value = os.getenv(primary, "").strip()
+    if value:
+        return value
+    legacy_value = os.getenv(legacy, "").strip()
+    if legacy_value:
+        return legacy_value
+    return default
 
 
 def _desktop_mode_enabled() -> bool:
-    return os.getenv("DMH_DESKTOP_MODE", "0") == "1"
+    return _env_with_legacy("PROTOQUERY_DESKTOP_MODE", "DMH_DESKTOP_MODE", "0") == "1"
 
 
 def _app_base_dir() -> Path:
-    raw = os.getenv("DMH_APP_BASE_DIR", "").strip()
+    raw = _env_with_legacy("PROTOQUERY_APP_BASE_DIR", "DMH_APP_BASE_DIR")
     if raw:
         return Path(raw).resolve()
     return Path.cwd()
@@ -209,7 +233,7 @@ def _iso_utc_now() -> str:
 
 
 def _mcp_port() -> int:
-    for key in ("DMH_MCP_PORT", "MCP_PORT", "FASTMCP_PORT"):
+    for key in ("PROTOQUERY_MCP_PORT", "DMH_MCP_PORT", "MCP_PORT", "FASTMCP_PORT"):
         raw = os.getenv(key, "").strip()
         if not raw:
             continue
@@ -222,32 +246,91 @@ def _mcp_port() -> int:
     return 8000
 
 
-def _resolve_ngrok_executable(base_dir: Path) -> str:
-    configured = os.getenv("NGROK_PATH", "").strip()
-    if configured:
-        path = Path(configured)
-        if path.exists():
-            return str(path)
-        raise RuntimeError(f"NGROK_PATH does not exist: {configured}")
-
-    local_name = "ngrok.exe" if os.name == "nt" else "ngrok"
-    local_path = base_dir / local_name
-    if local_path.exists():
-        return str(local_path)
-
-    path_lookup = shutil.which("ngrok")
-    if path_lookup:
-        return path_lookup
-
-    raise RuntimeError("ngrok executable not found. Place ngrok.exe next to the app or set NGROK_PATH.")
-
-
 def _resolve_npx_executable() -> str:
     for name in ("npx.cmd", "npx.exe", "npx"):
         found = shutil.which(name)
         if found:
             return found
     raise RuntimeError("npx not found. Install Node.js or add npx to PATH.")
+
+
+def _load_ngrok_sdk() -> Any:
+    try:
+        import ngrok as ngrok_sdk
+    except Exception as exc:
+        raise RuntimeError("ngrok SDK is not installed. Install dependencies and restart the app.") from exc
+    return ngrok_sdk
+
+
+def _resolve_awaitable_sync(value: Any, operation: str) -> Any:
+    if not inspect.isawaitable(value):
+        return value
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+
+    # Sync endpoints should not run inside an event loop, but handle it defensively.
+    result_box: Dict[str, Any] = {}
+    error_box: Dict[str, Exception] = {}
+
+    def _runner() -> None:
+        try:
+            result_box["value"] = asyncio.run(value)
+        except Exception as run_exc:
+            error_box["error"] = run_exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "error" in error_box:
+        raise RuntimeError(f"{operation} failed: {error_box['error']}") from error_box["error"]
+    return result_box.get("value")
+
+
+def _ngrok_listener_public_url(listener: Any) -> str:
+    if listener is None:
+        return ""
+    try:
+        url_attr = getattr(listener, "url", None)
+        if callable(url_attr):
+            raw = url_attr()
+        else:
+            raw = url_attr
+    except Exception:
+        return ""
+    return str(raw or "").strip()
+
+
+def _ngrok_listener_public_mcp_url(listener: Any) -> str:
+    return _append_mcp_suffix(_ngrok_listener_public_url(listener))
+
+
+def _start_ngrok_listener(authtoken: str, mcp_port: int) -> tuple[Any, str]:
+    ngrok_sdk = _load_ngrok_sdk()
+    ngrok_sdk.set_auth_token(authtoken)
+    listener = _resolve_awaitable_sync(
+        ngrok_sdk.forward(f"http://127.0.0.1:{mcp_port}"),
+        "ngrok.forward",
+    )
+    if not listener:
+        raise RuntimeError("ngrok.forward() did not return a listener.")
+    service_url = _ngrok_listener_public_mcp_url(listener)
+    return listener, service_url
+
+
+def _stop_ngrok_listener(listener: Any) -> None:
+    ngrok_sdk = _load_ngrok_sdk()
+    try:
+        close_fn = getattr(listener, "close", None)
+        if callable(close_fn):
+            _resolve_awaitable_sync(close_fn(), "listener.close")
+    except Exception:
+        # Fall back to killing any SDK-managed listeners in this process.
+        pass
+    kill_fn = getattr(ngrok_sdk, "kill", None)
+    if callable(kill_fn):
+        _resolve_awaitable_sync(kill_fn(), "ngrok.kill")
 
 
 def _extract_inspector_url_from_log(log_file: str, min_offset: int = 0) -> Optional[str]:
@@ -322,6 +405,22 @@ def _mcp_server_url() -> str:
     return f"http://127.0.0.1:{_mcp_port()}/mcp"
 
 
+def _ui_port() -> int:
+    raw = (os.getenv("UI_PORT", "") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if 1 <= value <= 65535:
+                return value
+        except ValueError:
+            pass
+    return 8001
+
+
+def _inspector_mcp_relay_url() -> str:
+    return f"http://127.0.0.1:{_ui_port()}/api/inspector/mcp"
+
+
 def _inspector_base_url() -> str:
     return "http://localhost:6274"
 
@@ -391,10 +490,15 @@ def _is_port_listening(host: str, port: int) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
-def _service_command(service_name: str) -> tuple[List[str], Dict[str, str]]:
+def _service_command(
+    service_name: str, mcp_auth: Optional[Dict[str, str]] = None
+) -> tuple[List[str], Dict[str, str]]:
     base_dir = _app_base_dir()
     mcp_port = str(_mcp_port())
     env_overrides: Dict[str, str] = {}
+    auth_mode = _normalize_mcp_auth_mode((mcp_auth or {}).get("mode", "none"))
+    auth_header = (mcp_auth or {}).get("header_name", _MCP_API_KEY_HEADER_NAME).strip() or _MCP_API_KEY_HEADER_NAME
+    auth_api_key = (mcp_auth or {}).get("api_key", "").strip()
 
     if service_name == "mcp_server":
         if getattr(sys, "frozen", False):
@@ -405,13 +509,24 @@ def _service_command(service_name: str) -> tuple[List[str], Dict[str, str]]:
             "MCP_TRANSPORT": "streamable-http",
             "FASTMCP_HOST": os.getenv("FASTMCP_HOST", "127.0.0.1"),
             "FASTMCP_PORT": mcp_port,
-            "DMH_MCP_MODE": os.getenv("DMH_MCP_MODE", "prod"),
+            "PROTOQUERY_MCP_MODE": _env_with_legacy("PROTOQUERY_MCP_MODE", "DMH_MCP_MODE", "prod"),
         }
+        if auth_mode == "api":
+            if not auth_api_key:
+                raise RuntimeError("MCP authentication mode is API but no API key is stored. Generate one in Settings.")
+            env_overrides["PROTOQUERY_MCP_AUTH_MODE"] = "api"
+            env_overrides["PROTOQUERY_MCP_API_KEY"] = auth_api_key
+            env_overrides["PROTOQUERY_MCP_API_KEY_HEADER"] = auth_header
+        else:
+            env_overrides["PROTOQUERY_MCP_AUTH_MODE"] = "none"
         return command, env_overrides
 
     if service_name == "mcp_inspector":
         npx_exe = _resolve_npx_executable()
         server_url = f"http://127.0.0.1:{mcp_port}/mcp"
+        if auth_mode == "api":
+            # Use a local relay so inspector does not depend on its own persisted custom headers.
+            server_url = _inspector_mcp_relay_url()
         command = [
             npx_exe,
             "@modelcontextprotocol/inspector",
@@ -420,29 +535,48 @@ def _service_command(service_name: str) -> tuple[List[str], Dict[str, str]]:
             "--server-url",
             server_url,
         ]
+        if auth_mode == "api" and not auth_api_key:
+            raise RuntimeError("MCP authentication mode is API but no API key is stored. Generate one in Settings.")
         env_overrides = {
             "MCP_AUTO_OPEN_ENABLED": "false",
         }
         return command, env_overrides
 
-    if service_name == "ngrok":
-        ngrok_exe = _resolve_ngrok_executable(base_dir)
-        command = [ngrok_exe, "http", mcp_port]
-        return command, {}
-
     raise ValueError(f"Unsupported service '{service_name}'")
+
+
+def _command_for_log(command: List[str]) -> str:
+    if not command:
+        return ""
+    redacted: List[str] = []
+    i = 0
+    while i < len(command):
+        part = command[i]
+        if part == "--header" and i + 1 < len(command):
+            header_value = command[i + 1]
+            if ":" in header_value:
+                header_name, _ = header_value.split(":", 1)
+                redacted.extend(["--header", f"{header_name}: ***"])
+                i += 2
+                continue
+        redacted.append(part)
+        i += 1
+    return " ".join(redacted)
 
 
 def _cleanup_if_exited(service_name: str) -> None:
     service = _SERVICE_STATE.get(service_name)
     if not service:
         return
+    if service.process is None:
+        return
     return_code = service.process.poll()
     if return_code is None:
         return
     _SERVICE_ERRORS[service_name] = f"Exited with code {return_code}. Check logs."
     try:
-        service.log_handle.close()
+        if service.log_handle:
+            service.log_handle.close()
     except Exception:
         pass
     _SERVICE_STATE.pop(service_name, None)
@@ -692,13 +826,18 @@ def _service_snapshot(service_name: str) -> Dict[str, Any]:
     with _SERVICE_LOCK:
         _cleanup_if_exited(service_name)
         service = _SERVICE_STATE.get(service_name)
-        running = bool(service and service.process.poll() is None)
+        managed_process_running = bool(service and service.process and service.process.poll() is None)
+        managed_ngrok_running = bool(service_name == "ngrok" and service and service.ngrok_listener is not None)
+        running = bool(managed_process_running or managed_ngrok_running)
         external_pid: Optional[int] = None
         service_url = service.service_url if service else None
         if running and service_name == "mcp_server":
             service_url = _mcp_server_url()
         if running and service_name == "mcp_inspector" and service and not service_url:
-            service_url = _extract_inspector_url_from_log(service.log_file, min_offset=service.log_offset)
+            service_url = _extract_inspector_url_from_log(
+                service.log_file or str(_app_base_dir() / "logs" / "mcp_inspector.log"),
+                min_offset=service.log_offset,
+            )
             if service_url:
                 service.service_url = service_url
         if not running and service_name == "mcp_server":
@@ -731,10 +870,14 @@ def _service_snapshot(service_name: str) -> Dict[str, Any]:
                         "ngrok is already running in another process; reusing existing tunnel process."
                     )
         if running and service_name == "ngrok":
-            ngrok_url = _discover_ngrok_public_mcp_url(timeout_seconds=1.0)
+            ngrok_url = ""
+            if managed_ngrok_running and service:
+                ngrok_url = _ngrok_listener_public_mcp_url(service.ngrok_listener)
+            if not ngrok_url:
+                ngrok_url = _discover_ngrok_public_mcp_url(timeout_seconds=1.0)
             if ngrok_url:
                 service_url = ngrok_url
-                if service and service.process.poll() is None:
+                if service and (managed_process_running or managed_ngrok_running):
                     service.service_url = ngrok_url
         if service_name == "mcp_inspector" and not service_url:
             service_url = "http://localhost:6274"
@@ -748,9 +891,9 @@ def _service_snapshot(service_name: str) -> Dict[str, Any]:
         return {
             "name": service_name,
             "running": running,
-            "pid": service.process.pid if running and service else external_pid,
+            "pid": service.process.pid if running and service and service.process else external_pid,
             "started_at": service.started_at if running and service else None,
-            "log_file": service.log_file if service else None,
+            "log_file": service.log_file if service and service.log_file else None,
             "last_error": _SERVICE_ERRORS.get(service_name, ""),
             "port": reported_port,
             "service_url": service_url,
@@ -764,7 +907,14 @@ def _start_service(service_name: str) -> Dict[str, Any]:
     with _SERVICE_LOCK:
         _cleanup_if_exited(service_name)
         current = _SERVICE_STATE.get(service_name)
-        if current and current.process.poll() is None:
+        current_running = bool(
+            current
+            and (
+                (current.process and current.process.poll() is None)
+                or (service_name == "ngrok" and current.ngrok_listener is not None)
+            )
+        )
+        if current_running:
             return _service_snapshot(service_name)
 
         if service_name == "mcp_server":
@@ -792,15 +942,40 @@ def _start_service(service_name: str) -> Dict[str, Any]:
         if service_name == "ngrok":
             if _list_ngrok_pids():
                 return _service_snapshot(service_name)
+            conn = db.get_connection()
+            try:
+                authtoken = _require_stored_ngrok_authtoken(conn)
+            finally:
+                conn.close()
+            listener, service_url = _start_ngrok_listener(authtoken=authtoken, mcp_port=_mcp_port())
+            _SERVICE_STATE[service_name] = ManagedService(
+                process=None,
+                log_handle=None,
+                log_file=None,
+                started_at=_iso_utc_now(),
+                service_url=service_url or None,
+                log_offset=0,
+                ngrok_listener=listener,
+            )
+            _SERVICE_ERRORS[service_name] = ""
+            return _service_snapshot(service_name)
 
-        command, env_overrides = _service_command(service_name)
+        mcp_auth: Optional[Dict[str, str]] = None
+        if service_name in ("mcp_server", "mcp_inspector"):
+            conn = db.get_connection()
+            try:
+                mcp_auth = _mcp_auth_runtime_config(conn)
+            finally:
+                conn.close()
+
+        command, env_overrides = _service_command(service_name, mcp_auth=mcp_auth)
         base_dir = _app_base_dir()
         log_dir = base_dir / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"{service_name}.log"
         log_handle = open(log_file, "a", encoding="utf-8")
         log_offset = log_handle.tell()
-        log_handle.write(f"\n[{_iso_utc_now()}] START {' '.join(command)}\n")
+        log_handle.write(f"\n[{_iso_utc_now()}] START {_command_for_log(command)}\n")
         log_handle.flush()
 
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -828,6 +1003,7 @@ def _start_service(service_name: str) -> Dict[str, Any]:
             started_at=_iso_utc_now(),
             service_url=None,
             log_offset=log_offset,
+            ngrok_listener=None,
         )
         _SERVICE_STATE[service_name] = service
         if service_name == "mcp_server":
@@ -878,15 +1054,20 @@ def _stop_service(service_name: str) -> Dict[str, Any]:
             return _service_snapshot(service_name)
 
         try:
-            _terminate_process_tree(service.process)
+            if service_name == "ngrok":
+                _stop_ngrok_listener(service.ngrok_listener)
+            elif service.process:
+                _terminate_process_tree(service.process)
         finally:
             try:
-                service.log_handle.write(f"[{_iso_utc_now()}] STOP\n")
-                service.log_handle.flush()
+                if service.log_handle:
+                    service.log_handle.write(f"[{_iso_utc_now()}] STOP\n")
+                    service.log_handle.flush()
             except Exception:
                 pass
             try:
-                service.log_handle.close()
+                if service.log_handle:
+                    service.log_handle.close()
             except Exception:
                 pass
             _SERVICE_STATE.pop(service_name, None)
@@ -941,17 +1122,29 @@ def _normalize_theme(theme: str) -> str:
     return "light"
 
 
+def _normalize_mcp_auth_mode(mode: str) -> str:
+    val = (mode or "").strip().lower()
+    if val in ("api", "api_key", "apikey"):
+        return "api"
+    if val in _ALLOWED_MCP_AUTH_MODES:
+        return val
+    return "none"
+
+
 def _settings_encryption_key_file_path() -> Path:
+    legacy_key = _app_base_dir() / _LEGACY_SETTINGS_ENCRYPTION_KEY_FILE
+    if legacy_key.exists():
+        return legacy_key
     return _app_base_dir() / _SETTINGS_ENCRYPTION_KEY_FILE
 
 
 def _settings_cipher() -> Fernet:
-    env_key = os.getenv("DMH_SETTINGS_ENCRYPTION_KEY", "").strip()
+    env_key = _env_with_legacy("PROTOQUERY_SETTINGS_ENCRYPTION_KEY", "DMH_SETTINGS_ENCRYPTION_KEY")
     if env_key:
         try:
             return Fernet(env_key.encode("utf-8"))
         except Exception as exc:
-            raise RuntimeError("DMH_SETTINGS_ENCRYPTION_KEY is invalid.") from exc
+            raise RuntimeError("PROTOQUERY_SETTINGS_ENCRYPTION_KEY is invalid.") from exc
 
     key_file = _settings_encryption_key_file_path()
     key_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1000,6 +1193,105 @@ def _mask_secret(value: str) -> str:
     if len(raw) <= 8:
         return "*" * len(raw)
     return f"{raw[:6]}...{raw[-4:]}"
+
+
+def _generate_mcp_api_key() -> str:
+    # 32 bytes of entropy, URL-safe for easy copy/paste into MCP client settings.
+    return secrets.token_urlsafe(32)
+
+
+def _read_stored_ngrok_authtoken(conn) -> tuple[str, bool]:
+    encrypted = (db.get_meta(conn, _SETTINGS_NGROK_AUTHTOKEN_KEY, "") or "").strip()
+    if not encrypted:
+        return "", False
+    try:
+        return _decrypt_secret(encrypted), True
+    except RuntimeError:
+        return "", True
+
+
+def _require_stored_ngrok_authtoken(conn) -> str:
+    token, configured = _read_stored_ngrok_authtoken(conn)
+    if token:
+        return token
+    if configured:
+        raise RuntimeError("Stored ngrok authtoken cannot be decrypted. Please set it again.")
+    raise RuntimeError("ngrok authtoken is required. Save it in Settings first.")
+
+
+def _read_stored_mcp_api_key(conn) -> tuple[str, bool]:
+    encrypted = (db.get_meta(conn, _SETTINGS_MCP_API_KEY_KEY, "") or "").strip()
+    if not encrypted:
+        return "", False
+    try:
+        return _decrypt_secret(encrypted), True
+    except RuntimeError:
+        return "", True
+
+
+def _require_stored_mcp_api_key(conn) -> str:
+    key, configured = _read_stored_mcp_api_key(conn)
+    if key:
+        return key
+    if configured:
+        raise RuntimeError("Stored MCP API key cannot be decrypted. Generate a new key in Settings.")
+    raise RuntimeError("MCP API key is required when MCP authentication mode is API. Generate one in Settings.")
+
+
+def _mcp_auth_runtime_config(conn) -> Dict[str, str]:
+    mode = _normalize_mcp_auth_mode(db.get_meta(conn, _SETTINGS_MCP_AUTH_MODE_KEY, "none") or "none")
+    config: Dict[str, str] = {"mode": mode, "header_name": _MCP_API_KEY_HEADER_NAME}
+    if mode == "api":
+        config["api_key"] = _require_stored_mcp_api_key(conn)
+    return config
+
+
+_HOP_BY_HOP_REQUEST_HEADERS = {
+    "host",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+}
+
+_HOP_BY_HOP_RESPONSE_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+}
+
+
+def _filtered_proxy_request_headers(request: Request) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    for key, value in request.headers.items():
+        lower_key = key.lower()
+        if lower_key in _HOP_BY_HOP_REQUEST_HEADERS:
+            continue
+        # Inspector's own proxy-auth header is not relevant to upstream MCP server.
+        if lower_key == "x-mcp-proxy-auth":
+            continue
+        headers[key] = value
+    return headers
+
+
+def _filtered_proxy_response_headers(headers: httpx.Headers) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for key, value in headers.items():
+        if key.lower() in _HOP_BY_HOP_RESPONSE_HEADERS:
+            continue
+        result[key] = value
+    return result
 
 
 def _read_stored_anthropic_key(conn) -> tuple[str, bool]:
@@ -1114,18 +1406,37 @@ def _get_saved_app_settings() -> Dict[str, Any]:
         model = (db.get_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, "") or "").strip()
         claude_instructions = (db.get_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, "") or "").strip()
         models = _load_cached_models(conn)
-        key, configured = _read_stored_anthropic_key(conn)
-        needs_reset = bool(configured and not key)
-        activated = bool(configured and key and _is_anthropic_key_activated(conn))
-        masked = _mask_secret(key) if key else ("configured" if needs_reset else "")
+        anthropic_key, anthropic_configured = _read_stored_anthropic_key(conn)
+        anthropic_needs_reset = bool(anthropic_configured and not anthropic_key)
+        anthropic_activated = bool(anthropic_configured and anthropic_key and _is_anthropic_key_activated(conn))
+        anthropic_masked = _mask_secret(anthropic_key) if anthropic_key else ("configured" if anthropic_needs_reset else "")
+        ngrok_token, ngrok_configured = _read_stored_ngrok_authtoken(conn)
+        ngrok_needs_reset = bool(ngrok_configured and not ngrok_token)
+        ngrok_masked = _mask_secret(ngrok_token) if ngrok_token else ("configured" if ngrok_needs_reset else "")
+        mcp_auth_mode = _normalize_mcp_auth_mode(db.get_meta(conn, _SETTINGS_MCP_AUTH_MODE_KEY, "none") or "none")
+        mcp_api_key, mcp_api_key_configured = _read_stored_mcp_api_key(conn)
+        mcp_api_key_needs_reset = bool(mcp_api_key_configured and not mcp_api_key)
+        mcp_api_key_masked = (
+            _mask_secret(mcp_api_key)
+            if mcp_api_key
+            else ("configured" if mcp_api_key_needs_reset else "")
+        )
         return {
             "theme": theme,
             "model": model,
             "models": models,
-            "anthropic_api_key_set": configured,
-            "anthropic_api_key_masked": masked,
-            "anthropic_api_key_needs_reset": needs_reset,
-            "anthropic_api_key_activated": activated,
+            "anthropic_api_key_set": anthropic_configured,
+            "anthropic_api_key_masked": anthropic_masked,
+            "anthropic_api_key_needs_reset": anthropic_needs_reset,
+            "anthropic_api_key_activated": anthropic_activated,
+            "ngrok_authtoken_set": ngrok_configured,
+            "ngrok_authtoken_masked": ngrok_masked,
+            "ngrok_authtoken_needs_reset": ngrok_needs_reset,
+            "mcp_auth_mode": mcp_auth_mode,
+            "mcp_api_key_header_name": _MCP_API_KEY_HEADER_NAME,
+            "mcp_api_key_set": mcp_api_key_configured,
+            "mcp_api_key_masked": mcp_api_key_masked,
+            "mcp_api_key_needs_reset": mcp_api_key_needs_reset,
             "claude_instructions": claude_instructions,
         }
     finally:
@@ -1195,7 +1506,7 @@ def _validate_relationship_payload(conn, payload: RelationshipUpsertRequest) -> 
     return left_fields, right_fields
 
 
-app = FastAPI(title="DM Helper Admin UI", version="0.1.0")
+app = FastAPI(title="ProtoQuery Admin UI", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1301,23 +1612,112 @@ def get_app_settings() -> Dict[str, Any]:
 @app.post("/api/settings/app")
 def save_app_settings(req: SaveAppSettingsRequest) -> Dict[str, Any]:
     theme = _normalize_theme(req.theme)
+    mcp_auth_mode = _normalize_mcp_auth_mode(req.mcp_auth_mode)
     model = (req.model or "").strip()
     claude_instructions = (req.claude_instructions or "").strip()
     api_key_input = req.anthropic_api_key
+    ngrok_authtoken_input = req.ngrok_authtoken
 
     conn = db.get_connection()
     try:
         db.set_meta(conn, _SETTINGS_THEME_KEY, theme, commit=False)
+        db.set_meta(conn, _SETTINGS_MCP_AUTH_MODE_KEY, mcp_auth_mode, commit=False)
         db.set_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, model, commit=False)
         db.set_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, claude_instructions, commit=False)
         if api_key_input is not None:
             encrypted = _encrypt_secret((api_key_input or "").strip())
             db.set_meta(conn, _SETTINGS_ANTHROPIC_API_KEY, encrypted, commit=False)
             _set_anthropic_key_activated(conn, False)
+        if ngrok_authtoken_input is not None:
+            encrypted_token = _encrypt_secret((ngrok_authtoken_input or "").strip())
+            db.set_meta(conn, _SETTINGS_NGROK_AUTHTOKEN_KEY, encrypted_token, commit=False)
     finally:
         conn.close()
 
     return _get_saved_app_settings()
+
+
+@app.post("/api/settings/mcp-auth/generate")
+def generate_mcp_api_key() -> Dict[str, Any]:
+    generated_key = _generate_mcp_api_key()
+    conn = db.get_connection()
+    try:
+        # Generating a key implies API-key auth intent, so persist mode to avoid UI/state reversion.
+        db.set_meta(conn, _SETTINGS_MCP_AUTH_MODE_KEY, "api", commit=False)
+        db.set_meta(conn, _SETTINGS_MCP_API_KEY_KEY, _encrypt_secret(generated_key), commit=False)
+    finally:
+        conn.close()
+
+    return {
+        "api_key": generated_key,
+        "header_name": _MCP_API_KEY_HEADER_NAME,
+        "app_settings": _get_saved_app_settings(),
+    }
+
+
+@app.api_route("/api/inspector/mcp", methods=["GET", "POST", "DELETE"])
+@app.api_route("/api/inspector/mcp/{subpath:path}", methods=["GET", "POST", "DELETE"])
+async def inspector_mcp_relay(request: Request, subpath: str = "") -> StreamingResponse:
+    upstream_base = _mcp_server_url().rstrip("/")
+    suffix = f"/{subpath.lstrip('/')}" if subpath else ""
+    query = request.url.query or ""
+    upstream_url = f"{upstream_base}{suffix}"
+    if query:
+        upstream_url = f"{upstream_url}?{query}"
+
+    forward_headers = _filtered_proxy_request_headers(request)
+
+    conn = db.get_connection()
+    try:
+        auth_cfg = _mcp_auth_runtime_config(conn)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if auth_cfg.get("mode") == "api":
+        header_name = auth_cfg.get("header_name", _MCP_API_KEY_HEADER_NAME)
+        api_key = auth_cfg.get("api_key", "")
+        if not api_key:
+            raise HTTPException(status_code=500, detail="MCP API key is missing for inspector relay.")
+        forward_headers[header_name] = api_key
+
+    body = await request.body()
+
+    client = httpx.AsyncClient(timeout=None)
+    outbound = client.build_request(
+        request.method.upper(),
+        upstream_url,
+        headers=forward_headers,
+        content=body,
+    )
+
+    try:
+        upstream = await client.send(outbound, stream=True)
+    except Exception as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Inspector relay failed: {exc}")
+
+    relay_headers = _filtered_proxy_response_headers(upstream.headers)
+
+    async def _stream() -> Any:
+        async for chunk in upstream.aiter_raw():
+            yield chunk
+
+    async def _cleanup() -> None:
+        await upstream.aclose()
+        await client.aclose()
+
+    return StreamingResponse(
+        _stream(),
+        status_code=upstream.status_code,
+        headers=relay_headers,
+        media_type=upstream.headers.get("content-type"),
+        background=BackgroundTask(_cleanup),
+    )
 
 
 @app.post("/api/settings/anthropic/validate")

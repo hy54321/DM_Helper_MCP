@@ -1,5 +1,5 @@
 """
-SQLite metadata database for DM Helper.
+SQLite metadata database for ProtoQuery.
 
 Stores catalog snapshots, pair overrides, key presets, job history,
 and report manifests.  All operational state lives here – DuckDB is
@@ -25,10 +25,10 @@ def _app_base_dir() -> str:
 
 
 def _default_db_path() -> str:
-    override = os.getenv("DMH_DB_PATH", "").strip()
+    override = os.getenv("PROTOQUERY_DB_PATH", "").strip() or os.getenv("DMH_DB_PATH", "").strip()
     if override:
         return os.path.abspath(override)
-    return os.path.join(_app_base_dir(), "dm_helper.db")
+    return os.path.join(_app_base_dir(), "protoquery.db")
 
 
 def get_connection(path: str | None = None) -> sqlite3.Connection:
@@ -61,6 +61,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             columns_json TEXT NOT NULL DEFAULT '[]',
             raw_columns_json TEXT NOT NULL DEFAULT '[]',
             column_map_json TEXT NOT NULL DEFAULT '{}',
+            csv_encoding TEXT NOT NULL DEFAULT '',
             row_count   INTEGER,
             discovered_at TEXT NOT NULL,
             updated_at  TEXT NOT NULL
@@ -176,6 +177,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE datasets ADD COLUMN file_size INTEGER")
     if "file_mtime_ns" not in ds_cols:
         conn.execute("ALTER TABLE datasets ADD COLUMN file_mtime_ns INTEGER")
+    if "csv_encoding" not in ds_cols:
+        conn.execute("ALTER TABLE datasets ADD COLUMN csv_encoding TEXT NOT NULL DEFAULT ''")
     rel_cols = {r["name"] for r in conn.execute("PRAGMA table_info(dataset_relationships)").fetchall()}
     if "left_fields_json" not in rel_cols:
         conn.execute("ALTER TABLE dataset_relationships ADD COLUMN left_fields_json TEXT NOT NULL DEFAULT '[]'")
@@ -216,9 +219,9 @@ def upsert_dataset(conn: sqlite3.Connection, ds: Dict[str, Any], commit: bool = 
         """
         INSERT INTO datasets
             (id, side, file_name, file_path, file_size, file_mtime_ns, sheet_name, ext,
-             columns_json, raw_columns_json, column_map_json,
+             columns_json, raw_columns_json, column_map_json, csv_encoding,
              row_count, discovered_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             file_path = excluded.file_path,
             file_size = excluded.file_size,
@@ -226,6 +229,7 @@ def upsert_dataset(conn: sqlite3.Connection, ds: Dict[str, Any], commit: bool = 
             columns_json = excluded.columns_json,
             raw_columns_json = excluded.raw_columns_json,
             column_map_json = excluded.column_map_json,
+            csv_encoding = excluded.csv_encoding,
             row_count = excluded.row_count,
             updated_at = excluded.updated_at
         """,
@@ -241,6 +245,7 @@ def upsert_dataset(conn: sqlite3.Connection, ds: Dict[str, Any], commit: bool = 
             json.dumps(ds.get("columns", [])),
             json.dumps(ds.get("raw_columns", [])),
             json.dumps(ds.get("column_map", {})),
+            str(ds.get("csv_encoding", "") or ""),
             ds.get("row_count"),
             now,
             now,
@@ -297,6 +302,7 @@ def _row_to_dataset(row: sqlite3.Row) -> Dict[str, Any]:
         "columns": json.loads(row["columns_json"]),
         "raw_columns": json.loads(row["raw_columns_json"]),
         "column_map": json.loads(row["column_map_json"]),
+        "csv_encoding": row["csv_encoding"] or "",
         "row_count": row["row_count"],
         "discovered_at": row["discovered_at"],
         "updated_at": row["updated_at"],

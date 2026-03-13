@@ -329,6 +329,8 @@ def compare_field(
     key_columns: List[str],
     field: str,
     limit: int = 10,
+    key_mappings: Optional[List[Dict[str, str]]] = None,
+    field_mapping: Optional[Dict[str, str]] = None,
     conn=None,
 ) -> Dict[str, Any]:
     """Per-row diffs for a single field (drill-down tool)."""
@@ -344,12 +346,26 @@ def compare_field(
         return {"error": f"Source '{source_id}' not found."}
     if not tgt:
         return {"error": f"Target '{target_id}' not found."}
-    if field not in src["columns"] or field not in tgt["columns"]:
-        return {"error": f"Field '{field}' not in both datasets."}
 
-    missing = [k for k in key_columns if k not in src["columns"] or k not in tgt["columns"]]
-    if missing:
-        return {"error": f"Key columns missing: {missing}"}
+    compare_mappings = [field_mapping] if field_mapping else None
+    compare_columns = None if compare_mappings else [field]
+    try:
+        key_maps, comp_maps, _ = _normalize_pair_mappings(
+            source_columns=src["columns"],
+            target_columns=tgt["columns"],
+            key_columns=key_columns,
+            compare_columns=compare_columns,
+            key_mappings=key_mappings,
+            compare_mappings=compare_mappings,
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if not comp_maps:
+        return {"error": f"Field '{field}' not in both datasets."}
+    resolved_field = comp_maps[0]
+    source_field = resolved_field["source_field"]
+    target_field = resolved_field["target_field"]
 
     limit = min(int(limit), HARD_CAP)
     datasets = [src, tgt]
@@ -357,22 +373,26 @@ def compare_field(
     with connect(datasets) as duck:
         sv = quote(source_id)
         tv = quote(target_id)
-        qf = quote(field)
+        qs = quote(source_field)
+        qt = quote(target_field)
 
         join_on = " AND ".join(
-            f"s.{quote(k)} = t.{quote(k)}" for k in key_columns
+            f"s.{quote(m['source_field'])} = t.{quote(m['target_field'])}" for m in key_maps
         )
-        key_sel = ", ".join(f"s.{quote(k)}" for k in key_columns)
+        key_sel = ", ".join(
+            f"s.{quote(m['source_field'])} AS {quote(m['source_field'])}" for m in key_maps
+        )
+        key_labels = [m["source_field"] for m in key_maps]
 
         rows = duck.execute(
             f"""
             WITH diff AS (
                 SELECT {key_sel},
-                       CAST(s.{qf} AS VARCHAR) AS source_value,
-                       CAST(t.{qf} AS VARCHAR) AS target_value
+                       CAST(s.{qs} AS VARCHAR) AS source_value,
+                       CAST(t.{qt} AS VARCHAR) AS target_value
                 FROM {sv} s
                 INNER JOIN {tv} t ON {join_on}
-                WHERE CAST(s.{qf} AS VARCHAR) IS DISTINCT FROM CAST(t.{qf} AS VARCHAR)
+                WHERE CAST(s.{qs} AS VARCHAR) IS DISTINCT FROM CAST(t.{qt} AS VARCHAR)
             ),
             ranked AS (
                 SELECT *,
@@ -380,7 +400,7 @@ def compare_field(
                        ROW_NUMBER() OVER () AS rn
                 FROM diff
             )
-            SELECT {", ".join(quote(k) for k in key_columns)},
+            SELECT {", ".join(quote(k) for k in key_labels)},
                    source_value,
                    target_value,
                    total_differences
@@ -389,18 +409,21 @@ def compare_field(
             """
         ).fetchall()
 
-        total_diffs = rows[0][len(key_columns) + 2] if rows else 0
+        total_diffs = rows[0][len(key_labels) + 2] if rows else 0
         diff_rows = []
         for r in rows:
-            entry = {key_columns[i]: r[i] for i in range(len(key_columns))}
-            entry["source_value"] = r[len(key_columns)]
-            entry["target_value"] = r[len(key_columns) + 1]
+            entry = {key_labels[i]: r[i] for i in range(len(key_labels))}
+            entry["source_value"] = r[len(key_labels)]
+            entry["target_value"] = r[len(key_labels) + 1]
             diff_rows.append(entry)
 
     return {
         "source": source_id,
         "target": target_id,
         "field": field,
+        "source_field": source_field,
+        "target_field": target_field,
+        "field_mapping": _mapping_label(resolved_field),
         "total_differences": total_diffs,
         "showing": len(diff_rows),
         "rows": diff_rows,

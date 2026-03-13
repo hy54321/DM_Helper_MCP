@@ -3,9 +3,9 @@ __pycache__
 .venv
 .DS_Store
 reports/
-dm_helper.db
 build/
 dist/
 *.spec
 logs/
 .dmh_settings.key
+protoquery.db

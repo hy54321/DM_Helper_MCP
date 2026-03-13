@@ -1,4 +1,5 @@
 const { useEffect, useState } = React;
+const THEME_STORAGE_KEY = "protoquery_theme";
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -105,10 +106,99 @@ function changedSampleToGrid(changedSample) {
   return objectRowsToGrid(rows);
 }
 
+const ISO_DATE_TIME_SECONDS_PATTERN = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/;
+
+function formatDateTimeToSeconds(value) {
+  if (typeof value !== "string") return value;
+  const text = value.trim();
+  const match = text.match(ISO_DATE_TIME_SECONDS_PATTERN);
+  if (!match) return value;
+  return `${match[1]}T${match[2]}`;
+}
+
+function formatDateTimeForBadge(value) {
+  if (!value) return "Never";
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return "Never";
+  return `${dt.toLocaleDateString()} ${dt.toLocaleTimeString()}`;
+}
+
+function getStoredTheme() {
+  try {
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === "dark" || stored === "light") {
+      return stored;
+    }
+  } catch (_err) {
+    // Ignore localStorage access issues and fallback.
+  }
+  return "dark";
+}
+
 function displayValue(value) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
+  return String(formatDateTimeToSeconds(value));
+}
+
+function getDatasetStatus(dataset) {
+  const safeColumns = Array.isArray(dataset?.columns) ? dataset.columns : [];
+  const rawColumns = Array.isArray(dataset?.raw_columns) ? dataset.raw_columns : [];
+
+  if (!safeColumns.length) {
+    return {
+      level: "error",
+      icon: "✖",
+      label: "Error",
+      message: "File could not be read or no header row was detected. Check file content/encoding, then refresh catalog.",
+    };
+  }
+
+  if (!rawColumns.length) {
+    return {
+      level: "ok",
+      icon: "✔",
+      label: "OK",
+      message: "File loaded successfully.",
+    };
+  }
+
+  let hasBlankNames = false;
+  let hasDuplicateNames = false;
+  const seen = new Set();
+
+  rawColumns.forEach((raw, idx) => {
+    const text = raw == null ? "" : String(raw);
+    const trimmed = text.trim();
+    const key = trimmed.toLowerCase();
+
+    if (!trimmed) {
+      hasBlankNames = true;
+    } else if (seen.has(key)) {
+      hasDuplicateNames = true;
+    } else {
+      seen.add(key);
+    }
+  });
+
+  if (hasBlankNames || hasDuplicateNames) {
+    const details = [];
+    if (hasBlankNames) details.push("empty column names");
+    if (hasDuplicateNames) details.push("duplicate column names");
+    return {
+      level: "warning",
+      icon: "⚠",
+      label: "Warning",
+      message: `File loaded with column sanitization (${details.join(", ")}).`,
+    };
+  }
+
+  return {
+    level: "ok",
+    icon: "✔",
+    label: "OK",
+    message: "File loaded successfully.",
+  };
 }
 
 function buildInspectorEmbedUrl(baseUrl, mcpPort) {
@@ -185,9 +275,20 @@ function App() {
   const [sourceFolder, setSourceFolder] = useState("");
   const [targetFolder, setTargetFolder] = useState("");
   const [reportFolder, setReportFolder] = useState("");
+  const [savedFoldersSnapshot, setSavedFoldersSnapshot] = useState({
+    source_folder: "",
+    target_folder: "",
+    report_folder: "",
+  });
   const [includeRowCounts, setIncludeRowCounts] = useState(false);
+  const [catalogRefreshing, setCatalogRefreshing] = useState(false);
+  const [catalogSaving, setCatalogSaving] = useState(false);
+  const [catalogReloading, setCatalogReloading] = useState(false);
+  const [lastCatalogRefreshAt, setLastCatalogRefreshAt] = useState("");
+  const [catalogSetupCollapsed, setCatalogSetupCollapsed] = useState(false);
 
   const [datasets, setDatasets] = useState([]);
+  const [catalogDatasetIssue, setCatalogDatasetIssue] = useState(null);
   const [pairs, setPairs] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [reports, setReports] = useState([]);
@@ -229,18 +330,29 @@ function App() {
     ui: { running: true, host: "127.0.0.1", port: "8001" },
   });
   const [serviceBusy, setServiceBusy] = useState({});
-  const [settingsTheme, setSettingsTheme] = useState("light");
+  const [settingsTheme, setSettingsTheme] = useState(getStoredTheme);
   const [settingsApiKeyInput, setSettingsApiKeyInput] = useState("");
   const [settingsApiKeyMasked, setSettingsApiKeyMasked] = useState("");
   const [settingsApiKeySet, setSettingsApiKeySet] = useState(false);
   const [settingsApiKeyNeedsReset, setSettingsApiKeyNeedsReset] = useState(false);
   const [settingsApiKeyActivated, setSettingsApiKeyActivated] = useState(false);
+  const [settingsNgrokTokenInput, setSettingsNgrokTokenInput] = useState("");
+  const [settingsNgrokTokenMasked, setSettingsNgrokTokenMasked] = useState("");
+  const [settingsNgrokTokenSet, setSettingsNgrokTokenSet] = useState(false);
+  const [settingsNgrokTokenNeedsReset, setSettingsNgrokTokenNeedsReset] = useState(false);
+  const [settingsMcpAuthMode, setSettingsMcpAuthMode] = useState("none");
+  const [settingsMcpApiKeyHeaderName, setSettingsMcpApiKeyHeaderName] = useState("x-api-key");
+  const [settingsMcpApiKeyMasked, setSettingsMcpApiKeyMasked] = useState("");
+  const [settingsMcpApiKeySet, setSettingsMcpApiKeySet] = useState(false);
+  const [settingsMcpApiKeyNeedsReset, setSettingsMcpApiKeyNeedsReset] = useState(false);
+  const [settingsMcpGeneratedApiKey, setSettingsMcpGeneratedApiKey] = useState("");
   const [settingsModel, setSettingsModel] = useState("");
   const [settingsModels, setSettingsModels] = useState([]);
   const [settingsClaudeInstructions, setSettingsClaudeInstructions] = useState("");
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsValidating, setSettingsValidating] = useState(false);
   const [settingsLoadingModels, setSettingsLoadingModels] = useState(false);
+  const [settingsGeneratingMcpApiKey, setSettingsGeneratingMcpApiKey] = useState(false);
   const [claudeMessages, setClaudeMessages] = useState([]);
   const [claudeInput, setClaudeInput] = useState("");
   const [claudeSending, setClaudeSending] = useState(false);
@@ -262,6 +374,14 @@ function App() {
     setSettingsApiKeyMasked(String(safe.anthropic_api_key_masked || ""));
     setSettingsApiKeyNeedsReset(!!safe.anthropic_api_key_needs_reset);
     setSettingsApiKeyActivated(!!safe.anthropic_api_key_activated);
+    setSettingsNgrokTokenSet(!!safe.ngrok_authtoken_set);
+    setSettingsNgrokTokenMasked(String(safe.ngrok_authtoken_masked || ""));
+    setSettingsNgrokTokenNeedsReset(!!safe.ngrok_authtoken_needs_reset);
+    setSettingsMcpAuthMode(safe.mcp_auth_mode === "api" ? "api" : "none");
+    setSettingsMcpApiKeyHeaderName(String(safe.mcp_api_key_header_name || "x-api-key"));
+    setSettingsMcpApiKeySet(!!safe.mcp_api_key_set);
+    setSettingsMcpApiKeyMasked(String(safe.mcp_api_key_masked || ""));
+    setSettingsMcpApiKeyNeedsReset(!!safe.mcp_api_key_needs_reset);
     setSettingsModel(String(safe.model || ""));
     setSettingsClaudeInstructions(String(safe.claude_instructions || ""));
   }
@@ -317,6 +437,11 @@ function App() {
       setSourceFolder(folders.source_folder || "");
       setTargetFolder(folders.target_folder || "");
       setReportFolder(folders.report_folder || "");
+      setSavedFoldersSnapshot({
+        source_folder: folders.source_folder || "",
+        target_folder: folders.target_folder || "",
+        report_folder: folders.report_folder || "",
+      });
       setDatasets(ds || []);
       setPairs(pr || []);
       setJobs(jb || []);
@@ -346,6 +471,13 @@ function App() {
   useEffect(() => {
     const theme = settingsTheme === "dark" ? "dark" : "light";
     document.documentElement.setAttribute("data-theme", theme);
+    document.documentElement.style.backgroundColor = theme === "dark" ? "#040b19" : "#f4f6f8";
+    document.body.style.backgroundColor = theme === "dark" ? "#040b19" : "#f4f6f8";
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch (_err) {
+      // Ignore localStorage write issues.
+    }
   }, [settingsTheme]);
 
   useEffect(() => {
@@ -375,6 +507,19 @@ function App() {
       setRelationshipMappings([{ left_field: "", right_field: "" }]);
     }
   }, [relationshipSide, leftDatasetId, rightDatasetId, datasets]);
+
+  useEffect(() => {
+    if (!catalogDatasetIssue?.datasetId) return;
+    const current = datasets.find((d) => d.id === catalogDatasetIssue.datasetId);
+    if (!current) {
+      setCatalogDatasetIssue(null);
+      return;
+    }
+    const statusInfo = getDatasetStatus(current);
+    if (statusInfo.level === "ok") {
+      setCatalogDatasetIssue(null);
+    }
+  }, [datasets, catalogDatasetIssue?.datasetId]);
 
   useEffect(() => {
     if (!pairId) return;
@@ -451,6 +596,7 @@ function App() {
 
   async function onRefreshCatalog() {
     setError("");
+    setCatalogRefreshing(true);
     setStatus("Refreshing catalog...");
     try {
       const res = await api("/api/catalog/refresh", {
@@ -466,14 +612,18 @@ function App() {
         `Catalog refreshed. Source=${res.source_datasets}, Target=${res.target_datasets}, Pairs=${res.total_pairs}, RowCounts=${res.row_counts_included ? "on" : "off"}`
       );
       await refreshBootstrap();
+      setLastCatalogRefreshAt(new Date().toISOString());
     } catch (err) {
       setError(err.message);
       setStatus("Catalog refresh failed.");
+    } finally {
+      setCatalogRefreshing(false);
     }
   }
 
   async function onSaveFolders() {
     setError("");
+    setCatalogSaving(true);
     setStatus("Saving folder settings...");
     try {
       const saved = await api("/api/settings/folders", {
@@ -487,10 +637,32 @@ function App() {
       setSourceFolder(saved.source_folder || "");
       setTargetFolder(saved.target_folder || "");
       setReportFolder(saved.report_folder || "");
+      setSavedFoldersSnapshot({
+        source_folder: saved.source_folder || "",
+        target_folder: saved.target_folder || "",
+        report_folder: saved.report_folder || "",
+      });
       setStatus("Folder settings saved.");
     } catch (err) {
       setError(err.message);
       setStatus("Saving folder settings failed.");
+    } finally {
+      setCatalogSaving(false);
+    }
+  }
+
+  async function onReloadMetadata() {
+    setError("");
+    setCatalogReloading(true);
+    setStatus("Reloading metadata...");
+    try {
+      await refreshBootstrap();
+      setStatus("Metadata reloaded.");
+    } catch (err) {
+      setError(err.message);
+      setStatus("Metadata reload failed.");
+    } finally {
+      setCatalogReloading(false);
     }
   }
 
@@ -552,6 +724,64 @@ function App() {
     }
   }
 
+  async function onGenerateMcpApiKey() {
+    if (settingsMcpAuthMode !== "api") {
+      setStatus("Switch MCP authentication mode to API first.");
+      return;
+    }
+    setError("");
+    setSettingsGeneratingMcpApiKey(true);
+    setStatus("Generating MCP API key...");
+    try {
+      const res = await api("/api/settings/mcp-auth/generate", { method: "POST" });
+      const generated = String(res?.api_key || "").trim();
+      if (!generated) {
+        throw new Error("API key generation returned an empty key.");
+      }
+      setSettingsMcpGeneratedApiKey(generated);
+      if (res?.app_settings) {
+        applyAppSettings(res.app_settings);
+      } else {
+        await loadAppSettings({ silent: true });
+      }
+      setStatus("MCP API key generated. Copy it now; it will only be shown once.");
+    } catch (err) {
+      setError(err.message);
+      setStatus("MCP API key generation failed.");
+    } finally {
+      setSettingsGeneratingMcpApiKey(false);
+    }
+  }
+
+  async function onCopyGeneratedMcpApiKey() {
+    const key = String(settingsMcpGeneratedApiKey || "").trim();
+    if (!key) {
+      setStatus("Generate an MCP API key first.");
+      return;
+    }
+    setError("");
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(key);
+      } else {
+        const temp = document.createElement("textarea");
+        temp.value = key;
+        temp.setAttribute("readonly", "true");
+        temp.style.position = "fixed";
+        temp.style.opacity = "0";
+        document.body.appendChild(temp);
+        temp.focus();
+        temp.select();
+        document.execCommand("copy");
+        document.body.removeChild(temp);
+      }
+      setStatus("MCP API key copied to clipboard.");
+    } catch (err) {
+      setError(err.message || "Copy failed.");
+      setStatus("Copying MCP API key failed.");
+    }
+  }
+
   async function onSaveAppSettings() {
     setError("");
     setSettingsSaving(true);
@@ -559,8 +789,10 @@ function App() {
     try {
       const payload = {
         theme: settingsTheme,
+        mcp_auth_mode: settingsMcpAuthMode,
         model: String(settingsModel || "").trim(),
         anthropic_api_key: String(settingsApiKeyInput || "").trim() || null,
+        ngrok_authtoken: String(settingsNgrokTokenInput || "").trim() || null,
         claude_instructions: String(settingsClaudeInstructions || "").trim(),
       };
       const saved = await api("/api/settings/app", {
@@ -569,6 +801,7 @@ function App() {
       });
       applyAppSettings(saved);
       setSettingsApiKeyInput("");
+      setSettingsNgrokTokenInput("");
       setStatus("Settings saved.");
     } catch (err) {
       setError(err.message);
@@ -670,6 +903,11 @@ function App() {
       setSourceFolder(saved.source_folder || "");
       setTargetFolder(saved.target_folder || "");
       setReportFolder(saved.report_folder || "");
+      setSavedFoldersSnapshot({
+        source_folder: saved.source_folder || "",
+        target_folder: saved.target_folder || "",
+        report_folder: saved.report_folder || "",
+      });
       const label = kind === "source" ? "Source" : kind === "target" ? "Target" : "Report";
       setStatus(`${label} folder selected.`);
     } catch (err) {
@@ -1271,13 +1509,23 @@ function App() {
       if (!mappingQuery) return true;
       return `${m.source_field || ""} ${m.target_field || ""}`.toLowerCase().includes(mappingQuery);
     });
+  const sourceFolderTrimmed = String(sourceFolder || "").trim();
+  const targetFolderTrimmed = String(targetFolder || "").trim();
+  const reportFolderTrimmed = String(reportFolder || "").trim();
   const foldersConfigured =
-    String(sourceFolder || "").trim().length > 0 &&
-    String(targetFolder || "").trim().length > 0 &&
-    String(reportFolder || "").trim().length > 0;
+    sourceFolderTrimmed.length > 0 &&
+    targetFolderTrimmed.length > 0 &&
+    reportFolderTrimmed.length > 0;
+  const foldersDirty =
+    sourceFolderTrimmed !== String(savedFoldersSnapshot.source_folder || "").trim() ||
+    targetFolderTrimmed !== String(savedFoldersSnapshot.target_folder || "").trim() ||
+    reportFolderTrimmed !== String(savedFoldersSnapshot.report_folder || "").trim();
+  const lastCatalogRefreshLabel = formatDateTimeForBadge(lastCatalogRefreshAt);
   const canValidateAnthropicKey = String(settingsApiKeyInput || "").trim().length > 0 || settingsApiKeySet;
   const canLookupAnthropicModels = canValidateAnthropicKey || settingsApiKeySet;
-  const settingsBusy = settingsSaving || settingsValidating || settingsLoadingModels;
+  const settingsBusy = settingsSaving || settingsValidating || settingsLoadingModels || settingsGeneratingMcpApiKey;
+  const mcpApiAuthEnabled = settingsMcpAuthMode === "api";
+  const canCopyMcpApiKey = String(settingsMcpGeneratedApiKey || "").trim().length > 0;
   const claudeTabEnabled = settingsApiKeyActivated;
   const claudeCanSend =
     claudeTabEnabled &&
@@ -1304,9 +1552,14 @@ function App() {
     {
       key: "ngrok",
       label: "ngrok",
-      description: "Publishes MCP port externally (requires ngrok installed).",
+      description: "Publishes MCP port externally using embedded SDK (requires saved auth token).",
     },
   ];
+  const topServiceIndicators = managedServices.map((svc) => ({
+    key: svc.key,
+    label: svc.label,
+    running: !!serviceState.services?.[svc.key]?.running,
+  }));
   const baseColumnSummaries = Array.isArray(columnSummaryResult?.summaries)
     ? columnSummaryResult.summaries
     : [];
@@ -1350,8 +1603,40 @@ function App() {
 
   return (
     <div className="app">
-      <div className="header">
-        <h1>DM Helper Admin</h1>
+      <div className="header app-header">
+        <h1 className="app-title">ProtoQuery</h1>
+        <div className="header-right">
+          <div className="service-status-list" role="status" aria-live="polite" aria-label="Service status" title={status}>
+            {topServiceIndicators.map((svc) => (
+              <span key={svc.key} className="service-status-item">
+                <span
+                  className={`service-status-dot ${svc.running ? "running" : "stopped"}`}
+                  aria-hidden="true"
+                />
+                <span>{svc.label}</span>
+              </span>
+            ))}
+            {error ? <span className="service-status-error">Error: {error}</span> : null}
+          </div>
+          <div className="status-actions">
+            {tab === "settings" ? (
+              <button
+                className="secondary status-icon-btn"
+                onClick={() => loadAppSettings()}
+                disabled={settingsBusy}
+                title="Reload saved settings"
+                aria-label="Reload saved settings"
+              >
+                {"\u21bb"}
+              </button>
+            ) : null}
+            {tab === "inspector" && inspectorRunning ? (
+              <button className="secondary inspector-refresh-btn" onClick={() => loadServices()}>
+                Refresh Inspector Status
+              </button>
+            ) : null}
+          </div>
+        </div>
       </div>
 
       <div className="layout">
@@ -1394,36 +1679,6 @@ function App() {
           </div>
         </aside>
         <main className="content">
-          <div className="status-row">
-            <div className="status">
-              <strong>Status:</strong> {status}
-              {error ? (
-                <>
-                  {" "}
-                  <span style={{ color: "#b42318" }}>| Error: {error}</span>
-                </>
-              ) : null}
-            </div>
-            <div className="status-actions">
-              {tab === "settings" ? (
-                <button
-                  className="secondary status-icon-btn"
-                  onClick={() => loadAppSettings()}
-                  disabled={settingsBusy}
-                  title="Reload saved settings"
-                  aria-label="Reload saved settings"
-                >
-                  {"\u21bb"}
-                </button>
-              ) : null}
-              {tab === "inspector" && inspectorRunning ? (
-                <button className="secondary inspector-refresh-btn" onClick={() => loadServices()}>
-                  Refresh Inspector Status
-                </button>
-              ) : null}
-            </div>
-          </div>
-
       {tab === "settings" ? (
         <>
           <div className="card">
@@ -1542,7 +1797,7 @@ function App() {
             </div>
             {!desktopMode ? (
               <div style={{ marginTop: 10, color: "#5b6470" }}>
-                Service toggles are available only in desktop mode (`DMH_DESKTOP_MODE=1`).
+                Service toggles are available only in desktop mode (`PROTOQUERY_DESKTOP_MODE=1`).
               </div>
             ) : null}
             {desktopMode && !foldersConfigured ? (
@@ -1552,16 +1807,116 @@ function App() {
             ) : null}
           </div>
 
-          <div className="card">
-            <h3>Theme</h3>
-            <div className="row">
-              <div className="col-4">
-                <label>Theme</label>
-                <select value={settingsTheme} onChange={(e) => setSettingsTheme(e.target.value)}>
-                  <option value="light">Light</option>
-                  <option value="dark">Dark</option>
+          <div className="card settings-compact-card">
+            <div className="settings-top-grid">
+              <div className="settings-left-stack">
+                <div className="settings-panel">
+                  <h3>Theme</h3>
+                  <label>UI Theme</label>
+                  <select value={settingsTheme} onChange={(e) => setSettingsTheme(e.target.value)}>
+                    <option value="light">Light</option>
+                    <option value="dark">Dark</option>
+                  </select>
+                  <div className="sub">Choose app theme for the admin UI.</div>
+                </div>
+                <div className="settings-panel">
+                  <h3>ngrok</h3>
+                  <div className="sub">Configure your ngrok authtoken to start tunnels.</div>
+                  <label>Auth Token</label>
+                  <input
+                    type="password"
+                    value={settingsNgrokTokenInput}
+                    onChange={(e) => setSettingsNgrokTokenInput(e.target.value)}
+                    placeholder="Paste token from dashboard.ngrok.com"
+                    autoComplete="off"
+                  />
+                  <div className="anthropic-meta settings-inline-meta">
+                    <span className="anthropic-meta-pill">
+                      Stored token:{" "}
+                      {settingsNgrokTokenSet
+                        ? settingsNgrokTokenMasked
+                          ? settingsNgrokTokenMasked
+                          : "configured"
+                        : "not set"}
+                    </span>
+                    <span className={`anthropic-meta-pill ${desktopMode ? "is-active" : "is-inactive"}`}>
+                      Desktop mode: {desktopMode ? "on" : "off"}
+                    </span>
+                  </div>
+                  {settingsNgrokTokenNeedsReset ? (
+                    <div className="anthropic-warning">
+                      Stored ngrok authtoken cannot be decrypted. Enter a new token and save.
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+              <div className="settings-panel settings-mcp-panel">
+                <h3>MCP Authentication</h3>
+                <div className="sub">Protect `/mcp` with no auth or API key authentication.</div>
+                <label>Mode</label>
+                <select value={settingsMcpAuthMode} onChange={(e) => setSettingsMcpAuthMode(e.target.value)}>
+                  <option value="none">No authentication</option>
+                  <option value="api">API key</option>
                 </select>
-                <div className="sub">Choose app theme for the admin UI.</div>
+                <div className="anthropic-meta settings-inline-meta">
+                  <span className={`anthropic-meta-pill ${mcpApiAuthEnabled ? "is-active" : "is-inactive"}`}>
+                    Current mode: {mcpApiAuthEnabled ? "API key" : "none"}
+                  </span>
+                </div>
+                {mcpApiAuthEnabled ? (
+                  <div className="mcp-auth-controls">
+                    <label>API Key Header</label>
+                    <input value={settingsMcpApiKeyHeaderName} readOnly />
+                    <label>Generated API Key</label>
+                    <div className="mcp-auth-row">
+                      <input
+                        type="text"
+                        value={settingsMcpGeneratedApiKey}
+                        readOnly
+                        placeholder="Generate a key, then copy it into Copilot Studio."
+                      />
+                      <button
+                        className="secondary"
+                        type="button"
+                        onClick={onCopyGeneratedMcpApiKey}
+                        disabled={!canCopyMcpApiKey}
+                      >
+                        Copy Key
+                      </button>
+                    </div>
+                    <div className="mcp-auth-row">
+                      <button
+                        className="secondary"
+                        type="button"
+                        onClick={onGenerateMcpApiKey}
+                        disabled={settingsGeneratingMcpApiKey || settingsSaving}
+                      >
+                        {settingsGeneratingMcpApiKey ? "Generating..." : "Generate / Rotate Key"}
+                      </button>
+                      <button className="secondary" type="button" onClick={onSaveAppSettings} disabled={settingsBusy}>
+                        Save Auth Mode
+                      </button>
+                    </div>
+                    <div className="anthropic-meta settings-inline-meta">
+                      <span className="anthropic-meta-pill">
+                        Stored key:{" "}
+                        {settingsMcpApiKeySet
+                          ? settingsMcpApiKeyMasked
+                            ? settingsMcpApiKeyMasked
+                            : "configured"
+                          : "not set"}
+                      </span>
+                    </div>
+                    {settingsMcpApiKeyNeedsReset ? (
+                      <div className="anthropic-warning">
+                        Stored MCP API key cannot be decrypted. Generate a new key and save.
+                      </div>
+                    ) : null}
+                    <div className="sub">After changing this mode or key, restart MCP Server to apply it.</div>
+                  </div>
+                ) : (
+                  <div className="sub">Endpoint accepts requests without authentication.</div>
+                )}
               </div>
             </div>
           </div>
@@ -1608,28 +1963,30 @@ function App() {
                 >
                   {settingsValidating ? "Validating..." : "Validate Key"}
                 </button>
-                <button
-                  className="secondary anthropic-action-btn"
-                  onClick={onLookupAnthropicModels}
-                  disabled={!canLookupAnthropicModels || settingsLoadingModels || settingsSaving}
-                >
-                  {settingsLoadingModels ? "Loading..." : "Lookup Models"}
-                </button>
               </div>
 
               <div className="anthropic-model-block">
                 <label>Model</label>
-                <select className="anthropic-model-select" value={settingsModel} onChange={(e) => setSettingsModel(e.target.value)}>
-                  <option value="">Select a model...</option>
-                  {settingsModel && !settingsModels.some((m) => m.id === settingsModel) ? (
-                    <option value={settingsModel}>{settingsModel} (saved)</option>
-                  ) : null}
-                  {settingsModels.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.id}
-                    </option>
-                  ))}
-                </select>
+                <div className="anthropic-model-row">
+                  <select className="anthropic-model-select" value={settingsModel} onChange={(e) => setSettingsModel(e.target.value)}>
+                    <option value="">Select a model...</option>
+                    {settingsModel && !settingsModels.some((m) => m.id === settingsModel) ? (
+                      <option value={settingsModel}>{settingsModel} (saved)</option>
+                    ) : null}
+                    {settingsModels.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.id}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="secondary anthropic-action-btn anthropic-model-lookup-btn"
+                    onClick={onLookupAnthropicModels}
+                    disabled={!canLookupAnthropicModels || settingsLoadingModels || settingsSaving}
+                  >
+                    {settingsLoadingModels ? "Loading..." : "Lookup Models"}
+                  </button>
+                </div>
                 <div className="sub">Selected model is used by the Claude tab chat.</div>
               </div>
 
@@ -1646,7 +2003,7 @@ function App() {
                     />
                     <div className="actions">
                       <button className="secondary" type="button" onClick={onLoadDefaultClaudeInstructions} disabled={settingsBusy}>
-                        Load DM Assistant Template
+                        Load Instructions
                       </button>
                     </div>
                     <div className="sub">
@@ -1725,63 +2082,153 @@ function App() {
 
       {tab === "catalog" ? (
         <>
-          <div className="card">
-            <div className="row">
-              <div className="col-6">
-                <label>Source folder</label>
-                <div className="field-with-action">
-                  <input value={sourceFolder} onChange={(e) => setSourceFolder(e.target.value)} placeholder="C:\data\source" />
-                  <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("source")}>
-                    Browse
+          <div className={`card catalog-setup-card ${catalogSetupCollapsed ? "collapsed" : ""}`}>
+            <div
+              className="catalog-setup-bar"
+              role="button"
+              tabIndex={0}
+              aria-expanded={!catalogSetupCollapsed}
+              onClick={() => setCatalogSetupCollapsed((prev) => !prev)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  setCatalogSetupCollapsed((prev) => !prev);
+                }
+              }}
+            >
+              <div className="catalog-setup-title">
+                <span
+                  className={`catalog-setup-caret ${catalogSetupCollapsed ? "collapsed" : "expanded"}`}
+                  aria-hidden="true"
+                >
+                  {">"}
+                </span>
+                <h3>Catalog Setup</h3>
+                <span className={`catalog-state-badge ${foldersDirty ? "dirty" : "saved"}`}>
+                  {foldersDirty ? "Unsaved changes" : "Saved"}
+                </span>
+              </div>
+              {catalogSetupCollapsed ? (
+                <div
+                  className="catalog-setup-inline-controls"
+                  onClick={(e) => e.stopPropagation()}
+                  onKeyDown={(e) => e.stopPropagation()}
+                >
+                  <label className="catalog-check-row compact">
+                    <input
+                      type="checkbox"
+                      className="check-input"
+                      checked={includeRowCounts}
+                      onChange={(e) => setIncludeRowCounts(e.target.checked)}
+                    />
+                    <span>Include row counts (slow)</span>
+                  </label>
+                  <button
+                    className="refresh-catalog-btn catalog-refresh-inline"
+                    onClick={onRefreshCatalog}
+                    disabled={!foldersConfigured || catalogRefreshing || catalogReloading}
+                  >
+                    {catalogRefreshing ? "Refreshing..." : "Refresh Catalog"}
                   </button>
                 </div>
-              </div>
-              <div className="col-6">
-                <label>Target folder</label>
-                <div className="field-with-action">
-                  <input value={targetFolder} onChange={(e) => setTargetFolder(e.target.value)} placeholder="C:\data\target" />
-                  <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("target")}>
-                    Browse
-                  </button>
-                </div>
-              </div>
-              <div className="col-6">
-                <label>Report folder</label>
-                <div className="field-with-action">
-                  <input value={reportFolder} onChange={(e) => setReportFolder(e.target.value)} placeholder="C:\data\reports" />
-                  <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("report")}>
-                    Browse
-                  </button>
-                </div>
-              </div>
-              <div className="col-3">
-                <label>Options</label>
-                <div className="toggle-inline">
-                  <input
-                    type="checkbox"
-                    className="check-input"
-                    checked={includeRowCounts}
-                    onChange={(e) => setIncludeRowCounts(e.target.checked)}
-                  />
-                  <span>Include row counts (slow)</span>
-                </div>
-              </div>
-              <div className="col-3">
-                <button className="refresh-catalog-btn" onClick={onRefreshCatalog}>
-                  Refresh Catalog
-                </button>
-              </div>
-              <div className="col-3">
-                <button className="secondary" onClick={onSaveFolders}>
-                  Save Folder Settings
-                </button>
-              </div>
-              <div className="col-3">
-                <button className="secondary" onClick={refreshBootstrap}>
-                  Reload Metadata
-                </button>
-              </div>
+              ) : null}
             </div>
+
+            {!catalogSetupCollapsed ? (
+              <div className="catalog-setup-grid">
+                <div className="settings-panel catalog-locations-panel">
+                  <div className="catalog-panel-head">
+                    <h3>Data Locations</h3>
+                  </div>
+                  <div className="catalog-fields-grid">
+                    <div>
+                      <label>Source folder</label>
+                      <div className="field-with-action">
+                        <input
+                          className="catalog-path-input"
+                          title={sourceFolder}
+                          value={sourceFolder}
+                          onChange={(e) => setSourceFolder(e.target.value)}
+                          placeholder="C:\data\source"
+                        />
+                        <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("source")}>
+                          Browse
+                        </button>
+                      </div>
+                    </div>
+                    <div>
+                      <label>Target folder</label>
+                      <div className="field-with-action">
+                        <input
+                          className="catalog-path-input"
+                          title={targetFolder}
+                          value={targetFolder}
+                          onChange={(e) => setTargetFolder(e.target.value)}
+                          placeholder="C:\data\target"
+                        />
+                        <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("target")}>
+                          Browse
+                        </button>
+                      </div>
+                    </div>
+                    <div>
+                      <label>Report folder</label>
+                      <div className="field-with-action">
+                        <input
+                          className="catalog-path-input"
+                          title={reportFolder}
+                          value={reportFolder}
+                          onChange={(e) => setReportFolder(e.target.value)}
+                          placeholder="C:\data\reports"
+                        />
+                        <button type="button" className="secondary browse-btn" onClick={() => onBrowseFolder("report")}>
+                          Browse
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="actions catalog-location-actions">
+                    <button className="secondary" onClick={onSaveFolders} disabled={catalogSaving || !foldersDirty}>
+                      {catalogSaving ? "Saving..." : "Save Folder Settings"}
+                    </button>
+                    <button className="secondary" onClick={onReloadMetadata} disabled={catalogReloading || catalogRefreshing}>
+                      {catalogReloading ? "Reloading..." : "Reload Metadata"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="settings-panel catalog-run-panel">
+                  <h3>Catalog Run</h3>
+                  <div className="sub">Run discovery after locations are ready.</div>
+                  <label>Options</label>
+                  <label className="catalog-check-row">
+                    <input
+                      type="checkbox"
+                      className="check-input"
+                      checked={includeRowCounts}
+                      onChange={(e) => setIncludeRowCounts(e.target.checked)}
+                    />
+                    <span>Include row counts (slow)</span>
+                  </label>
+                  <button
+                    className="refresh-catalog-btn"
+                    onClick={onRefreshCatalog}
+                    disabled={!foldersConfigured || catalogRefreshing || catalogReloading}
+                  >
+                    {catalogRefreshing ? "Refreshing..." : "Refresh Catalog"}
+                  </button>
+                  <div className="catalog-run-meta">
+                    <span className="anthropic-meta-pill">Last refresh: {lastCatalogRefreshLabel}</span>
+                    <span className={`anthropic-meta-pill ${foldersConfigured ? "is-active" : "is-inactive"}`}>
+                      Paths: {foldersConfigured ? "ready" : "missing"}
+                    </span>
+                    <span className={`anthropic-meta-pill ${includeRowCounts ? "is-active" : "is-inactive"}`}>
+                      Row counts: {includeRowCounts ? "on" : "off"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <div className="card">
@@ -1790,6 +2237,7 @@ function App() {
               <table>
                 <thead>
                   <tr>
+                    <th>Status</th>
                     <th>ID</th>
                     <th>Side</th>
                     <th>File</th>
@@ -1799,19 +2247,78 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {datasets.map((d) => (
-                    <tr key={d.id}>
-                      <td>{d.id}</td>
-                      <td>{d.side}</td>
-                      <td>{d.file_name}</td>
-                      <td>{d.sheet_name || "-"}</td>
-                      <td>{(d.columns || []).length}</td>
-                      <td>{d.row_count == null ? "-" : d.row_count}</td>
-                    </tr>
-                  ))}
+                  {datasets.map((d) => {
+                    const statusInfo = getDatasetStatus(d);
+                    const clickable = statusInfo.level === "warning" || statusInfo.level === "error";
+                    return (
+                      <tr key={d.id}>
+                        <td className="dataset-status-cell">
+                          {clickable ? (
+                            <button
+                              type="button"
+                              className={`dataset-status-icon ${statusInfo.level} is-clickable`}
+                              title={`${statusInfo.label}: ${statusInfo.message}`}
+                              aria-label={`${statusInfo.label}: ${statusInfo.message}`}
+                              onClick={() =>
+                                setCatalogDatasetIssue((prev) =>
+                                  prev?.datasetId === d.id
+                                    ? null
+                                    : {
+                                        datasetId: d.id,
+                                        fileName: d.file_name || "",
+                                        sheetName: d.sheet_name || "",
+                                        level: statusInfo.level,
+                                        label: statusInfo.label,
+                                        message: statusInfo.message,
+                                      }
+                                )
+                              }
+                            >
+                              {statusInfo.icon}
+                            </button>
+                          ) : (
+                            <span
+                              className={`dataset-status-icon ${statusInfo.level}`}
+                              title={`${statusInfo.label}: ${statusInfo.message}`}
+                              aria-label={`${statusInfo.label}: ${statusInfo.message}`}
+                            >
+                              {statusInfo.icon}
+                            </span>
+                          )}
+                        </td>
+                        <td>{d.id}</td>
+                        <td>{d.side}</td>
+                        <td>{d.file_name}</td>
+                        <td>{d.sheet_name || "-"}</td>
+                        <td>{(d.columns || []).length}</td>
+                        <td>{d.row_count == null ? "-" : d.row_count}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
+            {catalogDatasetIssue ? (
+              <div className={`catalog-dataset-issue-box ${catalogDatasetIssue.level}`}>
+                <div className="catalog-dataset-issue-head">
+                  <strong>
+                    {catalogDatasetIssue.label}: {catalogDatasetIssue.datasetId}
+                  </strong>
+                  <button
+                    type="button"
+                    className="secondary catalog-dataset-issue-close"
+                    onClick={() => setCatalogDatasetIssue(null)}
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="catalog-dataset-issue-meta">
+                  File: {catalogDatasetIssue.fileName || "-"}
+                  {catalogDatasetIssue.sheetName ? ` | Sheet: ${catalogDatasetIssue.sheetName}` : ""}
+                </div>
+                <div>{catalogDatasetIssue.message}</div>
+              </div>
+            ) : null}
           </div>
 
           <div className="card">
@@ -2365,7 +2872,7 @@ function App() {
               </button>
             </div>
             <div className="scroll">
-              <table>
+              <table className="jobs-table">
                 <thead>
                   <tr>
                     <th>Job ID</th>
@@ -2383,7 +2890,7 @@ function App() {
                       <td>{j.state}</td>
                       <td>{j.source_dataset}</td>
                       <td>{j.target_dataset}</td>
-                      <td>{j.created_at}</td>
+                      <td>{displayValue(j.created_at)}</td>
                       <td>
                         <div className="actions">
                           <button className="secondary" onClick={() => loadJobSummary(j.id)}>
@@ -2414,9 +2921,9 @@ function App() {
                     <div className="metric-value">{displayValue(jobSummary.state)}</div>
                   </div>
                   <div className="metric-card">
-                    <div className="metric-label">Source -> Target</div>
+                    <div className="metric-label">Source {'->'} Target</div>
                     <div className="metric-value">
-                      {displayValue(jobSummary.source)} -> {displayValue(jobSummary.target)}
+                      {displayValue(jobSummary.source)}{" -> "}{displayValue(jobSummary.target)}
                     </div>
                   </div>
                 </div>
@@ -2519,7 +3026,7 @@ function App() {
                       <td>{r.file_name}</td>
                       <td>{r.source_dataset}</td>
                       <td>{r.target_dataset}</td>
-                      <td>{r.created_at}</td>
+                      <td>{displayValue(r.created_at)}</td>
                       <td>
                         <div className="actions report-actions">
                           <button className="secondary" onClick={() => onOpenReport(r.id)}>
@@ -2709,7 +3216,7 @@ function App() {
           <div className="card">
             <h3>Relationships ({filteredRelationships.length})</h3>
             <div className="scroll">
-              <table>
+              <table className="relationships-table">
                 <thead>
                   <tr>
                     <th>ID</th>
@@ -2731,9 +3238,9 @@ function App() {
                       <td>{r.confidence}</td>
                       <td>{r.method}</td>
                       <td>{r.active ? "Yes" : "No"}</td>
-                      <td>{r.updated_at}</td>
+                      <td>{displayValue(r.updated_at)}</td>
                       <td>
-                        <div className="actions">
+                        <div className="actions relationship-actions">
                           <button className="secondary" onClick={() => editRelationship(r)}>
                             Edit
                           </button>

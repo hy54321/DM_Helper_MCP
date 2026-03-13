@@ -1,5 +1,5 @@
 param(
-    [string]$Name = "DMHelper",
+    [string]$Name = "ProtoQuery",
     [switch]$Clean
 )
 
@@ -21,8 +21,10 @@ uv run pyinstaller `
     --onefile `
     --windowed `
     --name $Name `
-    --icon "ui\static\dmhelper.ico" `
+    --icon "ui\static\protoquery.ico" `
     --collect-submodules webview `
+    --collect-submodules ngrok `
+    --collect-binaries ngrok `
     --hidden-import uvicorn.logging `
     --hidden-import uvicorn.loops.auto `
     --hidden-import uvicorn.protocols.http.auto `

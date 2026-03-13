@@ -1,4 +1,4 @@
-from typing import List, Optional
+﻿from typing import List, Optional
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.key_binding import KeyBindings
@@ -189,7 +189,7 @@ class CliApp:
             print(f"Error refreshing prompts: {e}")
 
     async def run(self):
-        print("DM Helper — Data Migration Assistant")
+        print("ProtoQuery - Data Migration Assistant")
         print("Type your query, use /command, or @dataset_id for autocomplete.")
         print("Press Ctrl+C to exit.\n")
 
@@ -210,3 +210,4 @@ class CliApp:
             except KeyboardInterrupt:
                 print("\nGoodbye!")
                 break
+

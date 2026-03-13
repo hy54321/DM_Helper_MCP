@@ -3,9 +3,35 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>DM Helper Admin</title>
-    <link rel="icon" type="image/svg+xml" href="/static/dmhelper-icon.svg" />
-    <link rel="alternate icon" type="image/x-icon" href="/static/dmhelper.ico" />
+    <title>ProtoQuery</title>
+    <style>
+      html,
+      body,
+      #root {
+        margin: 0;
+        min-height: 100%;
+        background: #040b19;
+      }
+    </style>
+    <script>
+      (function () {
+        var theme = "dark";
+        try {
+          var stored = localStorage.getItem("protoquery_theme");
+          if (stored === "dark" || stored === "light") {
+            theme = stored;
+          }
+        } catch (_err) {}
+        document.documentElement.setAttribute("data-theme", theme);
+        var bg = theme === "dark" ? "#040b19" : "#f4f6f8";
+        document.documentElement.style.backgroundColor = bg;
+        document.addEventListener("DOMContentLoaded", function () {
+          document.body.style.backgroundColor = bg;
+        });
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/static/protoquery-icon.svg" />
+    <link rel="alternate icon" type="image/x-icon" href="/static/protoquery.ico" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>

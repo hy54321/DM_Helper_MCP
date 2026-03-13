@@ -16,6 +16,16 @@ from dotenv import load_dotenv
 from server import db
 
 
+def _env_with_legacy(primary: str, legacy: str, default: str = "") -> str:
+    value = os.getenv(primary, "").strip()
+    if value:
+        return value
+    legacy_value = os.getenv(legacy, "").strip()
+    if legacy_value:
+        return legacy_value
+    return default
+
+
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -90,12 +100,19 @@ def _run_service_mode(service_name: str) -> None:
 
     os.environ.setdefault("MCP_TRANSPORT", "streamable-http")
     os.environ.setdefault("FASTMCP_HOST", os.getenv("FASTMCP_HOST", "127.0.0.1"))
-    os.environ.setdefault("FASTMCP_PORT", os.getenv("DMH_MCP_PORT", "8000"))
-    os.environ.setdefault("DMH_MCP_MODE", os.getenv("DMH_MCP_MODE", "prod"))
+    os.environ.setdefault("FASTMCP_PORT", _env_with_legacy("PROTOQUERY_MCP_PORT", "DMH_MCP_PORT", "8000"))
+    os.environ.setdefault("PROTOQUERY_MCP_MODE", _env_with_legacy("PROTOQUERY_MCP_MODE", "DMH_MCP_MODE", "prod"))
+    os.environ.setdefault("DMH_MCP_MODE", os.getenv("PROTOQUERY_MCP_MODE", "prod"))
+    os.environ.setdefault("PROTOQUERY_MCP_AUTH_MODE", _env_with_legacy("PROTOQUERY_MCP_AUTH_MODE", "DMH_MCP_AUTH_MODE", "none"))
+    os.environ.setdefault("DMH_MCP_AUTH_MODE", os.getenv("PROTOQUERY_MCP_AUTH_MODE", "none"))
 
-    from mcp_server import mcp
+    from mcp_server import _run_streamable_http, mcp
 
-    mcp.run(transport=os.getenv("MCP_TRANSPORT", "streamable-http"))
+    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+    if transport == "streamable-http":
+        _run_streamable_http()
+    else:
+        mcp.run(transport=transport)
 
 
 def main() -> None:
@@ -106,11 +123,15 @@ def main() -> None:
     args, _ = parser.parse_known_args()
 
     base_dir = _base_dir()
-    db_path = base_dir / "dm_helper.db"
-    os.environ.setdefault("DMH_DESKTOP_MODE", "1")
-    os.environ.setdefault("DMH_APP_BASE_DIR", str(base_dir))
-    os.environ.setdefault("DMH_MCP_PORT", "8000")
-    os.environ.setdefault("DMH_DB_PATH", str(db_path))
+    db_path = base_dir / "protoquery.db"
+    os.environ.setdefault("PROTOQUERY_DESKTOP_MODE", "1")
+    os.environ.setdefault("DMH_DESKTOP_MODE", os.getenv("PROTOQUERY_DESKTOP_MODE", "1"))
+    os.environ.setdefault("PROTOQUERY_APP_BASE_DIR", str(base_dir))
+    os.environ.setdefault("DMH_APP_BASE_DIR", os.getenv("PROTOQUERY_APP_BASE_DIR", str(base_dir)))
+    os.environ.setdefault("PROTOQUERY_MCP_PORT", "8000")
+    os.environ.setdefault("DMH_MCP_PORT", os.getenv("PROTOQUERY_MCP_PORT", "8000"))
+    os.environ.setdefault("PROTOQUERY_DB_PATH", str(db_path))
+    os.environ.setdefault("DMH_DB_PATH", os.getenv("PROTOQUERY_DB_PATH", str(db_path)))
 
     if args.service_name:
         _run_service_mode(args.service_name)
@@ -140,17 +161,18 @@ def main() -> None:
             "pywebview is required for desktop mode. Install it with: uv add pywebview"
         ) from exc
 
-    window_title = os.getenv("DMH_WINDOW_TITLE", "DM Helper")
+    window_title = _env_with_legacy("PROTOQUERY_WINDOW_TITLE", "DMH_WINDOW_TITLE", "ProtoQuery")
     webview.create_window(
         title=window_title,
         url=f"http://{host}:{port}",
         width=1440,
         height=920,
         min_size=(1100, 700),
+        background_color="#040b19",
     )
 
     try:
-        webview.start(debug=os.getenv("DMH_WEBVIEW_DEBUG", "0") == "1")
+        webview.start(debug=_env_with_legacy("PROTOQUERY_WEBVIEW_DEBUG", "DMH_WEBVIEW_DEBUG", "0") == "1")
     finally:
         backend.stop()
         try:

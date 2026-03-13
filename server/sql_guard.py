@@ -31,7 +31,7 @@ _DANGEROUS_RE = re.compile(
 
 def validate(sql: str) -> Tuple[bool, str]:
     """Return ``(True, "")`` if the SQL is safe, else ``(False, reason)``."""
-    stripped = sql.strip().rstrip(";").strip()
+    stripped = _strip_sql_comments(sql).strip().rstrip(";").strip()
     if not stripped:
         return False, "Empty query."
 
@@ -74,3 +74,71 @@ def _has_unquoted_semicolon(sql: str) -> bool:
             return True
         i += 1
     return False
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove line/block comments while preserving quoted string content."""
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+    i = 0
+
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append(ch)
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if not in_single and not in_double:
+            if ch == "-" and nxt == "-":
+                in_line_comment = True
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+                continue
+
+        if ch == "'" and not in_double:
+            # Handle escaped single quote ('')
+            if in_single and nxt == "'":
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            in_single = not in_single
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '"' and not in_single:
+            # Handle escaped double quote ("")
+            if in_double and nxt == '"':
+                out.append(ch)
+                out.append(nxt)
+                i += 2
+                continue
+            in_double = not in_double
+            out.append(ch)
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)

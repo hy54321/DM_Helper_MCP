@@ -18,7 +18,7 @@ class TestReportsRegistry(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def test_list_reports_defaults_to_last_five(self) -> None:
+    def test_list_reports_defaults_to_all(self) -> None:
         for i in range(7):
             db.create_report(
                 self.conn,
@@ -34,7 +34,7 @@ class TestReportsRegistry(unittest.TestCase):
 
         rows_default = db.list_reports(self.conn)
         rows_all = db.list_reports(self.conn, limit=50)
-        self.assertEqual(len(rows_default), 5)
+        self.assertEqual(len(rows_default), 7)
         self.assertEqual(len(rows_all), 7)
 
     def test_export_query_registers_report_and_returns_report_id(self) -> None:

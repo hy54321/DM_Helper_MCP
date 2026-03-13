@@ -37,11 +37,29 @@ if "mcp.server.fastmcp" not in sys.modules:
 
     mcp_mod = types.ModuleType("mcp")
     server_mod = types.ModuleType("mcp.server")
+    types_mod = types.ModuleType("mcp.types")
+
+    class _TextContent:
+        def __init__(self, type: str, text: str):
+            self.type = type
+            self.text = text
+
+    class _CallToolResult:
+        def __init__(self, content=None, structuredContent=None, isError=False):
+            self.content = content or []
+            self.structuredContent = structuredContent
+            self.isError = isError
+
+    types_mod.TextContent = _TextContent
+    types_mod.CallToolResult = _CallToolResult
+
     mcp_mod.server = server_mod
+    mcp_mod.types = types_mod
     server_mod.fastmcp = fastmcp_mod
     sys.modules["mcp"] = mcp_mod
     sys.modules["mcp.server"] = server_mod
     sys.modules["mcp.server.fastmcp"] = fastmcp_mod
+    sys.modules["mcp.types"] = types_mod
 
 import mcp_server
 
@@ -135,6 +153,26 @@ class TestMcpCompareMappingResolution(unittest.TestCase):
         self.assertEqual(kwargs["key_mappings"], PAIR["key_mappings"])
         self.assertEqual(kwargs["compare_mappings"], PAIR["compare_mappings"])
         self.assertEqual(kwargs["pair_id"], "pair_keys")
+
+    @patch("mcp_server.comp.compare_field")
+    @patch("mcp_server.cat.get_pair_by_datasets")
+    def test_compare_field_resolves_target_field_names(self, mock_get_pair, mock_compare_field):
+        mock_get_pair.return_value = PAIR
+        mock_compare_field.return_value = {"status": "ok"}
+
+        result = mcp_server.compare_field(
+            source_dataset_id="source_ds",
+            target_dataset_id="target_ds",
+            key_columns="ZIPCODE,COUNTRYREGIONID,CITYID",
+            field="CITYID",
+        )
+
+        parsed = json.loads(result)
+        self.assertEqual(parsed, {"status": "ok"})
+        kwargs = mock_compare_field.call_args.kwargs
+        self.assertEqual(kwargs["key_columns"], ["ZipCode", "COUNTRYREGIONID", "City"])
+        self.assertEqual(kwargs["key_mappings"], PAIR["key_mappings"])
+        self.assertEqual(kwargs["field_mapping"], {"source_field": "City", "target_field": "CITYID"})
 
     @patch("mcp_server.comp.compare_datasets")
     @patch("mcp_server.cat.get_pair")

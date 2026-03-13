@@ -17,6 +17,7 @@ from server import db
 from server.query_engine import (
     count_csv_rows,
     count_excel_sheet_rows,
+    detect_text_encoding,
     read_csv_headers,
     read_excel_sheets,
     sanitize_column_names,
@@ -122,12 +123,23 @@ def _scan_folder(
                 safe_cols = existing.get("columns", []) or []
                 col_map = existing.get("column_map", {}) or {}
                 row_count = existing.get("row_count")
+                csv_encoding = str(existing.get("csv_encoding") or "")
+                csv_py_encoding = ""
+                if not csv_encoding:
+                    csv_py_encoding, csv_encoding = detect_text_encoding(full_path)
                 if include_row_counts and row_count is None:
-                    row_count = count_csv_rows(full_path)
+                    if not csv_py_encoding:
+                        csv_py_encoding, _ = detect_text_encoding(full_path)
+                    row_count = count_csv_rows(full_path, encoding=csv_py_encoding)
             else:
-                raw_headers = read_csv_headers(full_path)
+                csv_py_encoding, csv_encoding = detect_text_encoding(full_path)
+                raw_headers = read_csv_headers(full_path, encoding=csv_py_encoding)
                 safe_cols, col_map = sanitize_column_names(raw_headers)
-                row_count = count_csv_rows(full_path) if include_row_counts else None
+                row_count = (
+                    count_csv_rows(full_path, encoding=csv_py_encoding)
+                    if include_row_counts
+                    else None
+                )
             datasets.append(
                 {
                     "id": ds_id,
@@ -141,6 +153,7 @@ def _scan_folder(
                     "columns": safe_cols,
                     "raw_columns": raw_headers,
                     "column_map": col_map,
+                    "csv_encoding": csv_encoding,
                     "row_count": row_count,
                 }
             )
@@ -178,6 +191,7 @@ def _scan_folder(
                             "columns": old.get("columns", []) or [],
                             "raw_columns": old.get("raw_columns", []) or [],
                             "column_map": old.get("column_map", {}) or {},
+                            "csv_encoding": "",
                             "row_count": row_count,
                         }
                     )
@@ -202,6 +216,7 @@ def _scan_folder(
                         "columns": safe_cols,
                         "raw_columns": raw_headers,
                         "column_map": col_map,
+                        "csv_encoding": "",
                         "row_count": row_count,
                     }
                 )

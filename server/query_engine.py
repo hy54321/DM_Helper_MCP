@@ -69,10 +69,39 @@ def esc(value: str) -> str:
 #  Header reading
 # ═══════════════════════════════════════════════════════════════
 
-def read_csv_headers(path: str) -> List[str]:
-    """Read the first row of a CSV to extract column headers."""
+def detect_text_encoding(path: str) -> Tuple[str, str]:
+    """Detect a text file's encoding for Python and DuckDB CSV reads.
+
+    Returns ``(python_encoding, duckdb_encoding)``.
+    """
     try:
-        with open(path, newline="", encoding="utf-8-sig") as fh:
+        with open(path, "rb") as fh:
+            sample = fh.read(4096)
+    except Exception:
+        return ("utf-8-sig", "utf-8")
+
+    if sample.startswith(b"\xef\xbb\xbf"):
+        return ("utf-8-sig", "utf-8")
+    if sample.startswith(b"\xff\xfe") or sample.startswith(b"\xfe\xff"):
+        return ("utf-16", "utf-16")
+
+    if sample:
+        even_nuls = sample[::2].count(0)
+        odd_nuls = sample[1::2].count(0)
+        threshold = max(8, len(sample) // 16)
+        if odd_nuls >= threshold and odd_nuls > even_nuls * 2:
+            return ("utf-16le", "utf-16")
+        if even_nuls >= threshold and even_nuls > odd_nuls * 2:
+            return ("utf-16be", "utf-16")
+
+    return ("utf-8-sig", "utf-8")
+
+
+def read_csv_headers(path: str, encoding: Optional[str] = None) -> List[str]:
+    """Read the first row of a CSV to extract column headers."""
+    csv_py_encoding = encoding or detect_text_encoding(path)[0]
+    try:
+        with open(path, newline="", encoding=csv_py_encoding) as fh:
             sample = fh.read(8192)
             fh.seek(0)
             try:
@@ -88,10 +117,11 @@ def read_csv_headers(path: str) -> List[str]:
         return []
 
 
-def count_csv_rows(path: str) -> Optional[int]:
+def count_csv_rows(path: str, encoding: Optional[str] = None) -> Optional[int]:
     """Count data rows in a CSV-like file (excluding the header row)."""
+    csv_py_encoding = encoding or detect_text_encoding(path)[0]
     try:
-        with open(path, newline="", encoding="utf-8-sig") as fh:
+        with open(path, newline="", encoding=csv_py_encoding) as fh:
             sample = fh.read(8192)
             fh.seek(0)
             try:
@@ -206,7 +236,17 @@ def _register_views(conn, datasets: List[Dict[str, Any]]) -> None:
 
         # Pick the correct DuckDB table function
         if ext == ".csv":
-            src = f"read_csv_auto('{path}', header=true, all_varchar=true)"
+            csv_duckdb_encoding = str(ds.get("csv_encoding", "") or "").strip().lower()
+            if not csv_duckdb_encoding:
+                _, csv_duckdb_encoding = detect_text_encoding(ds["file_path"])
+            if csv_duckdb_encoding == "utf-16":
+                src = (
+                    "read_csv_auto("
+                    f"'{path}', header=true, all_varchar=true, encoding='{csv_duckdb_encoding}'"
+                    ")"
+                )
+            else:
+                src = f"read_csv_auto('{path}', header=true, all_varchar=true)"
         elif ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
             src = f"read_xlsx('{path}', sheet='{sheet}', header=true, all_varchar=true)"
         elif ext == ".xls":

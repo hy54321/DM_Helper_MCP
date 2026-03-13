@@ -4,12 +4,12 @@ from pathlib import Path
 
 
 def _load_ui_api(monkeypatch, tmp_path: Path):
-    db_path = tmp_path / "dm_helper.db"
+    db_path = tmp_path / "protoquery.db"
     app_dir = tmp_path / "app_data"
     app_dir.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setenv("DMH_DB_PATH", str(db_path))
-    monkeypatch.setenv("DMH_APP_BASE_DIR", str(app_dir))
+    monkeypatch.setenv("PROTOQUERY_DB_PATH", str(db_path))
+    monkeypatch.setenv("PROTOQUERY_APP_BASE_DIR", str(app_dir))
 
     import ui.api as ui_api
 

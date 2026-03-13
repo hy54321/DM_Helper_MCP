@@ -1,26 +1,27 @@
 from typing import List, Tuple
-from mcp.types import Prompt, PromptMessage
+
 from anthropic.types import MessageParam
+from mcp.types import Prompt, PromptMessage
 
 from core.chat import Chat
 from core.claude import Claude
 from mcp_client import MCPClient
 
 
-SYSTEM_PROMPT = """You are DM Helper — a data-migration assistant.
+SYSTEM_PROMPT = """You are ProtoQuery - a data-migration assistant.
 
 You help users compare source-system data extracts against target-ERP
 extracts (CSV / Excel files) using DuckDB-powered tools.
 
 Capabilities:
-• Catalog management: scan folders, list datasets, preview data.
-• Data profiling: column statistics, value distributions, duplicate detection.
-• Source ↔ target comparison: ADDED/REMOVED/CHANGED analysis with XLSX reports.
-• Read-only SQL queries against loaded datasets.
+- Catalog management: scan folders, list datasets, preview data.
+- Data profiling: column statistics, value distributions, duplicate detection.
+- Source to target comparison: ADDED/REMOVED/CHANGED analysis with XLSX reports.
+- Read-only SQL queries against loaded datasets.
 
 Rules:
 1. NEVER modify source or target data files.
-2. Return summaries and samples — not full datasets — unless writing to a report.
+2. Return summaries and samples - not full datasets - unless writing to a report.
 3. When comparing, always confirm key columns with the user before running.
 4. For large result sets, cap at 10 rows by default; mention total count.
 5. Point users to generated XLSX reports for full data.
@@ -82,7 +83,6 @@ to look up data when needed. Start with the exact information they need.
         words = query.split()
         command = words[0].replace("/", "")
 
-        # Build args dict from remaining words
         args: dict[str, str] = {}
         prompts = await self.list_prompts()
         prompt_names = {p.name for p in prompts}
@@ -90,7 +90,6 @@ to look up data when needed. Start with the exact information they need.
         if command not in prompt_names:
             return False
 
-        # Map positional args
         prompt_def = next((p for p in prompts if p.name == command), None)
         if prompt_def and prompt_def.arguments:
             for i, arg_def in enumerate(prompt_def.arguments):

@@ -1,4 +1,4 @@
-# DM Helper v1 — Final Implementation Plan
+# ProtoQuery v1 — Final Implementation Plan
 
 > Consolidated from two prior designs (Plan A: stdio/CLI-first, Plan B: FastAPI/React + HTTP MCP).
 > Where the two differed, each decision is justified below.
@@ -41,7 +41,7 @@ MCP server is solid).
 ## 2. Architecture
 
 ```
-DM_Helper_MCP/
+ProtoQuery/
 ├── main.py                    # CLI entry (stdio MCP client → Claude loop)
 ├── mcp_server.py              # FastMCP server (stdio + HTTP transport)
 ├── mcp_client.py              # MCP stdio client wrapper

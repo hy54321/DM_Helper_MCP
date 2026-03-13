@@ -1,5 +1,5 @@
 """
-DM Helper MCP Server.
+ProtoQuery MCP Server.
 
 Exposes data-migration tools (catalog, profiling, comparison,
 reports, SQL preview) via FastMCP (stdio transport).
@@ -7,8 +7,10 @@ reports, SQL preview) via FastMCP (stdio transport).
 
 import json
 import os
+import hmac
 from typing import Any, Dict, List, Optional
 
+from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
 
 from server import db
@@ -22,13 +24,39 @@ from server.query_engine import connect, format_results, quote
 from server.sql_guard import validate as sql_validate
 
 
-# DMH_MCP_MODE controls MCP tool exposure:
+# PROTOQUERY_MCP_MODE controls MCP tool exposure:
 # - "prod" (default): compact pair tools only (list_table_pairs + list_field_pairs)
 # - "debug": also exposes legacy list_pairs (full mapping payload)
-DMH_MCP_MODE = os.getenv("DMH_MCP_MODE", "prod").strip().lower()
-DEBUG_MODE = DMH_MCP_MODE == "debug"
+PROTOQUERY_MCP_MODE = (
+    os.getenv("PROTOQUERY_MCP_MODE", "").strip()
+    or os.getenv("DMH_MCP_MODE", "prod").strip()
+).lower()
+DEBUG_MODE = PROTOQUERY_MCP_MODE == "debug"
 
-mcp = FastMCP("DMHelperMCP", log_level="ERROR")
+mcp = FastMCP("ProtoQueryMCP", log_level="ERROR")
+
+
+def _mcp_auth_mode() -> str:
+    raw = (os.getenv("PROTOQUERY_MCP_AUTH_MODE", "") or os.getenv("DMH_MCP_AUTH_MODE", "")).strip().lower()
+    if raw in ("api", "api_key", "apikey"):
+        return "api"
+    return "none"
+
+
+def _mcp_api_key_header_name() -> str:
+    name = (
+        os.getenv("PROTOQUERY_MCP_API_KEY_HEADER", "")
+        or os.getenv("DMH_MCP_API_KEY_HEADER", "")
+        or "x-api-key"
+    ).strip()
+    return (name or "x-api-key").lower()
+
+
+def _mcp_api_key_value() -> str:
+    return (
+        os.getenv("PROTOQUERY_MCP_API_KEY", "")
+        or os.getenv("DMH_MCP_API_KEY", "")
+    ).strip()
 
 
 def _split_csv_fields(value: Optional[str]) -> List[str]:
@@ -209,47 +237,82 @@ def preview_dataset(
     limit: int = 10,
     offset: int = 0,
     fields: Optional[str] = None,
-) -> str:
+) -> mcp_types.CallToolResult:
     """Preview top-N rows from a dataset. Optionally specify comma-separated field names."""
+
+    def _error_result(message: str) -> mcp_types.CallToolResult:
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text=message)],
+            structuredContent={"error": message},
+            isError=True,
+        )
+
     ds = cat.get_dataset(dataset_id)
     if not ds:
-        return json.dumps({"error": f"Dataset '{dataset_id}' not found."})
+        return _error_result(f"Dataset '{dataset_id}' not found.")
 
-    limit = min(int(limit), 100)
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
     field_list = [f.strip() for f in fields.split(",")] if fields else None
 
     with connect([ds]) as duck:
         view = quote(dataset_id)
         sel = "*"
+        selected_fields: Optional[List[str]] = None
         if field_list:
-            valid = [f for f in field_list if f in ds["columns"]]
-            if valid:
-                sel = ", ".join(quote(f) for f in valid)
-        sql = f"SELECT {sel} FROM {view} LIMIT {limit} OFFSET {int(offset)}"
+            selected_fields = [f for f in field_list if f in ds["columns"]]
+            if selected_fields:
+                sel = ", ".join(quote(f) for f in selected_fields)
+        sql = f"SELECT {sel} FROM {view} LIMIT {limit} OFFSET {offset}"
         result = duck.execute(sql)
         headers = [d[0] for d in result.description]
-        rows = result.fetchall()
+        rows = [list(r) for r in result.fetchall()]
         total = duck.execute(f"SELECT COUNT(*) FROM {view}").fetchone()[0]
 
-    return format_results(headers, [list(r) for r in rows], total, limit)
+    safe_rows = json.loads(json.dumps(rows, default=str))
+    payload: Dict[str, Any] = {
+        "dataset": dataset_id,
+        "headers": headers,
+        "rows": safe_rows,
+        "total_rows": total,
+        "row_count": len(safe_rows),
+        "limit": limit,
+        "offset": offset,
+        "selected_fields": selected_fields,
+    }
+    table_text = format_results(headers, safe_rows, total, limit)
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=table_text)],
+        structuredContent=payload,
+        isError=False,
+    )
 
 
 @mcp.tool()
-def run_sql_preview(sql: str, limit: int = 10) -> str:
+def run_sql_preview(sql: str, limit: int = 10) -> mcp_types.CallToolResult:
     """Execute a read-only SQL query against loaded datasets and return capped results."""
+
+    def _error_result(message: str) -> mcp_types.CallToolResult:
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text=message)],
+            structuredContent={"error": message},
+            isError=True,
+        )
+
     ok, err = sql_validate(sql)
     if not ok:
-        return json.dumps({"error": err})
+        return _error_result(err)
 
-    limit = min(int(limit), 100)
+    limit = max(1, min(int(limit), 100))
     conn = db.get_connection()
     datasets = db.list_datasets(conn)
     conn.close()
 
     if not datasets:
-        return json.dumps({"error": "No datasets loaded. Run refresh_catalog first."})
+        return _error_result("No datasets loaded. Run refresh_catalog first.")
 
     # Inject LIMIT if not present
+    original_sql = sql
     sql_upper = sql.strip().upper()
     if "LIMIT" not in sql_upper:
         sql = f"{sql.rstrip().rstrip(';')} LIMIT {limit}"
@@ -258,11 +321,26 @@ def run_sql_preview(sql: str, limit: int = 10) -> str:
         try:
             result = duck.execute(sql)
             headers = [d[0] for d in result.description]
-            rows = result.fetchall()
+            rows = [list(r) for r in result.fetchall()]
         except Exception as exc:
-            return json.dumps({"error": str(exc)})
+            return _error_result(str(exc))
 
-    return format_results(headers, [list(r) for r in rows], len(rows), limit)
+    safe_rows = json.loads(json.dumps(rows, default=str))
+    payload: Dict[str, Any] = {
+        "sql": original_sql,
+        "executed_sql": sql,
+        "headers": headers,
+        "rows": safe_rows,
+        "row_count": len(safe_rows),
+        "total_rows": len(safe_rows),
+        "limit_applied": limit,
+    }
+    table_text = format_results(headers, safe_rows, len(safe_rows), limit)
+    return mcp_types.CallToolResult(
+        content=[mcp_types.TextContent(type="text", text=table_text)],
+        structuredContent=payload,
+        isError=False,
+    )
 
 
 @mcp.tool()
@@ -691,15 +769,32 @@ def compare_field(
     key_columns: str,
     field: str,
     limit: int = 10,
+    pair_id: Optional[str] = None,
 ) -> str:
-    """Drill-down: per-row diffs for a single field between source and target."""
-    keys = [k.strip() for k in key_columns.split(",") if k.strip()]
+    """Drill-down: per-row diffs for a single field between source and target.
+
+    When pair mappings exist, `field` can be either source or target field name.
+    """
+    keys = _split_csv_fields(key_columns)
+    err, keys, _comp_cols, key_mappings, compare_mappings = _resolve_pair_context(
+        source_dataset_id=source_dataset_id,
+        target_dataset_id=target_dataset_id,
+        key_fields=keys,
+        compare_fields=[field],
+        pair_id=pair_id,
+    )
+    if err:
+        return json.dumps({"error": err})
+
+    field_mapping = compare_mappings[0] if compare_mappings else None
     result = comp.compare_field(
         source_id=source_dataset_id,
         target_id=target_dataset_id,
         key_columns=keys,
         field=field,
         limit=limit,
+        key_mappings=key_mappings,
+        field_mapping=field_mapping,
     )
     return json.dumps(result, indent=2, default=str)
 
@@ -842,6 +937,48 @@ Please follow these steps:
 3. Provide an overall reconciliation summary across all pairs"""
 
 
+def _run_streamable_http() -> None:
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    auth_mode = _mcp_auth_mode()
+    header_name = _mcp_api_key_header_name()
+    expected_key = _mcp_api_key_value()
+    streamable_path = mcp.settings.streamable_http_path or "/mcp"
+
+    app = mcp.streamable_http_app()
+
+    if auth_mode == "api":
+        if not expected_key:
+            raise RuntimeError(
+                "MCP authentication mode is API but PROTOQUERY_MCP_API_KEY is not set."
+            )
+
+        class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
+            async def dispatch(self, request: Request, call_next):
+                path = request.url.path or ""
+                if path == streamable_path or path.startswith(f"{streamable_path}/"):
+                    provided = (request.headers.get(header_name) or "").strip()
+                    if not hmac.compare_digest(provided, expected_key):
+                        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+                return await call_next(request)
+
+        app.add_middleware(ApiKeyAuthMiddleware)
+
+    config = uvicorn.Config(
+        app,
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
+    uvicorn.Server(config).run()
+
+
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "stdio")
-    mcp.run(transport=transport)
+    if transport == "streamable-http":
+        _run_streamable_http()
+    else:
+        mcp.run(transport=transport)

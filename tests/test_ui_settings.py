@@ -7,12 +7,12 @@ from server import db
 
 
 def _load_ui_api(monkeypatch, tmp_path: Path):
-    db_path = tmp_path / "dm_helper.db"
+    db_path = tmp_path / "protoquery.db"
     app_dir = tmp_path / "app_data"
     app_dir.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setenv("DMH_DB_PATH", str(db_path))
-    monkeypatch.setenv("DMH_APP_BASE_DIR", str(app_dir))
+    monkeypatch.setenv("PROTOQUERY_DB_PATH", str(db_path))
+    monkeypatch.setenv("PROTOQUERY_APP_BASE_DIR", str(app_dir))
 
     import ui.api as ui_api
 
@@ -24,11 +24,13 @@ def test_save_settings_encrypts_anthropic_key(monkeypatch, tmp_path: Path) -> No
     client = TestClient(ui_api.app)
 
     raw_key = "sk-ant-test-1234567890"
+    raw_ngrok_token = "2abc1234567890-ngrok-token"
     response = client.post(
         "/api/settings/app",
         json={
             "theme": "light",
             "anthropic_api_key": raw_key,
+            "ngrok_authtoken": raw_ngrok_token,
             "model": "claude-test-model",
         },
     )
@@ -41,11 +43,255 @@ def test_save_settings_encrypts_anthropic_key(monkeypatch, tmp_path: Path) -> No
 
     conn = db.get_connection(path=str(db_path))
     encrypted = db.get_meta(conn, "anthropic_api_key_encrypted", "")
+    encrypted_ngrok_token = db.get_meta(conn, "ngrok_authtoken_encrypted", "")
     conn.close()
 
     assert encrypted
     assert encrypted != raw_key
     assert ui_api._decrypt_secret(encrypted) == raw_key
+    assert encrypted_ngrok_token
+    assert encrypted_ngrok_token != raw_ngrok_token
+    assert ui_api._decrypt_secret(encrypted_ngrok_token) == raw_ngrok_token
+
+
+def test_generate_mcp_api_key_encrypts_and_returns_plaintext_once(monkeypatch, tmp_path: Path) -> None:
+    ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "mcp_auth_mode": "api",
+            "model": "",
+        },
+    )
+    assert save_response.status_code == 200
+
+    generate_response = client.post("/api/settings/mcp-auth/generate", json={})
+    assert generate_response.status_code == 200
+    payload = generate_response.json()
+
+    generated_key = payload["api_key"]
+    assert generated_key
+    assert payload["header_name"] == "x-api-key"
+    assert payload["app_settings"]["mcp_api_key_set"] is True
+    assert payload["app_settings"]["mcp_auth_mode"] == "api"
+
+    conn = db.get_connection(path=str(db_path))
+    encrypted_key = db.get_meta(conn, "mcp_api_key_encrypted", "")
+    conn.close()
+
+    assert encrypted_key
+    assert encrypted_key != generated_key
+    assert ui_api._decrypt_secret(encrypted_key) == generated_key
+
+
+def test_generate_mcp_api_key_forces_api_mode(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "mcp_auth_mode": "none",
+            "model": "",
+        },
+    )
+    assert save_response.status_code == 200
+    assert save_response.json()["mcp_auth_mode"] == "none"
+
+    generate_response = client.post("/api/settings/mcp-auth/generate", json={})
+    assert generate_response.status_code == 200
+    payload = generate_response.json()
+    assert payload["app_settings"]["mcp_auth_mode"] == "api"
+
+
+def test_service_command_includes_mcp_api_auth_env(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "mcp_auth_mode": "api",
+            "model": "",
+        },
+    )
+    assert save_response.status_code == 200
+
+    generate_response = client.post("/api/settings/mcp-auth/generate", json={})
+    assert generate_response.status_code == 200
+
+    conn = db.get_connection()
+    try:
+        runtime_auth = ui_api._mcp_auth_runtime_config(conn)
+    finally:
+        conn.close()
+
+    _command, env_overrides = ui_api._service_command("mcp_server", mcp_auth=runtime_auth)
+    assert env_overrides["PROTOQUERY_MCP_AUTH_MODE"] == "api"
+    assert env_overrides["PROTOQUERY_MCP_API_KEY"] == runtime_auth["api_key"]
+    assert env_overrides["PROTOQUERY_MCP_API_KEY_HEADER"] == "x-api-key"
+
+
+def test_service_command_rejects_api_mode_without_key(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+
+    try:
+        ui_api._service_command(
+            "mcp_server",
+            mcp_auth={"mode": "api", "header_name": "x-api-key", "api_key": ""},
+        )
+        assert False, "Expected RuntimeError for missing API key"
+    except RuntimeError as exc:
+        assert "no API key is stored" in str(exc)
+
+
+def test_service_command_uses_local_relay_for_inspector_when_api_auth_enabled(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+    monkeypatch.setenv("UI_PORT", "18001")
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "mcp_auth_mode": "api",
+            "model": "",
+        },
+    )
+    assert save_response.status_code == 200
+
+    generate_response = client.post("/api/settings/mcp-auth/generate", json={})
+    assert generate_response.status_code == 200
+
+    conn = db.get_connection()
+    try:
+        runtime_auth = ui_api._mcp_auth_runtime_config(conn)
+    finally:
+        conn.close()
+
+    command, _env_overrides = ui_api._service_command("mcp_inspector", mcp_auth=runtime_auth)
+    assert "--server-url" in command
+    server_url_index = command.index("--server-url")
+    assert command[server_url_index + 1] == "http://127.0.0.1:18001/api/inspector/mcp"
+    assert "--header" not in command
+
+
+def test_inspector_relay_injects_saved_mcp_api_key(monkeypatch, tmp_path: Path) -> None:
+    ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "mcp_auth_mode": "api",
+            "model": "",
+        },
+    )
+    assert save_response.status_code == 200
+
+    generate_response = client.post("/api/settings/mcp-auth/generate", json={})
+    assert generate_response.status_code == 200
+    generated_key = generate_response.json()["api_key"]
+
+    captured = {}
+
+    class _FakeUpstreamResponse:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        async def aiter_raw(self):
+            yield b'{"ok":true}'
+
+        async def aclose(self):
+            return None
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, method, url, headers=None, content=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["headers"] = dict(headers or {})
+            captured["content"] = content
+            return object()
+
+        async def send(self, request, stream=False):
+            captured["stream"] = stream
+            return _FakeUpstreamResponse()
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(ui_api.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setenv("PROTOQUERY_DB_PATH", str(db_path))
+
+    relay_response = client.post(
+        "/api/inspector/mcp",
+        headers={"mcp-session-id": "session-1"},
+        json={"jsonrpc": "2.0", "id": "1", "method": "tools/list"},
+    )
+    assert relay_response.status_code == 200
+    assert relay_response.json() == {"ok": True}
+    assert captured["stream"] is True
+    assert captured["headers"]["x-api-key"] == generated_key
+
+
+def test_start_ngrok_service_uses_saved_authtoken(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "ngrok_authtoken": "2abc1234567890-ngrok-token",
+            "model": "",
+        },
+    )
+    assert save_response.status_code == 200
+
+    captured = {}
+
+    class _FakeListener:
+        def url(self):
+            return "https://demo.ngrok-free.app"
+
+        def close(self):
+            captured["closed"] = True
+            return None
+
+    class _FakeNgrokSdk:
+        def set_auth_token(self, token: str):
+            captured["token"] = token
+
+        def forward(self, upstream: str):
+            captured["forward"] = upstream
+            return _FakeListener()
+
+        def kill(self):
+            captured["killed"] = True
+            return None
+
+    monkeypatch.setattr(ui_api, "_list_ngrok_pids", lambda: [])
+    monkeypatch.setattr(ui_api, "_load_ngrok_sdk", lambda: _FakeNgrokSdk())
+
+    snapshot = ui_api._start_service("ngrok")
+    assert snapshot["running"] is True
+    assert snapshot["service_url"] == "https://demo.ngrok-free.app/mcp"
+    assert captured["token"] == "2abc1234567890-ngrok-token"
+    assert captured["forward"] == "http://127.0.0.1:8000"
+
+    stopped = ui_api._stop_service("ngrok")
+    assert stopped["running"] is False
+    assert captured["closed"] is True
+    assert captured["killed"] is True
 
 
 def test_models_lookup_uses_stored_key_when_request_key_is_empty(monkeypatch, tmp_path: Path) -> None:
@@ -195,6 +441,7 @@ def test_claude_chat_uses_saved_key_and_model(monkeypatch, tmp_path: Path) -> No
 
     class _FakeMessage:
         content = [_FakeTextBlock()]
+        stop_reason = "end_turn"
 
     class _FakeMessagesClient:
         def create(self, **kwargs):
@@ -225,7 +472,8 @@ def test_claude_chat_uses_saved_key_and_model(monkeypatch, tmp_path: Path) -> No
     assert captured["api_key"] == "sk-ant-stored-key"
     assert captured["model"] == "claude-sonnet-4-5"
     assert captured["system"] == "Use MCP tools first."
-    assert captured["messages"] == [
+    assert captured["messages"][:2] == [
         {"role": "user", "content": "Summary please"},
         {"role": "user", "content": "How many rows changed?"},
     ]
+    assert captured["messages"][2]["role"] == "assistant"
