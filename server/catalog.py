@@ -32,6 +32,12 @@ from server.query_engine import (
 CSV_EXTS = {".csv", ".tsv", ".txt"}
 EXCEL_EXTS = {".xlsx", ".xlsm", ".xltx", ".xltm", ".xls"}
 ALL_EXTS = CSV_EXTS | EXCEL_EXTS
+EXTRA_FOLDER_META_BY_SIDE = {
+    "configurations": "configurations_folder",
+    "translations": "translations_folder",
+    "rules": "rules_folder",
+}
+MANAGED_DATASET_SIDES = ("source", "target", "configurations", "translations", "rules")
 
 # Auto-pair fallback thresholds (for schema/field-based matching)
 AUTO_PAIR_MIN_SHARED_FIELDS = 3
@@ -43,7 +49,7 @@ LOW_CARDINALITY_DISTINCT = 3
 MIN_KEYLIKE_DISTINCT = 3
 MIN_KEYLIKE_UNIQUENESS = 0.96
 MIN_KEYLIKE_COMPLETENESS = 0.9
-MIN_KEYLIKE_CONTAINMENT = 0.85
+MIN_KEYLIKE_CONTAINMENT = 0.8
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -178,9 +184,10 @@ def _pair_metrics(
 
 
 def _is_key_pair_candidate(metrics: Dict[str, float]) -> bool:
+    max_uniqueness = max(metrics["src_uniqueness"], metrics["tgt_uniqueness"])
     return bool(
         min(metrics["src_distinct"], metrics["tgt_distinct"]) >= MIN_KEYLIKE_DISTINCT
-        and min(metrics["src_uniqueness"], metrics["tgt_uniqueness"]) >= MIN_KEYLIKE_UNIQUENESS
+        and max_uniqueness >= MIN_KEYLIKE_UNIQUENESS
         and min(metrics["src_completeness"], metrics["tgt_completeness"]) >= MIN_KEYLIKE_COMPLETENESS
         and metrics["containment"] >= MIN_KEYLIKE_CONTAINMENT
     )
@@ -368,6 +375,9 @@ def _scan_folder(
 def refresh_catalog(
     source_folder: Optional[str] = None,
     target_folder: Optional[str] = None,
+    configurations_folder: Optional[str] = None,
+    translations_folder: Optional[str] = None,
+    rules_folder: Optional[str] = None,
     include_row_counts: bool = False,
     conn=None,
 ) -> Dict[str, Any]:
@@ -390,9 +400,22 @@ def refresh_catalog(
     else:
         target_folder = db.get_meta(conn, "target_folder")
 
+    extra_folder_values = {
+        "configurations": configurations_folder,
+        "translations": translations_folder,
+        "rules": rules_folder,
+    }
+    for side, value in extra_folder_values.items():
+        meta_key = EXTRA_FOLDER_META_BY_SIDE[side]
+        if value is not None:
+            db.set_meta(conn, meta_key, value, commit=False)
+            extra_folder_values[side] = value
+        else:
+            extra_folder_values[side] = db.get_meta(conn, meta_key)
+
     # Existing datasets
     old_datasets = {d["id"]: d for d in db.list_datasets(conn)}
-    old_ids = set(old_datasets.keys())
+    old_ids = {d["id"] for d in old_datasets.values() if d.get("side") in MANAGED_DATASET_SIDES}
 
     # Scan
     src_list = (
@@ -405,7 +428,37 @@ def refresh_catalog(
         if target_folder
         else []
     )
-    new_list = src_list + tgt_list
+    cfg_list = (
+        _scan_folder(
+            extra_folder_values["configurations"],
+            "configurations",
+            existing_by_id=old_datasets,
+            include_row_counts=include_row_counts,
+        )
+        if extra_folder_values["configurations"]
+        else []
+    )
+    trn_list = (
+        _scan_folder(
+            extra_folder_values["translations"],
+            "translations",
+            existing_by_id=old_datasets,
+            include_row_counts=include_row_counts,
+        )
+        if extra_folder_values["translations"]
+        else []
+    )
+    rules_list = (
+        _scan_folder(
+            extra_folder_values["rules"],
+            "rules",
+            existing_by_id=old_datasets,
+            include_row_counts=include_row_counts,
+        )
+        if extra_folder_values["rules"]
+        else []
+    )
+    new_list = src_list + tgt_list + cfg_list + trn_list + rules_list
     new_ids = {d["id"] for d in new_list}
 
     # Upsert discovered datasets
@@ -427,8 +480,15 @@ def refresh_catalog(
     summary = {
         "source_folder": source_folder or "",
         "target_folder": target_folder or "",
+        "configurations_folder": extra_folder_values["configurations"] or "",
+        "translations_folder": extra_folder_values["translations"] or "",
+        "rules_folder": extra_folder_values["rules"] or "",
         "source_datasets": len(src_list),
         "target_datasets": len(tgt_list),
+        "configurations_datasets": len(cfg_list),
+        "translations_datasets": len(trn_list),
+        "rules_datasets": len(rules_list),
+        "total_datasets": len(new_list),
         "new_datasets": sorted(new_ids - old_ids),
         "removed_datasets": sorted(removed_ids),
         "row_counts_included": bool(include_row_counts),

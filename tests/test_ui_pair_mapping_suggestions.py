@@ -102,6 +102,135 @@ def test_quick_map_content_mode_returns_confidence_and_key_candidates(monkeypatc
     assert by_source["SRC_STATUS"]["confidence"] < by_source["SRC_ID"]["confidence"]
 
 
+def test_quick_map_content_mode_marks_one_to_many_key_candidate(monkeypatch, tmp_path: Path) -> None:
+    ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    source_csv = tmp_path / "source_headers.csv"
+    target_csv = tmp_path / "target_lines.csv"
+    source_csv.write_text(
+        "HEADER_ID,HEADER_NAME\n"
+        "H1,A\n"
+        "H2,B\n"
+        "H3,C\n"
+        "H4,D\n"
+        "H5,E\n",
+        encoding="utf-8",
+    )
+    target_csv.write_text(
+        "LINE_ID,HEADER_REF,AMOUNT\n"
+        "1,H1,10\n"
+        "2,H1,20\n"
+        "3,H2,30\n"
+        "4,H3,40\n"
+        "5,H3,50\n"
+        "6,H4,60\n"
+        "7,H5,70\n",
+        encoding="utf-8",
+    )
+
+    conn = db.get_connection(path=str(db_path))
+    try:
+        _register_csv_dataset(conn, "source_headers", "source", source_csv, ["HEADER_ID", "HEADER_NAME"])
+        _register_csv_dataset(conn, "target_lines", "target", target_csv, ["LINE_ID", "HEADER_REF", "AMOUNT"])
+    finally:
+        conn.close()
+
+    response = client.get(
+        "/api/pairs/quick-map",
+        params={
+            "source_dataset_id": "source_headers",
+            "target_dataset_id": "target_lines",
+            "mode": "content",
+            "min_confidence": 0.2,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    mappings = payload["compare_mappings"]
+    by_source = {m["source_field"]: m for m in mappings}
+
+    assert by_source["HEADER_ID"]["target_field"] == "HEADER_REF"
+    assert by_source["HEADER_ID"]["is_key_pair"] is True
+    assert by_source["HEADER_ID"]["use_key"] is True
+
+
+def test_quick_map_content_mode_marks_customer_group_fk_key_candidate_with_partial_overlap(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    source_csv = tmp_path / "configurations_customer_groups.csv"
+    target_csv = tmp_path / "target_customers.csv"
+    source_csv.write_text(
+        "Customer_group,Description\n"
+        "C-DOM,Domestic\n"
+        "C-EMP,Employee\n"
+        "C-EU,Europe\n"
+        "C-IC-DOM,Intercompany Domestic\n"
+        "C-IC-EU,Intercompany Europe\n"
+        "C-IC-TCY,Intercompany Turkey\n",
+        encoding="utf-8",
+    )
+    # Intentionally includes C-TCY while source has no C-TCY entry.
+    target_csv.write_text(
+        "CUSTOMERACCOUNT,CUSTOMERGROUPID\n"
+        "C0001,C-DOM\n"
+        "C0002,C-DOM\n"
+        "C0003,C-EU\n"
+        "C0004,C-EU\n"
+        "C0005,C-IC-DOM\n"
+        "C0006,C-IC-DOM\n"
+        "C0007,C-IC-EU\n"
+        "C0008,C-TCY\n"
+        "C0009,C-TCY\n"
+        "C0010,C-TCY\n",
+        encoding="utf-8",
+    )
+
+    conn = db.get_connection(path=str(db_path))
+    try:
+        _register_csv_dataset(
+            conn,
+            "configurations_customer_groups_Sheet1",
+            "configurations",
+            source_csv,
+            ["Customer_group", "Description"],
+        )
+        _register_csv_dataset(
+            conn,
+            "target_SLS_Customers_V3_Customers_V3",
+            "target",
+            target_csv,
+            ["CUSTOMERACCOUNT", "CUSTOMERGROUPID"],
+        )
+    finally:
+        conn.close()
+
+    response = client.get(
+        "/api/pairs/quick-map",
+        params={
+            "source_dataset_id": "configurations_customer_groups_Sheet1",
+            "target_dataset_id": "target_SLS_Customers_V3_Customers_V3",
+            "mode": "content",
+            "min_confidence": 0.6,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    mappings = payload["compare_mappings"]
+
+    group_mapping = next(
+        m
+        for m in mappings
+        if m["source_field"] == "Customer_group" and m["target_field"] == "CUSTOMERGROUPID"
+    )
+    assert group_mapping["origin_mode"] == "content"
+    assert group_mapping["is_key_pair"] is True
+    assert group_mapping["use_key"] is True
+
+
 def test_quick_map_name_mode_returns_dash_compatible_confidence(monkeypatch, tmp_path: Path) -> None:
     ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
     client = TestClient(ui_api.app)

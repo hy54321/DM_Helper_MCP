@@ -14,10 +14,10 @@ from typing import Tuple
 # ── Allowed statement prefixes ──────────────────────────────────
 _ALLOWED_PREFIXES = ("select", "with", "from", "summarize")
 
-# ── Forbidden keywords (word-boundary matched) ─────────────────
-_DANGEROUS_RE = re.compile(
-    r"\b("
-    r"INSERT|UPDATE|DELETE|MERGE|REPLACE"
+# ── Forbidden statement starts (outside quotes/comments) ─────────────────
+_UNSAFE_STATEMENT_RE = re.compile(
+    r"(^|[;(])\s*(?P<kw>"
+    r"INSERT|UPDATE|DELETE|MERGE"
     r"|CREATE|ALTER|DROP|TRUNCATE"
     r"|EXEC|EXECUTE"
     r"|GRANT|REVOKE"
@@ -40,14 +40,14 @@ def validate(sql: str) -> Tuple[bool, str]:
     if not any(lower.startswith(p) for p in _ALLOWED_PREFIXES):
         return False, "Only SELECT / WITH / FROM / SUMMARIZE queries are allowed."
 
-    # 2. No forbidden keywords
-    match = _DANGEROUS_RE.search(stripped)
-    if match:
-        return False, f"Destructive or unsafe keyword '{match.group()}' is not allowed."
-
-    # 3. No unquoted semicolons (multi-statement)
+    # 2. No unquoted semicolons (multi-statement)
     if _has_unquoted_semicolon(stripped):
         return False, "Multiple statements are not allowed."
+
+    # 3. No forbidden statement keywords outside quoted literals/identifiers
+    unsafe_kw = _find_unsafe_statement_keyword(stripped)
+    if unsafe_kw:
+        return False, f"Destructive or unsafe keyword '{unsafe_kw}' is not allowed."
 
     return True, ""
 
@@ -74,6 +74,69 @@ def _has_unquoted_semicolon(sql: str) -> bool:
             return True
         i += 1
     return False
+
+
+def _find_unsafe_statement_keyword(sql: str) -> str:
+    masked = _mask_sql_literals_and_identifiers(sql)
+    match = _UNSAFE_STATEMENT_RE.search(masked)
+    if not match:
+        return ""
+    return str(match.group("kw") or "")
+
+
+def _mask_sql_literals_and_identifiers(sql: str) -> str:
+    """Mask quoted text with spaces so keyword scans ignore literals/identifiers."""
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+
+    while i < len(sql):
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < len(sql) else ""
+
+        if in_single:
+            # Handle escaped single quote ('')
+            if ch == "'" and nxt == "'":
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            out.append(" ")
+            i += 1
+            continue
+
+        if in_double:
+            # Handle escaped double quote ("")
+            if ch == '"' and nxt == '"':
+                out.append(" ")
+                out.append(" ")
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            out.append(" ")
+            i += 1
+            continue
+
+        if ch == "'":
+            in_single = True
+            out.append(" ")
+            i += 1
+            continue
+
+        if ch == '"':
+            in_double = True
+            out.append(" ")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
 def _strip_sql_comments(sql: str) -> str:
@@ -142,3 +205,4 @@ def _strip_sql_comments(sql: str) -> str:
         i += 1
 
     return "".join(out)
+

@@ -9,3 +9,4 @@ dist/
 logs/
 .dmh_settings.key
 protoquery.db
+tests_tmp/

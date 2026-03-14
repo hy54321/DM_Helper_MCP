@@ -8,7 +8,12 @@ reports, SQL preview) via FastMCP (stdio transport).
 import json
 import os
 import hmac
+import time
+import inspect
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
@@ -19,7 +24,6 @@ from server import profile as prof
 from server import comparison as comp
 from server import reports as rpt
 from server import jobs as job_svc
-from server import relationships as rel
 from server.query_engine import connect, format_results, quote
 from server.sql_guard import validate as sql_validate
 
@@ -32,6 +36,30 @@ PROTOQUERY_MCP_MODE = (
     or os.getenv("DMH_MCP_MODE", "prod").strip()
 ).lower()
 DEBUG_MODE = PROTOQUERY_MCP_MODE == "debug"
+_EXPOSE_TOOLS_META_BY_SIDE = {
+    "source": "expose_source_to_tools",
+    "target": "expose_target_to_tools",
+    "configurations": "expose_configurations_to_tools",
+    "translations": "expose_translations_to_tools",
+    "rules": "expose_rules_to_tools",
+}
+_EXPOSE_TOOLS_DEFAULT_BY_SIDE = {
+    "source": True,
+    "target": True,
+    "configurations": False,
+    "translations": False,
+    "rules": False,
+}
+_SETTINGS_TOOL_LOGGING_ENABLED_KEY = "tool_logging_enabled"
+_TOOL_LOG_MAX_REQUEST_CHARS = 40_000
+_TOOL_LOG_MAX_RESPONSE_CHARS = 120_000
+_TOOL_LOG_MAX_ERROR_CHARS = 8_000
+_TOOL_LOG_SOURCE_CONTEXT: ContextVar[str] = ContextVar(
+    "protoquery_tool_log_source",
+    default="mcp_external",
+)
+_TOOL_LOG_SOURCE_HEADER = "x-protoquery-tool-log-source"
+_SENSITIVE_LOG_KEYWORDS = ("api_key", "apikey", "token", "secret", "password", "authorization", "auth")
 
 mcp = FastMCP("ProtoQueryMCP", log_level="ERROR")
 
@@ -57,6 +85,211 @@ def _mcp_api_key_value() -> str:
         os.getenv("PROTOQUERY_MCP_API_KEY", "")
         or os.getenv("DMH_MCP_API_KEY", "")
     ).strip()
+
+
+def _iso_utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _tool_log_truncate(value: Any, max_chars: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}... [truncated {len(text) - max_chars} chars]"
+
+
+def _sanitize_for_tool_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized: Dict[str, Any] = {}
+        for key, inner in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if any(keyword in lowered for keyword in _SENSITIVE_LOG_KEYWORDS):
+                sanitized[key_text] = "***"
+            else:
+                sanitized[key_text] = _sanitize_for_tool_log(inner)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_for_tool_log(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_for_tool_log(item) for item in value]
+    return value
+
+
+def _tool_logging_enabled(conn) -> bool:
+    raw = (db.get_meta(conn, _SETTINGS_TOOL_LOGGING_ENABLED_KEY, "1") or "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _tool_log_status_from_result_text(result_text: str) -> str:
+    if not result_text:
+        return "ok"
+    try:
+        payload = json.loads(result_text)
+    except Exception:
+        return "ok"
+    if isinstance(payload, dict):
+        if payload.get("error"):
+            return "error"
+        if payload.get("is_error") is True:
+            return "error"
+    return "ok"
+
+
+def _tool_log_error_from_result_text(result_text: str) -> str:
+    if not result_text:
+        return ""
+    try:
+        payload = json.loads(result_text)
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    raw = payload.get("error")
+    if raw in (None, "") and payload.get("is_error") is True:
+        raw = payload.get("content_text") or "Tool returned error."
+    if raw in (None, ""):
+        return ""
+    return _tool_log_truncate(raw, _TOOL_LOG_MAX_ERROR_CHARS)
+
+
+def _serialize_tool_result_for_log(result: Any) -> str:
+    if isinstance(result, str):
+        return _tool_log_truncate(result, _TOOL_LOG_MAX_RESPONSE_CHARS)
+    if isinstance(result, mcp_types.CallToolResult):
+        content_text = []
+        for item in list(getattr(result, "content", []) or []):
+            if getattr(item, "type", "") == "text":
+                content_text.append(str(getattr(item, "text", "") or ""))
+        payload = {
+            "is_error": bool(getattr(result, "isError", False)),
+            "structured_content": getattr(result, "structuredContent", None),
+            "content_text": content_text,
+        }
+        return _tool_log_truncate(json.dumps(payload, ensure_ascii=False, default=str), _TOOL_LOG_MAX_RESPONSE_CHARS)
+    return _tool_log_truncate(json.dumps(result, ensure_ascii=False, default=str), _TOOL_LOG_MAX_RESPONSE_CHARS)
+
+
+def _bind_tool_call_arguments(fn: Any, args: tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        raw_payload = dict(bound.arguments)
+    except Exception:
+        raw_payload = {
+            "args": list(args),
+            "kwargs": dict(kwargs),
+        }
+    sanitized = _sanitize_for_tool_log(raw_payload)
+    payload_json = json.dumps(sanitized, ensure_ascii=False, default=str)
+    if len(payload_json) <= _TOOL_LOG_MAX_REQUEST_CHARS:
+        return sanitized
+    return {
+        "_truncated": True,
+        "_preview": _tool_log_truncate(payload_json, _TOOL_LOG_MAX_REQUEST_CHARS),
+    }
+
+
+def _persist_tool_call_log(
+    *,
+    source: str,
+    tool_name: str,
+    request_payload: Dict[str, Any],
+    response_payload: str,
+    status: str,
+    error_message: str,
+    called_at: str,
+    responded_at: str,
+    duration_ms: int,
+) -> None:
+    conn = db.get_connection()
+    try:
+        if not _tool_logging_enabled(conn):
+            return
+        db.create_tool_call_log(
+            conn,
+            source=source,
+            request_id="",
+            tool_name=tool_name,
+            status=status,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error_message=error_message,
+            called_at=called_at,
+            responded_at=responded_at,
+            duration_ms=duration_ms,
+        )
+    finally:
+        conn.close()
+
+
+@contextmanager
+def tool_call_log_source(source: str):
+    normalized = (source or "").strip().lower() or "mcp_external"
+    token = _TOOL_LOG_SOURCE_CONTEXT.set(normalized)
+    try:
+        yield
+    finally:
+        _TOOL_LOG_SOURCE_CONTEXT.reset(token)
+
+
+def _current_tool_log_source() -> str:
+    return _TOOL_LOG_SOURCE_CONTEXT.get()
+
+
+def _instrument_tool_call_logging() -> None:
+    tool_manager = getattr(mcp, "_tool_manager", None)
+    tools = getattr(tool_manager, "_tools", {}) if tool_manager is not None else {}
+    for tool in list(tools.values()):
+        original_fn = getattr(tool, "fn", None)
+        if not callable(original_fn):
+            continue
+        if getattr(original_fn, "_protoquery_tool_log_wrapped", False):
+            continue
+        tool_name = str(getattr(tool, "name", "") or "")
+
+        def _wrapped_tool_fn(*args, __original=original_fn, __tool_name=tool_name, **kwargs):
+            called_at = _iso_utc_now()
+            started_at = time.perf_counter()
+            request_payload = _bind_tool_call_arguments(__original, args, kwargs)
+            response_payload = ""
+            status = "ok"
+            error_message = ""
+            try:
+                result = __original(*args, **kwargs)
+                response_payload = _serialize_tool_result_for_log(result)
+                status = _tool_log_status_from_result_text(response_payload)
+                error_message = _tool_log_error_from_result_text(response_payload)
+                return result
+            except Exception as exc:
+                status = "error"
+                error_message = _tool_log_truncate(str(exc), _TOOL_LOG_MAX_ERROR_CHARS)
+                response_payload = _tool_log_truncate(
+                    json.dumps({"error": str(exc)}, ensure_ascii=False),
+                    _TOOL_LOG_MAX_RESPONSE_CHARS,
+                )
+                raise
+            finally:
+                responded_at = _iso_utc_now()
+                duration_ms = int(max(0.0, (time.perf_counter() - started_at) * 1000.0))
+                try:
+                    _persist_tool_call_log(
+                        source=_current_tool_log_source(),
+                        tool_name=__tool_name or "unknown_tool",
+                        request_payload=request_payload,
+                        response_payload=response_payload,
+                        status=status,
+                        error_message=error_message,
+                        called_at=called_at,
+                        responded_at=responded_at,
+                        duration_ms=duration_ms,
+                    )
+                except Exception:
+                    # Never fail tool execution because logging failed.
+                    pass
+
+        setattr(_wrapped_tool_fn, "_protoquery_tool_log_wrapped", True)
+        tool.fn = _wrapped_tool_fn
 
 
 def _split_csv_fields(value: Optional[str]) -> List[str]:
@@ -126,6 +359,39 @@ def _resolve_requested_mappings(
         seen.add(sig)
         resolved.append(mapping)
     return resolved
+
+
+def _tool_visible_dataset_sides(conn) -> set[str]:
+    sides: set[str] = set()
+    for side, meta_key in _EXPOSE_TOOLS_META_BY_SIDE.items():
+        try:
+            default_value = "1" if _EXPOSE_TOOLS_DEFAULT_BY_SIDE.get(side, False) else "0"
+            raw = str(db.get_meta(conn, meta_key, default_value) or "").strip().lower()
+        except Exception:
+            # Keep tool visibility conservative but resilient for lightweight test doubles
+            # that do not implement full sqlite connection APIs.
+            raw = "1" if _EXPOSE_TOOLS_DEFAULT_BY_SIDE.get(side, False) else "0"
+        if raw in ("1", "true", "yes", "on"):
+            sides.add(side)
+    return sides
+
+
+def _tool_visible_datasets(conn) -> List[Dict[str, Any]]:
+    visible_sides = _tool_visible_dataset_sides(conn)
+    return [ds for ds in db.list_datasets(conn) if (ds.get("side") or "source") in visible_sides]
+
+
+def _tool_get_visible_dataset(dataset_id: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    conn = db.get_connection()
+    try:
+        ds = db.get_dataset(conn, dataset_id)
+        if not ds:
+            return None, f"Dataset '{dataset_id}' not found."
+        if (ds.get("side") or "source") not in _tool_visible_dataset_sides(conn):
+            return None, f"Dataset '{dataset_id}' is not exposed to MCP tools."
+        return ds, None
+    finally:
+        conn.close()
 
 
 def _format_export_job_start(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -223,8 +489,19 @@ def list_datasets(
     side: Optional[str] = None,
     filter: Optional[str] = None,
 ) -> str:
-    """List discovered datasets. Optional filter by side ('source'/'target') or text search."""
-    datasets = cat.get_datasets(side=side, filter_text=filter)
+    """List discovered datasets visible to MCP tools. Optional side/text filter."""
+    conn = db.get_connection()
+    datasets = _tool_visible_datasets(conn)
+    conn.close()
+    if side:
+        side_norm = side.strip().lower()
+        datasets = [d for d in datasets if str(d.get("side", "")).strip().lower() == side_norm]
+    if filter:
+        needle = filter.strip().lower()
+        datasets = [
+            d for d in datasets
+            if needle in str(d.get("id", "")).lower() or needle in str(d.get("file_name", "")).lower()
+        ]
     rows = [
         {
             "id": d["id"],
@@ -242,9 +519,9 @@ def list_datasets(
 @mcp.tool()
 def list_fields(dataset_id: str) -> str:
     """List column names and count for a dataset."""
-    ds = cat.get_dataset(dataset_id)
-    if not ds:
-        return json.dumps({"error": f"Dataset '{dataset_id}' not found."})
+    ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     return json.dumps(
         {
             "dataset": dataset_id,
@@ -271,9 +548,9 @@ def preview_dataset(
             isError=True,
         )
 
-    ds = cat.get_dataset(dataset_id)
-    if not ds:
-        return _error_result(f"Dataset '{dataset_id}' not found.")
+    ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return _error_result(err)
 
     limit = max(1, min(int(limit), 100))
     offset = max(0, int(offset))
@@ -329,7 +606,7 @@ def run_sql_preview(sql: str, limit: int = 10) -> mcp_types.CallToolResult:
 
     limit = max(1, min(int(limit), 100))
     conn = db.get_connection()
-    datasets = db.list_datasets(conn)
+    datasets = _tool_visible_datasets(conn)
     conn.close()
 
     if not datasets:
@@ -384,7 +661,7 @@ def export_query(
         return json.dumps({"error": err})
 
     conn = db.get_connection()
-    datasets = db.list_datasets(conn)
+    datasets = _tool_visible_datasets(conn)
     conn.close()
 
     if not datasets:
@@ -407,25 +684,48 @@ def export_query(
 
 
 @mcp.tool()
-def row_count_summary() -> str:
-    """Return row counts for all loaded datasets."""
-    conn = db.get_connection()
-    datasets = db.list_datasets(conn)
-    conn.close()
+def row_count_summary(dataset_id: str) -> str:
+    """Return row count for a single dataset."""
+    ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
 
-    if not datasets:
-        return json.dumps({"error": "No datasets loaded."})
+    cached = ds.get("row_count")
+    if cached is not None:
+        return json.dumps(
+            {
+                "dataset": ds["id"],
+                "side": ds["side"],
+                "row_count": cached,
+            },
+            indent=2,
+        )
 
-    counts = []
-    with connect(datasets) as duck:
-        for ds in datasets:
-            try:
-                n = duck.execute(f"SELECT COUNT(*) FROM {quote(ds['id'])}").fetchone()[0]
-            except Exception:
-                n = None
-            counts.append({"dataset": ds["id"], "side": ds["side"], "row_count": n})
+    with connect([ds]) as duck:
+        try:
+            n = duck.execute(f"SELECT COUNT(*) FROM {quote(ds['id'])}").fetchone()[0]
+        except Exception:
+            n = None
 
-    return json.dumps(counts, indent=2)
+    if n is not None:
+        conn = db.get_connection()
+        try:
+            conn.execute(
+                "UPDATE datasets SET row_count = ?, updated_at = ? WHERE id = ?",
+                (int(n), db.utcnow(), ds["id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return json.dumps(
+        {
+            "dataset": ds["id"],
+            "side": ds["side"],
+            "row_count": n,
+        },
+        indent=2,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -436,6 +736,9 @@ def row_count_summary() -> str:
 @mcp.tool()
 def data_profile(dataset_id: str) -> str:
     """Profile a dataset: per-column distinct, min, max, blanks."""
+    _ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     result = prof.data_profile(dataset_id)
     return json.dumps(result, indent=2)
 
@@ -444,9 +747,12 @@ def data_profile(dataset_id: str) -> str:
 def column_value_summary(
     dataset_id: str,
     column: Optional[str] = None,
-    top_n: int = 10,
+    top_n: int = 5,
 ) -> str:
     """Top-N value frequencies and blank counts for one or all columns."""
+    _ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     result = prof.column_value_summary(dataset_id, column=column, top_n=top_n)
     return json.dumps(result, indent=2)
 
@@ -459,6 +765,9 @@ def export_column_value_summary(
     filename: Optional[str] = None,
 ) -> str:
     """Create an XLSX Top-N value summary report (Column | Top 1..Top N | Blanks) in reports/."""
+    _ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     top_n = max(1, min(int(top_n), 100))
     result = prof.column_value_summary(dataset_id, column=column, top_n=top_n)
     if "error" in result:
@@ -474,6 +783,9 @@ def combo_value_summary(
     top_n: int = 10,
 ) -> str:
     """Frequency of combined-field value tuples. Columns as comma-separated string."""
+    _ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     col_list = [c.strip() for c in columns.split(",") if c.strip()]
     result = prof.combo_value_summary(dataset_id, col_list, top_n=top_n)
     return json.dumps(result, indent=2)
@@ -488,6 +800,9 @@ def preview_filtered_records(
     limit: int = 10,
 ) -> str:
     """Preview records matching a filter (exact value or blanks)."""
+    _ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     fspec = {"column": column}
     if blanks_only:
         fspec["blanks_only"] = True
@@ -504,6 +819,9 @@ def find_duplicates(
     limit: int = 10,
 ) -> str:
     """Find duplicate groups based on comma-separated key columns."""
+    _ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     keys = [k.strip() for k in key_columns.split(",") if k.strip()]
     result = prof.find_duplicates(dataset_id, keys, limit=limit)
     return json.dumps(result, indent=2)
@@ -516,6 +834,9 @@ def value_distribution(
     limit: int = 20,
 ) -> str:
     """Frequency counts for a single column, sorted by count descending."""
+    _ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     result = prof.value_distribution(dataset_id, column, limit=limit)
     return json.dumps(result, indent=2)
 
@@ -589,24 +910,12 @@ if DEBUG_MODE:
         return json.dumps(pairs, indent=2)
 
 @mcp.tool()
-def upsert_pair_override(
-    source_dataset_id: str,
-    target_dataset_id: str,
-    enabled: bool = True,
-) -> str:
-    """Create or update a manual pair override."""
-    result = cat.upsert_pair_override(source_dataset_id, target_dataset_id, enabled=enabled)
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
 def suggest_keys(pair_id: str) -> str:
     """Suggest candidate key columns for a pair based on uniqueness, completeness, and overlap."""
     result = prof.suggest_keys(pair_id)
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
 def save_key_preset(
     pair_id: str,
     key_fields: str,
@@ -630,21 +939,6 @@ def list_key_presets(pair_id: str) -> str:
 
 
 @mcp.tool()
-def link_related_tables(
-    side: str = "target",
-    min_confidence: float = 0.9,
-    suggest_only: bool = False,
-) -> str:
-    """Discover high-confidence same-side dataset relationships and optionally persist them."""
-    result = rel.link_related_tables(
-        side=side,
-        min_confidence=min_confidence,
-        suggest_only=suggest_only,
-    )
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool()
 def get_dataset_links(
     dataset_id: str,
 ) -> str:
@@ -654,10 +948,13 @@ def get_dataset_links(
     if not ds:
         conn.close()
         return json.dumps({"error": f"Dataset '{dataset_id}' not found."})
+    if ds.get("side") not in _tool_visible_dataset_sides(conn):
+        conn.close()
+        return json.dumps({"error": f"Dataset '{dataset_id}' is not exposed to MCP tools."})
 
     rels = db.list_relationships(
         conn,
-        side=ds["side"],
+        side=None,
         dataset_id=dataset_id,
         active_only=True,
         limit=5000,
@@ -889,7 +1186,6 @@ def get_report_metadata(report_id: str) -> str:
     return json.dumps(report, indent=2)
 
 
-@mcp.tool()
 def delete_report(report_id: str) -> str:
     """Delete a report (file + metadata). Never deletes source/target data."""
     import os
@@ -921,7 +1217,7 @@ def delete_report(report_id: str) -> str:
 def resource_datasets() -> str:
     """JSON list of all dataset IDs with side info."""
     conn = db.get_connection()
-    datasets = db.list_datasets(conn)
+    datasets = _tool_visible_datasets(conn)
     conn.close()
     return json.dumps(
         [{"id": d["id"], "side": d["side"], "file_name": d["file_name"]} for d in datasets]
@@ -931,9 +1227,9 @@ def resource_datasets() -> str:
 @mcp.resource("data://datasets/{dataset_id}/schema")
 def resource_dataset_schema(dataset_id: str) -> str:
     """JSON column list for a specific dataset."""
-    ds = cat.get_dataset(dataset_id)
-    if not ds:
-        return json.dumps({"error": f"Dataset '{dataset_id}' not found."})
+    ds, err = _tool_get_visible_dataset(dataset_id)
+    if err:
+        return json.dumps({"error": err})
     return json.dumps({"id": ds["id"], "columns": ds["columns"]})
 
 
@@ -985,6 +1281,9 @@ Please follow these steps:
 3. Provide an overall reconciliation summary across all pairs"""
 
 
+_instrument_tool_call_logging()
+
+
 def _run_streamable_http() -> None:
     import uvicorn
     from starlette.middleware.base import BaseHTTPMiddleware
@@ -997,6 +1296,19 @@ def _run_streamable_http() -> None:
     streamable_path = mcp.settings.streamable_http_path or "/mcp"
 
     app = mcp.streamable_http_app()
+
+    class ToolLogSourceMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            path = request.url.path or ""
+            source = "mcp_external"
+            if path == streamable_path or path.startswith(f"{streamable_path}/"):
+                hinted_source = (request.headers.get(_TOOL_LOG_SOURCE_HEADER) or "").strip().lower()
+                if hinted_source in ("inspector", "claude_chat", "mcp_external"):
+                    source = hinted_source
+            with tool_call_log_source(source):
+                return await call_next(request)
+
+    app.add_middleware(ToolLogSourceMiddleware)
 
     if auth_mode == "api":
         if not expected_key:

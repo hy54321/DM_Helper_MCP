@@ -1,5 +1,7 @@
 import importlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import types
 
 from fastapi.testclient import TestClient
 
@@ -17,6 +19,23 @@ def _load_ui_api(monkeypatch, tmp_path: Path):
     import ui.api as ui_api
 
     return importlib.reload(ui_api), db_path
+
+
+def _register_demo_tool(ui_api, tool_name: str = "demo_tool"):
+    import mcp_server
+
+    manager = ui_api._mcp_instance._tool_manager
+
+    def _fn(limit: int = 1):
+        return '{"ok": true, "limit": %d}' % int(limit)
+
+    manager._tools[tool_name] = types.SimpleNamespace(
+        name=tool_name,
+        description="Demo wrapped tool",
+        parameters={"type": "object", "properties": {"limit": {"type": "integer"}}},
+        fn=_fn,
+    )
+    mcp_server._instrument_tool_call_logging()
 
 
 def test_save_settings_encrypts_anthropic_key(monkeypatch, tmp_path: Path) -> None:
@@ -479,6 +498,255 @@ def test_claude_chat_uses_saved_key_and_model(monkeypatch, tmp_path: Path) -> No
     assert captured["messages"][2]["role"] == "assistant"
 
 
+def test_claude_chat_logs_tool_calls(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+    _register_demo_tool(ui_api, "demo_tool")
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "anthropic_api_key": "sk-ant-stored-key",
+            "model": "claude-sonnet-4-5",
+        },
+    )
+    assert save_response.status_code == 200
+
+    monkeypatch.setattr(
+        ui_api,
+        "_list_anthropic_models",
+        lambda api_key, limit=1: [{"id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"}],
+    )
+    validate_response = client.post("/api/settings/anthropic/validate", json={"api_key": ""})
+    assert validate_response.status_code == 200
+    assert validate_response.json()["activated"] is True
+
+    class _FakeToolUseBlock:
+        def __init__(self):
+            self.type = "tool_use"
+            self.id = "toolu_123"
+            self.name = "demo_tool"
+            self.input = {"limit": 1}
+
+    class _FakeTextBlock:
+        type = "text"
+        text = "Tool call done."
+
+    class _FakeMessagesClient:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                class _ToolUseMessage:
+                    content = [_FakeToolUseBlock()]
+                    stop_reason = "tool_use"
+
+                return _ToolUseMessage()
+
+            class _FinalMessage:
+                content = [_FakeTextBlock()]
+                stop_reason = "end_turn"
+
+            return _FinalMessage()
+
+    class _FakeAnthropic:
+        def __init__(self, api_key: str, timeout: float):
+            self.api_key = api_key
+            self.timeout = timeout
+            self.messages = _FakeMessagesClient()
+
+    monkeypatch.setattr(ui_api, "Anthropic", _FakeAnthropic)
+
+    chat_response = client.post(
+        "/api/claude/chat",
+        json={"message": "Run the demo tool", "history": []},
+    )
+    assert chat_response.status_code == 200
+    assert chat_response.json()["message"]["content"] == "Tool call done."
+
+    logs_response = client.get("/api/tool-logs?status=all&limit=20")
+    assert logs_response.status_code == 200
+    logs_payload = logs_response.json()
+    assert logs_payload["total"] == 1
+    assert len(logs_payload["items"]) == 1
+    entry = logs_payload["items"][0]
+    assert entry["tool_name"] == "demo_tool"
+    assert entry["source"] == "claude_chat"
+    assert entry["status"] == "ok"
+    assert entry["request_payload"]["limit"] == 1
+    assert "\"ok\": true" in entry["response_payload"]
+    assert entry["called_at"]
+    assert entry["responded_at"]
+    assert entry["duration_ms"] >= 0
+
+
+def test_external_mcp_tool_calls_are_logged(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+    _register_demo_tool(ui_api, "external_demo_tool")
+
+    # Invoke the wrapped MCP tool function directly (mimics external MCP client execution path).
+    tool = ui_api._mcp_instance._tool_manager._tools.get("external_demo_tool")
+    assert tool is not None
+    output = tool.fn(limit=1)
+    assert isinstance(output, str)
+
+    logs_response = client.get("/api/tool-logs?status=all&limit=20")
+    assert logs_response.status_code == 200
+    payload = logs_response.json()
+    assert payload["total"] == 1
+    entry = payload["items"][0]
+    assert entry["source"] == "mcp_external"
+    assert entry["tool_name"] == "external_demo_tool"
+    assert entry["request_payload"]["limit"] == 1
+    assert entry["status"] == "ok"
+
+
+def test_tool_logging_can_be_disabled_from_settings(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+    _register_demo_tool(ui_api, "no_log_tool")
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "tool_logging_enabled": False,
+            "anthropic_api_key": "sk-ant-stored-key",
+            "model": "claude-sonnet-4-5",
+        },
+    )
+    assert save_response.status_code == 200
+    assert save_response.json()["tool_logging_enabled"] is False
+
+    monkeypatch.setattr(
+        ui_api,
+        "_list_anthropic_models",
+        lambda api_key, limit=1: [{"id": "claude-sonnet-4-5", "display_name": "Claude Sonnet 4.5"}],
+    )
+    validate_response = client.post("/api/settings/anthropic/validate", json={"api_key": ""})
+    assert validate_response.status_code == 200
+    assert validate_response.json()["activated"] is True
+
+    class _FakeToolUseBlock:
+        def __init__(self):
+            self.type = "tool_use"
+            self.id = "toolu_456"
+            self.name = "no_log_tool"
+            self.input = {"limit": 1}
+
+    class _FakeTextBlock:
+        type = "text"
+        text = "Done."
+
+    class _FakeMessagesClient:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                class _ToolUseMessage:
+                    content = [_FakeToolUseBlock()]
+                    stop_reason = "tool_use"
+
+                return _ToolUseMessage()
+
+            class _FinalMessage:
+                content = [_FakeTextBlock()]
+                stop_reason = "end_turn"
+
+            return _FinalMessage()
+
+    class _FakeAnthropic:
+        def __init__(self, api_key: str, timeout: float):
+            self.api_key = api_key
+            self.timeout = timeout
+            self.messages = _FakeMessagesClient()
+
+    monkeypatch.setattr(ui_api, "Anthropic", _FakeAnthropic)
+
+    chat_response = client.post(
+        "/api/claude/chat",
+        json={"message": "Run no_log_tool", "history": []},
+    )
+    assert chat_response.status_code == 200
+
+    logs_response = client.get("/api/tool-logs?status=all&limit=20")
+    assert logs_response.status_code == 200
+    assert logs_response.json()["total"] == 0
+
+
+def test_tool_logs_filters_and_cleanup(monkeypatch, tmp_path: Path) -> None:
+    ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    old_called = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    old_responded = (datetime.now(timezone.utc) - timedelta(days=30, seconds=-1)).isoformat()
+    new_called = datetime.now(timezone.utc).isoformat()
+    new_responded = (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat()
+
+    conn = db.get_connection(path=str(db_path))
+    try:
+        db.create_tool_call_log(
+            conn,
+            source="claude_chat",
+            request_id="old_req",
+            tool_name="old_tool",
+            status="error",
+            request_payload={"a": 1},
+            response_payload='{"error":"old failure"}',
+            error_message="old failure",
+            called_at=old_called,
+            responded_at=old_responded,
+            duration_ms=100,
+            commit=False,
+        )
+        db.create_tool_call_log(
+            conn,
+            source="claude_chat",
+            request_id="new_req",
+            tool_name="new_tool",
+            status="ok",
+            request_payload={"b": 2},
+            response_payload='{"ok":true}',
+            error_message="",
+            called_at=new_called,
+            responded_at=new_responded,
+            duration_ms=50,
+            commit=False,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    error_only_response = client.get("/api/tool-logs?status=error")
+    assert error_only_response.status_code == 200
+    error_payload = error_only_response.json()
+    assert error_payload["total"] == 1
+    assert error_payload["items"][0]["tool_name"] == "old_tool"
+
+    cleanup_response = client.post("/api/tool-logs/cleanup-older-than", json={"days": 7})
+    assert cleanup_response.status_code == 200
+    assert cleanup_response.json()["deleted"] == 1
+
+    after_cleanup = client.get("/api/tool-logs")
+    assert after_cleanup.status_code == 200
+    assert after_cleanup.json()["total"] == 1
+    assert after_cleanup.json()["items"][0]["tool_name"] == "new_tool"
+
+    clear_all_response = client.delete("/api/tool-logs")
+    assert clear_all_response.status_code == 200
+    assert clear_all_response.json()["deleted"] == 1
+
+    empty_response = client.get("/api/tool-logs")
+    assert empty_response.status_code == 200
+    assert empty_response.json()["total"] == 0
+
+
 def test_folder_configurations_save_list_apply(monkeypatch, tmp_path: Path) -> None:
     ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
     client = TestClient(ui_api.app)
@@ -604,3 +872,74 @@ def test_folder_configurations_delete_removes_active(monkeypatch, tmp_path: Path
     assert list_response.status_code == 200
     assert list_response.json()["configs"] == []
     assert list_response.json()["active_id"] == ""
+
+
+def test_folders_expose_source_target_defaults_to_true(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    response = client.get("/api/settings/folders")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["expose_source_to_tools"] is True
+    assert payload["expose_target_to_tools"] is True
+
+
+def test_folder_configurations_persist_extra_folders_and_exposure_flags(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/folder-configs",
+        json={
+            "name": "Extended Config",
+            "source_folder": "C:/extended/source",
+            "target_folder": "C:/extended/target",
+            "configurations_folder": "C:/extended/configurations",
+            "translations_folder": "C:/extended/translations",
+            "rules_folder": "C:/extended/rules",
+            "report_folder": "C:/extended/reports",
+            "expose_source_to_tools": False,
+            "expose_target_to_tools": True,
+            "expose_configurations_to_tools": True,
+            "expose_translations_to_tools": False,
+            "expose_rules_to_tools": True,
+            "set_active": True,
+        },
+    )
+    assert save_response.status_code == 200
+    payload = save_response.json()
+    assert payload["folders"]["configurations_folder"] == "C:/extended/configurations"
+    assert payload["folders"]["translations_folder"] == "C:/extended/translations"
+    assert payload["folders"]["rules_folder"] == "C:/extended/rules"
+    assert payload["folders"]["expose_source_to_tools"] is False
+    assert payload["folders"]["expose_target_to_tools"] is True
+    assert payload["folders"]["expose_configurations_to_tools"] is True
+    assert payload["folders"]["expose_translations_to_tools"] is False
+    assert payload["folders"]["expose_rules_to_tools"] is True
+
+    folders_response = client.get("/api/settings/folders")
+    assert folders_response.status_code == 200
+    folders_payload = folders_response.json()
+    assert folders_payload["configurations_folder"] == "C:/extended/configurations"
+    assert folders_payload["translations_folder"] == "C:/extended/translations"
+    assert folders_payload["rules_folder"] == "C:/extended/rules"
+    assert folders_payload["expose_source_to_tools"] is False
+    assert folders_payload["expose_target_to_tools"] is True
+    assert folders_payload["expose_configurations_to_tools"] is True
+    assert folders_payload["expose_translations_to_tools"] is False
+    assert folders_payload["expose_rules_to_tools"] is True
+
+    list_response = client.get("/api/settings/folder-configs")
+    assert list_response.status_code == 200
+    configs = list_response.json()["configs"]
+    assert len(configs) == 1
+    cfg = configs[0]
+    assert cfg["configurations_folder"] == "C:/extended/configurations"
+    assert cfg["translations_folder"] == "C:/extended/translations"
+    assert cfg["rules_folder"] == "C:/extended/rules"
+    assert cfg["expose_source_to_tools"] is False
+    assert cfg["expose_target_to_tools"] is True
+    assert cfg["expose_configurations_to_tools"] is True
+    assert cfg["expose_translations_to_tools"] is False
+    assert cfg["expose_rules_to_tools"] is True

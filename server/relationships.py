@@ -5,9 +5,10 @@ Relationship discovery and auto-linking for datasets on the same side.
 from __future__ import annotations
 
 from difflib import SequenceMatcher
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import re
 
+from server import catalog as cat
 from server import db
 from server.query_engine import connect, quote
 
@@ -244,6 +245,217 @@ def _pair_sig(left_ds: str, right_ds: str) -> Tuple[str, str]:
     return tuple(sorted((left_ds, right_ds)))
 
 
+def _normalize_side_filter(value: Optional[str]) -> Optional[str]:
+    side = (value or "").strip().lower()
+    if side in {"", "any", "all", "mixed"}:
+        return None
+    return side
+
+
+def _resolve_scope_pool(
+    conn,
+    *,
+    side: Optional[str],
+    dataset_id: Optional[str],
+    label: str,
+) -> tuple[Optional[str], List[Dict[str, Any]]]:
+    cleaned_dataset = (dataset_id or "").strip()
+    if cleaned_dataset:
+        ds = db.get_dataset(conn, cleaned_dataset)
+        if not ds:
+            return f"{label} dataset '{cleaned_dataset}' not found.", []
+        if side and ds.get("side") != side:
+            return (
+                f"{label} dataset '{cleaned_dataset}' belongs to side '{ds.get('side')}', not '{side}'.",
+                [],
+            )
+        return None, [ds]
+
+    if not side:
+        return (
+            f"{label} scope is required: choose a {label.lower()} dataset or a {label.lower()} folder prefilter.",
+            [],
+        )
+    return None, db.list_datasets(conn, side=side)
+
+
+def auto_link_scoped_relationships(
+    *,
+    left_side: Optional[str] = None,
+    right_side: Optional[str] = None,
+    left_dataset: Optional[str] = None,
+    right_dataset: Optional[str] = None,
+    mode: str = "content",
+    min_confidence: float = 0.6,
+    suggest_only: bool = False,
+    max_links: int = 200,
+    conn=None,
+) -> Dict[str, Any]:
+    """Auto-create relationship links for a scoped left/right selection.
+
+    Scope can be dataset+dataset, folder+folder, or dataset+folder.
+    Existing related dataset pairs are skipped.
+    """
+    normalized_mode = (mode or "content").strip().lower()
+    if normalized_mode not in {"name", "content", "hybrid"}:
+        return {"error": "mode must be one of: name, content, hybrid."}
+
+    normalized_left_side = _normalize_side_filter(left_side)
+    normalized_right_side = _normalize_side_filter(right_side)
+
+    for side_val in (normalized_left_side, normalized_right_side):
+        if side_val and side_val not in db.DATASET_SIDES:
+            return {
+                "error": "side must be one of: source, target, configurations, translations, rules, or any.",
+            }
+
+    min_confidence = max(0.0, min(float(min_confidence), 1.0))
+    max_links = max(1, min(int(max_links), 2000))
+
+    own = conn is None
+    if own:
+        conn = db.get_connection()
+
+    left_err, left_pool = _resolve_scope_pool(
+        conn,
+        side=normalized_left_side,
+        dataset_id=left_dataset,
+        label="Left",
+    )
+    if left_err:
+        if own:
+            conn.close()
+        return {"error": left_err}
+
+    right_err, right_pool = _resolve_scope_pool(
+        conn,
+        side=normalized_right_side,
+        dataset_id=right_dataset,
+        label="Right",
+    )
+    if right_err:
+        if own:
+            conn.close()
+        return {"error": right_err}
+
+    existing_pair_sigs: Set[Tuple[str, str]] = {
+        _pair_sig(str(r["left_dataset"]), str(r["right_dataset"]))
+        for r in conn.execute(
+            "SELECT left_dataset, right_dataset FROM dataset_relationships WHERE active = 1"
+        ).fetchall()
+    }
+
+    visited_pair_sigs: Set[Tuple[str, str]] = set()
+    suggestions: List[Dict[str, Any]] = []
+    applied: List[Dict[str, Any]] = []
+    considered_pairs = 0
+    skipped_existing_pairs = 0
+
+    for left_ds in left_pool:
+        for right_ds in right_pool:
+            left_id = str(left_ds.get("id") or "")
+            right_id = str(right_ds.get("id") or "")
+            if not left_id or not right_id or left_id == right_id:
+                continue
+
+            pair_sig = _pair_sig(left_id, right_id)
+            if pair_sig in visited_pair_sigs:
+                continue
+            visited_pair_sigs.add(pair_sig)
+            considered_pairs += 1
+
+            if pair_sig in existing_pair_sigs:
+                skipped_existing_pairs += 1
+                continue
+
+            result = cat.suggest_field_mappings(
+                source_id=left_id,
+                target_id=right_id,
+                mode=normalized_mode,
+                min_confidence=min_confidence,
+                max_mappings=100,
+                conn=conn,
+            )
+            if "error" in result:
+                continue
+
+            mappings = result.get("compare_mappings", []) or []
+            key_candidates = [
+                m
+                for m in mappings
+                if bool(m.get("is_key_pair")) or bool(m.get("use_key"))
+            ]
+            if not key_candidates:
+                continue
+
+            key_candidates.sort(
+                key=lambda m: float(m.get("confidence") or 0.0),
+                reverse=True,
+            )
+            best = key_candidates[0]
+            left_field = str(best.get("source_field") or "").strip()
+            right_field = str(best.get("target_field") or "").strip()
+            if not left_field or not right_field:
+                continue
+
+            natural_side = left_ds["side"] if left_ds["side"] == right_ds["side"] else "cross"
+            confidence = float(best.get("confidence") or 1.0)
+            suggestion = {
+                "side": natural_side,
+                "left_dataset": left_id,
+                "left_field": left_field,
+                "right_dataset": right_id,
+                "right_field": right_field,
+                "confidence": round(confidence, 3),
+                "method": f"{normalized_mode}_auto_scope",
+                "origin_mode": str(best.get("origin_mode") or "content"),
+            }
+            suggestions.append(suggestion)
+
+            if suggest_only:
+                continue
+            if len(applied) >= max_links:
+                continue
+
+            rel = db.upsert_relationship(
+                conn=conn,
+                side=natural_side,
+                left_dataset=left_id,
+                left_field=left_field,
+                right_dataset=right_id,
+                right_field=right_field,
+                confidence=confidence,
+                method=f"{normalized_mode}_auto_scope",
+                active=True,
+            )
+            applied.append(rel)
+            existing_pair_sigs.add(pair_sig)
+
+    if own:
+        conn.close()
+
+    return {
+        "left_scope": {
+            "side": normalized_left_side or "any",
+            "dataset": (left_dataset or "").strip() or None,
+            "dataset_count": len(left_pool),
+        },
+        "right_scope": {
+            "side": normalized_right_side or "any",
+            "dataset": (right_dataset or "").strip() or None,
+            "dataset_count": len(right_pool),
+        },
+        "mode": normalized_mode,
+        "suggest_only": suggest_only,
+        "min_confidence": min_confidence,
+        "pairs_considered": considered_pairs,
+        "pairs_skipped_existing": skipped_existing_pairs,
+        "suggested_count": len(suggestions),
+        "applied_count": len(applied),
+        "relationships": applied if not suggest_only else suggestions,
+    }
+
+
 def link_related_tables(
     side: str = "target",
     min_confidence: float = 0.9,
@@ -255,8 +467,10 @@ def link_related_tables(
 ) -> Dict[str, Any]:
     """Discover high-confidence same-side dataset field relationships and optionally persist them."""
     side = (side or "").strip().lower()
-    if side not in ("source", "target"):
-        return {"error": "side must be 'source' or 'target'."}
+    if side not in db.DATASET_SIDES:
+        return {
+            "error": "side must be one of: source, target, configurations, translations, rules.",
+        }
 
     min_confidence = max(0.0, min(float(min_confidence), 1.0))
     min_name_score = max(0.0, min(float(min_name_score), 1.0))

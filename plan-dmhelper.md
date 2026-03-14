@@ -173,7 +173,7 @@ data files, not database tables).
 | `preview_dataset` | `dataset_id, limit=10, offset=0, fields?` | Formatted top-N rows. |
 | `run_sql_preview` | `sql, limit=10` | Execute read-only SQL, return capped result. |
 | `export_query` | `sql, filename?, format?` | Run SQL, save ALL rows to `reports/`, return file path. |
-| `row_count_summary` | — | Row counts for all loaded datasets. |
+| `row_count_summary` | `dataset_id` | Row count for a single dataset. |
 
 ### 5.2 Profiling tools
 

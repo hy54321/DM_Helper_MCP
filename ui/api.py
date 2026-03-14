@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import httpx
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, IO, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -29,6 +30,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 from mcp_server import mcp as _mcp_instance
+from mcp_server import tool_call_log_source as _tool_call_log_source
 from server import catalog as cat
 from server import comparison as comp
 from server import db
@@ -62,7 +64,8 @@ def _call_mcp_tool(name: str, arguments: Dict[str, Any]) -> str:
     if not tool:
         return json.dumps({"error": f"Tool '{name}' not found."})
     try:
-        return tool.fn(**arguments)
+        with _tool_call_log_source("claude_chat"):
+            return tool.fn(**arguments)
     except Exception as exc:
         return json.dumps({"error": f"Tool '{name}' failed: {exc}"})
 
@@ -93,6 +96,9 @@ def _format_export_job_start(result: Dict[str, Any]) -> Dict[str, Any]:
 class RefreshCatalogRequest(BaseModel):
     source_folder: Optional[str] = None
     target_folder: Optional[str] = None
+    configurations_folder: Optional[str] = None
+    translations_folder: Optional[str] = None
+    rules_folder: Optional[str] = None
     report_folder: Optional[str] = None
     include_row_counts: bool = False
 
@@ -100,6 +106,14 @@ class RefreshCatalogRequest(BaseModel):
 class SaveFoldersRequest(BaseModel):
     source_folder: str = ""
     target_folder: str = ""
+    configurations_folder: str = ""
+    translations_folder: str = ""
+    rules_folder: str = ""
+    expose_source_to_tools: bool = True
+    expose_target_to_tools: bool = True
+    expose_configurations_to_tools: bool = False
+    expose_translations_to_tools: bool = False
+    expose_rules_to_tools: bool = False
     report_folder: str = ""
 
 
@@ -107,6 +121,14 @@ class SaveFolderConfigRequest(BaseModel):
     name: str = ""
     source_folder: str = ""
     target_folder: str = ""
+    configurations_folder: str = ""
+    translations_folder: str = ""
+    rules_folder: str = ""
+    expose_source_to_tools: bool = True
+    expose_target_to_tools: bool = True
+    expose_configurations_to_tools: bool = False
+    expose_translations_to_tools: bool = False
+    expose_rules_to_tools: bool = False
     report_folder: str = ""
     set_active: bool = True
 
@@ -185,11 +207,23 @@ class RelationshipLinkRequest(BaseModel):
     suggest_only: bool = False
 
 
+class RelationshipScopedLinkRequest(BaseModel):
+    left_side: str = Field(default="any")
+    right_side: str = Field(default="any")
+    left_dataset: str = ""
+    right_dataset: str = ""
+    mode: str = Field(default="content")
+    min_confidence: float = Field(default=0.6, ge=0, le=1)
+    suggest_only: bool = False
+    max_links: int = Field(default=200, ge=1, le=2000)
+
+
 class SaveAppSettingsRequest(BaseModel):
     theme: str = "light"
     anthropic_api_key: Optional[str] = None
     ngrok_authtoken: Optional[str] = None
     mcp_auth_mode: str = "none"
+    tool_logging_enabled: Optional[bool] = None
     model: str = ""
     claude_instructions: str = ""
 
@@ -210,6 +244,10 @@ class ClaudeChatHistoryMessage(BaseModel):
 class ClaudeChatRequest(BaseModel):
     message: str = ""
     history: List[ClaudeChatHistoryMessage] = Field(default_factory=list)
+
+
+class ToolLogCleanupOlderThanRequest(BaseModel):
+    days: int = Field(default=7, ge=1, le=3650)
 
 
 @dataclass
@@ -238,11 +276,33 @@ _SETTINGS_CLAUDE_INSTRUCTIONS_KEY = "claude_system_instructions"
 _SETTINGS_NGROK_AUTHTOKEN_KEY = "ngrok_authtoken_encrypted"
 _SETTINGS_MCP_AUTH_MODE_KEY = "mcp_auth_mode"
 _SETTINGS_MCP_API_KEY_KEY = "mcp_api_key_encrypted"
+_SETTINGS_TOOL_LOGGING_ENABLED_KEY = "tool_logging_enabled"
 _MCP_API_KEY_HEADER_NAME = "x-api-key"
 _SETTINGS_FOLDER_CONFIGS_KEY = "folder_configs_json"
 _SETTINGS_ACTIVE_FOLDER_CONFIG_KEY = "active_folder_config_id"
 _SETTINGS_ENCRYPTION_KEY_FILE = ".protoquery_settings.key"
 _LEGACY_SETTINGS_ENCRYPTION_KEY_FILE = ".dmh_settings.key"
+_TOOL_LOG_ALLOWED_STATUSES = {"all", "ok", "error"}
+_TOOL_LOG_MAX_QUERY_CHARS = 500
+_EXTRA_FOLDER_META_BY_SIDE = {
+    "configurations": "configurations_folder",
+    "translations": "translations_folder",
+    "rules": "rules_folder",
+}
+_EXPOSE_TOOLS_META_BY_SIDE = {
+    "source": "expose_source_to_tools",
+    "target": "expose_target_to_tools",
+    "configurations": "expose_configurations_to_tools",
+    "translations": "expose_translations_to_tools",
+    "rules": "expose_rules_to_tools",
+}
+_FOLDER_CONFIG_EXPOSE_KEYS = {
+    "source": "expose_source_to_tools",
+    "target": "expose_target_to_tools",
+    "configurations": "expose_configurations_to_tools",
+    "translations": "expose_translations_to_tools",
+    "rules": "expose_rules_to_tools",
+}
 
 
 def _env_with_legacy(primary: str, legacy: str, default: str = "") -> str:
@@ -267,9 +327,14 @@ def _app_base_dir() -> Path:
 
 
 def _iso_utc_now() -> str:
-    from datetime import datetime, timezone
-
     return datetime.now(timezone.utc).isoformat()
+
+
+def _tool_log_truncate(value: Any, max_chars: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}... [truncated {len(text) - max_chars} chars]"
 
 
 def _mcp_port() -> int:
@@ -1161,14 +1226,38 @@ def _datasets_or_404() -> List[Dict[str, Any]]:
     return datasets
 
 
-def _get_saved_folders_from_conn(conn) -> Dict[str, str]:
+def _meta_bool(conn, key: str, default: bool = False) -> bool:
+    raw = (db.get_meta(conn, key, "1" if default else "0") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _save_meta_bool(conn, key: str, value: bool) -> None:
+    db.set_meta(conn, key, "1" if value else "0", commit=False)
+
+
+def _get_saved_folders_from_conn(conn) -> Dict[str, Any]:
     source = (db.get_meta(conn, "source_folder", "") or "").strip()
     target = (db.get_meta(conn, "target_folder", "") or "").strip()
+    configurations = (db.get_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["configurations"], "") or "").strip()
+    translations = (db.get_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["translations"], "") or "").strip()
+    rules = (db.get_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["rules"], "") or "").strip()
     report = (db.get_meta(conn, "report_folder", "") or "").strip()
-    return {"source_folder": source, "target_folder": target, "report_folder": report}
+    return {
+        "source_folder": source,
+        "target_folder": target,
+        "configurations_folder": configurations,
+        "translations_folder": translations,
+        "rules_folder": rules,
+        "report_folder": report,
+        "expose_source_to_tools": _meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["source"], default=True),
+        "expose_target_to_tools": _meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["target"], default=True),
+        "expose_configurations_to_tools": _meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["configurations"], default=False),
+        "expose_translations_to_tools": _meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["translations"], default=False),
+        "expose_rules_to_tools": _meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["rules"], default=False),
+    }
 
 
-def _get_saved_folders() -> Dict[str, str]:
+def _get_saved_folders() -> Dict[str, Any]:
     conn = db.get_connection()
     try:
         return _get_saved_folders_from_conn(conn)
@@ -1185,7 +1274,7 @@ def _normalize_folder_config_name(value: str) -> str:
     return name
 
 
-def _load_folder_configs_from_conn(conn) -> List[Dict[str, str]]:
+def _load_folder_configs_from_conn(conn) -> List[Dict[str, Any]]:
     raw = (db.get_meta(conn, _SETTINGS_FOLDER_CONFIGS_KEY, "") or "").strip()
     if not raw:
         return []
@@ -1196,7 +1285,7 @@ def _load_folder_configs_from_conn(conn) -> List[Dict[str, str]]:
     if not isinstance(parsed, list):
         return []
 
-    configs: List[Dict[str, str]] = []
+    configs: List[Dict[str, Any]] = []
     seen_ids = set()
     for item in parsed:
         if not isinstance(item, dict):
@@ -1211,7 +1300,15 @@ def _load_folder_configs_from_conn(conn) -> List[Dict[str, str]]:
                 "name": name,
                 "source_folder": str(item.get("source_folder") or "").strip(),
                 "target_folder": str(item.get("target_folder") or "").strip(),
+                "configurations_folder": str(item.get("configurations_folder") or "").strip(),
+                "translations_folder": str(item.get("translations_folder") or "").strip(),
+                "rules_folder": str(item.get("rules_folder") or "").strip(),
                 "report_folder": str(item.get("report_folder") or "").strip(),
+                "expose_source_to_tools": bool(item.get("expose_source_to_tools", True)),
+                "expose_target_to_tools": bool(item.get("expose_target_to_tools", True)),
+                "expose_configurations_to_tools": bool(item.get("expose_configurations_to_tools", False)),
+                "expose_translations_to_tools": bool(item.get("expose_translations_to_tools", False)),
+                "expose_rules_to_tools": bool(item.get("expose_rules_to_tools", False)),
                 "created_at": str(item.get("created_at") or "").strip(),
                 "updated_at": str(item.get("updated_at") or "").strip(),
             }
@@ -1222,7 +1319,7 @@ def _load_folder_configs_from_conn(conn) -> List[Dict[str, str]]:
     return configs
 
 
-def _save_folder_configs_to_conn(conn, configs: List[Dict[str, str]], active_id: str) -> str:
+def _save_folder_configs_to_conn(conn, configs: List[Dict[str, Any]], active_id: str) -> str:
     valid_ids = {cfg["id"] for cfg in configs}
     next_active = active_id if active_id in valid_ids else ""
     db.set_meta(conn, _SETTINGS_FOLDER_CONFIGS_KEY, json.dumps(configs), commit=False)
@@ -1231,16 +1328,32 @@ def _save_folder_configs_to_conn(conn, configs: List[Dict[str, str]], active_id:
 
 
 def _find_matching_folder_config_id(
-    configs: List[Dict[str, str]],
+    configs: List[Dict[str, Any]],
     source_folder: str,
     target_folder: str,
+    configurations_folder: str,
+    translations_folder: str,
+    rules_folder: str,
     report_folder: str,
+    expose_source_to_tools: bool,
+    expose_target_to_tools: bool,
+    expose_configurations_to_tools: bool,
+    expose_translations_to_tools: bool,
+    expose_rules_to_tools: bool,
 ) -> str:
     for cfg in configs:
         if (
             cfg["source_folder"] == source_folder
             and cfg["target_folder"] == target_folder
+            and cfg["configurations_folder"] == configurations_folder
+            and cfg["translations_folder"] == translations_folder
+            and cfg["rules_folder"] == rules_folder
             and cfg["report_folder"] == report_folder
+            and bool(cfg.get("expose_source_to_tools", True)) == bool(expose_source_to_tools)
+            and bool(cfg.get("expose_target_to_tools", True)) == bool(expose_target_to_tools)
+            and bool(cfg.get("expose_configurations_to_tools", False)) == bool(expose_configurations_to_tools)
+            and bool(cfg.get("expose_translations_to_tools", False)) == bool(expose_translations_to_tools)
+            and bool(cfg.get("expose_rules_to_tools", False)) == bool(expose_rules_to_tools)
         ):
             return cfg["id"]
     return ""
@@ -1552,6 +1665,8 @@ def _get_saved_app_settings() -> Dict[str, Any]:
         ngrok_needs_reset = bool(ngrok_configured and not ngrok_token)
         ngrok_masked = _mask_secret(ngrok_token) if ngrok_token else ("configured" if ngrok_needs_reset else "")
         mcp_auth_mode = _normalize_mcp_auth_mode(db.get_meta(conn, _SETTINGS_MCP_AUTH_MODE_KEY, "none") or "none")
+        tool_logging_enabled_raw = (db.get_meta(conn, _SETTINGS_TOOL_LOGGING_ENABLED_KEY, "1") or "1").strip().lower()
+        tool_logging_enabled = tool_logging_enabled_raw in ("1", "true", "yes", "on")
         mcp_api_key, mcp_api_key_configured = _read_stored_mcp_api_key(conn)
         mcp_api_key_needs_reset = bool(mcp_api_key_configured and not mcp_api_key)
         mcp_api_key_masked = (
@@ -1571,6 +1686,7 @@ def _get_saved_app_settings() -> Dict[str, Any]:
             "ngrok_authtoken_masked": ngrok_masked,
             "ngrok_authtoken_needs_reset": ngrok_needs_reset,
             "mcp_auth_mode": mcp_auth_mode,
+            "tool_logging_enabled": tool_logging_enabled,
             "mcp_api_key_header_name": _MCP_API_KEY_HEADER_NAME,
             "mcp_api_key_set": mcp_api_key_configured,
             "mcp_api_key_masked": mcp_api_key_masked,
@@ -1605,10 +1721,14 @@ def _validate_service_start_folders(service_name: str) -> None:
         raise RuntimeError("Configured folders do not exist: " + "; ".join(invalid))
 
 
-def _validate_relationship_payload(conn, payload: RelationshipUpsertRequest) -> tuple[List[str], List[str]]:
-    side = (payload.side or "").strip().lower()
-    if side not in ("source", "target"):
-        raise HTTPException(status_code=400, detail="side must be 'source' or 'target'.")
+def _validate_relationship_payload(conn, payload: RelationshipUpsertRequest) -> tuple[List[str], List[str], str]:
+    requested_side = (payload.side or "").strip().lower()
+    allowed_requested = set(db.RELATIONSHIP_SIDES) | {"any", "all", "mixed"}
+    if requested_side and requested_side not in allowed_requested:
+        raise HTTPException(
+            status_code=400,
+            detail="side must be one of: source, target, configurations, translations, rules, cross, any.",
+        )
 
     left = db.get_dataset(conn, payload.left_dataset)
     right = db.get_dataset(conn, payload.right_dataset)
@@ -1616,8 +1736,17 @@ def _validate_relationship_payload(conn, payload: RelationshipUpsertRequest) -> 
         raise HTTPException(status_code=404, detail=f"Left dataset '{payload.left_dataset}' not found.")
     if not right:
         raise HTTPException(status_code=404, detail=f"Right dataset '{payload.right_dataset}' not found.")
-    if left["side"] != side or right["side"] != side:
-        raise HTTPException(status_code=400, detail="Both datasets must belong to the selected side.")
+    natural_side = left["side"] if left["side"] == right["side"] else "cross"
+
+    if requested_side in {"source", "target", "configurations", "translations", "rules"}:
+        if left["side"] != requested_side or right["side"] != requested_side:
+            raise HTTPException(status_code=400, detail="Both datasets must belong to the selected side.")
+        resolved_side = requested_side
+    elif requested_side == "cross":
+        resolved_side = natural_side
+    else:
+        resolved_side = natural_side
+
     left_fields = [f.strip() for f in (payload.left_fields or []) if f and f.strip()]
     right_fields = [f.strip() for f in (payload.right_fields or []) if f and f.strip()]
     if not left_fields and payload.left_field.strip():
@@ -1641,7 +1770,7 @@ def _validate_relationship_payload(conn, payload: RelationshipUpsertRequest) -> 
                 status_code=400,
                 detail=f"Field '{fld}' not found in dataset '{payload.right_dataset}'.",
             )
-    return left_fields, right_fields
+    return left_fields, right_fields, resolved_side
 
 
 app = FastAPI(title="ProtoQuery Admin UI", version="0.1.0")
@@ -1722,27 +1851,130 @@ def force_stop_system_service(service_name: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Failed to force stop {service_name}: {exc}")
 
 
+@app.get("/api/tool-logs")
+def list_tool_logs(
+    limit: int = 200,
+    offset: int = 0,
+    status: str = "all",
+    tool_name: str = "",
+    contains: str = "",
+    since_days: int = 0,
+) -> Dict[str, Any]:
+    normalized_status = (status or "all").strip().lower()
+    if normalized_status not in _TOOL_LOG_ALLOWED_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be one of: all, ok, error.")
+
+    safe_limit = max(1, min(int(limit), 1000))
+    safe_offset = max(0, int(offset))
+    safe_since_days = max(0, min(int(since_days), 3650))
+    safe_tool_name = (tool_name or "").strip()
+    safe_contains = _tool_log_truncate((contains or "").strip(), _TOOL_LOG_MAX_QUERY_CHARS)
+    called_since = ""
+    if safe_since_days > 0:
+        called_since = (datetime.now(timezone.utc) - timedelta(days=safe_since_days)).isoformat()
+
+    conn = db.get_connection()
+    try:
+        rows, total = db.list_tool_call_logs(
+            conn,
+            limit=safe_limit,
+            offset=safe_offset,
+            status=None if normalized_status == "all" else normalized_status,
+            tool_name=safe_tool_name,
+            contains=safe_contains,
+            called_since=called_since or None,
+        )
+        tool_names = db.list_tool_call_log_names(conn)
+    finally:
+        conn.close()
+
+    return {
+        "items": rows,
+        "total": total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "tool_names": tool_names,
+        "filters": {
+            "status": normalized_status,
+            "tool_name": safe_tool_name,
+            "contains": safe_contains,
+            "since_days": safe_since_days,
+        },
+    }
+
+
+@app.delete("/api/tool-logs")
+def clear_all_tool_logs() -> Dict[str, Any]:
+    conn = db.get_connection()
+    try:
+        deleted = db.delete_tool_call_logs(conn)
+    finally:
+        conn.close()
+    return {"deleted": deleted}
+
+
+@app.post("/api/tool-logs/cleanup-older-than")
+def clear_tool_logs_older_than(req: ToolLogCleanupOlderThanRequest) -> Dict[str, Any]:
+    days = max(1, min(int(req.days), 3650))
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    conn = db.get_connection()
+    try:
+        deleted = db.delete_tool_call_logs_older_than(conn, cutoff)
+    finally:
+        conn.close()
+    return {"deleted": deleted, "older_than_days": days, "cutoff": cutoff}
+
+
 @app.get("/api/settings/folders")
-def get_folders() -> Dict[str, str]:
+def get_folders() -> Dict[str, Any]:
     return _get_saved_folders()
 
 
 @app.post("/api/settings/folders")
-def save_folders(req: SaveFoldersRequest) -> Dict[str, str]:
+def save_folders(req: SaveFoldersRequest) -> Dict[str, Any]:
     source = (req.source_folder or "").strip()
     target = (req.target_folder or "").strip()
+    configurations = (req.configurations_folder or "").strip()
+    translations = (req.translations_folder or "").strip()
+    rules = (req.rules_folder or "").strip()
     report = (req.report_folder or "").strip()
+    expose_source = bool(req.expose_source_to_tools)
+    expose_target = bool(req.expose_target_to_tools)
+    expose_configurations = bool(req.expose_configurations_to_tools)
+    expose_translations = bool(req.expose_translations_to_tools)
+    expose_rules = bool(req.expose_rules_to_tools)
     conn = db.get_connection()
     try:
         db.set_meta(conn, "source_folder", source, commit=False)
         db.set_meta(conn, "target_folder", target, commit=False)
+        db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["configurations"], configurations, commit=False)
+        db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["translations"], translations, commit=False)
+        db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["rules"], rules, commit=False)
         db.set_meta(conn, "report_folder", report, commit=False)
+        _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["source"], expose_source)
+        _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["target"], expose_target)
+        _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["configurations"], expose_configurations)
+        _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["translations"], expose_translations)
+        _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["rules"], expose_rules)
         configs = _load_folder_configs_from_conn(conn)
-        matching_id = _find_matching_folder_config_id(configs, source, target, report)
+        matching_id = _find_matching_folder_config_id(
+            configs,
+            source,
+            target,
+            configurations,
+            translations,
+            rules,
+            report,
+            expose_source,
+            expose_target,
+            expose_configurations,
+            expose_translations,
+            expose_rules,
+        )
         _save_folder_configs_to_conn(conn, configs, matching_id)
+        return _get_saved_folders_from_conn(conn)
     finally:
         conn.close()
-    return {"source_folder": source, "target_folder": target, "report_folder": report}
 
 
 @app.get("/api/settings/folder-configs")
@@ -1759,7 +1991,15 @@ def save_folder_config(req: SaveFolderConfigRequest) -> Dict[str, Any]:
     name = _normalize_folder_config_name(req.name)
     source = (req.source_folder or "").strip()
     target = (req.target_folder or "").strip()
+    configurations = (req.configurations_folder or "").strip()
+    translations = (req.translations_folder or "").strip()
+    rules = (req.rules_folder or "").strip()
     report = (req.report_folder or "").strip()
+    expose_source = bool(req.expose_source_to_tools)
+    expose_target = bool(req.expose_target_to_tools)
+    expose_configurations = bool(req.expose_configurations_to_tools)
+    expose_translations = bool(req.expose_translations_to_tools)
+    expose_rules = bool(req.expose_rules_to_tools)
     set_active = bool(req.set_active)
 
     conn = db.get_connection()
@@ -1772,7 +2012,15 @@ def save_folder_config(req: SaveFolderConfigRequest) -> Dict[str, Any]:
             existing["name"] = name
             existing["source_folder"] = source
             existing["target_folder"] = target
+            existing["configurations_folder"] = configurations
+            existing["translations_folder"] = translations
+            existing["rules_folder"] = rules
             existing["report_folder"] = report
+            existing["expose_source_to_tools"] = expose_source
+            existing["expose_target_to_tools"] = expose_target
+            existing["expose_configurations_to_tools"] = expose_configurations
+            existing["expose_translations_to_tools"] = expose_translations
+            existing["expose_rules_to_tools"] = expose_rules
             existing["updated_at"] = now
             saved_id = existing["id"]
         else:
@@ -1783,7 +2031,15 @@ def save_folder_config(req: SaveFolderConfigRequest) -> Dict[str, Any]:
                     "name": name,
                     "source_folder": source,
                     "target_folder": target,
+                    "configurations_folder": configurations,
+                    "translations_folder": translations,
+                    "rules_folder": rules,
                     "report_folder": report,
+                    "expose_source_to_tools": expose_source,
+                    "expose_target_to_tools": expose_target,
+                    "expose_configurations_to_tools": expose_configurations,
+                    "expose_translations_to_tools": expose_translations,
+                    "expose_rules_to_tools": expose_rules,
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -1794,7 +2050,15 @@ def save_folder_config(req: SaveFolderConfigRequest) -> Dict[str, Any]:
         if set_active:
             db.set_meta(conn, "source_folder", source, commit=False)
             db.set_meta(conn, "target_folder", target, commit=False)
+            db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["configurations"], configurations, commit=False)
+            db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["translations"], translations, commit=False)
+            db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["rules"], rules, commit=False)
             db.set_meta(conn, "report_folder", report, commit=False)
+            _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["source"], expose_source)
+            _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["target"], expose_target)
+            _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["configurations"], expose_configurations)
+            _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["translations"], expose_translations)
+            _save_meta_bool(conn, _EXPOSE_TOOLS_META_BY_SIDE["rules"], expose_rules)
             active_id = saved_id
         active_id = _save_folder_configs_to_conn(conn, configs, active_id)
 
@@ -1822,7 +2086,35 @@ def apply_folder_config(config_id: str) -> Dict[str, Any]:
 
         db.set_meta(conn, "source_folder", selected["source_folder"], commit=False)
         db.set_meta(conn, "target_folder", selected["target_folder"], commit=False)
+        db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["configurations"], selected.get("configurations_folder", ""), commit=False)
+        db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["translations"], selected.get("translations_folder", ""), commit=False)
+        db.set_meta(conn, _EXTRA_FOLDER_META_BY_SIDE["rules"], selected.get("rules_folder", ""), commit=False)
         db.set_meta(conn, "report_folder", selected["report_folder"], commit=False)
+        _save_meta_bool(
+            conn,
+            _EXPOSE_TOOLS_META_BY_SIDE["source"],
+            bool(selected.get("expose_source_to_tools", True)),
+        )
+        _save_meta_bool(
+            conn,
+            _EXPOSE_TOOLS_META_BY_SIDE["target"],
+            bool(selected.get("expose_target_to_tools", True)),
+        )
+        _save_meta_bool(
+            conn,
+            _EXPOSE_TOOLS_META_BY_SIDE["configurations"],
+            bool(selected.get("expose_configurations_to_tools", False)),
+        )
+        _save_meta_bool(
+            conn,
+            _EXPOSE_TOOLS_META_BY_SIDE["translations"],
+            bool(selected.get("expose_translations_to_tools", False)),
+        )
+        _save_meta_bool(
+            conn,
+            _EXPOSE_TOOLS_META_BY_SIDE["rules"],
+            bool(selected.get("expose_rules_to_tools", False)),
+        )
         active_id = _save_folder_configs_to_conn(conn, configs, selected["id"])
         return {
             "configs": configs,
@@ -1873,8 +2165,14 @@ def save_app_settings(req: SaveAppSettingsRequest) -> Dict[str, Any]:
 
     conn = db.get_connection()
     try:
+        if req.tool_logging_enabled is None:
+            tool_logging_raw = (db.get_meta(conn, _SETTINGS_TOOL_LOGGING_ENABLED_KEY, "1") or "1").strip().lower()
+            tool_logging_enabled = tool_logging_raw in ("1", "true", "yes", "on")
+        else:
+            tool_logging_enabled = bool(req.tool_logging_enabled)
         db.set_meta(conn, _SETTINGS_THEME_KEY, theme, commit=False)
         db.set_meta(conn, _SETTINGS_MCP_AUTH_MODE_KEY, mcp_auth_mode, commit=False)
+        db.set_meta(conn, _SETTINGS_TOOL_LOGGING_ENABLED_KEY, "1" if tool_logging_enabled else "0", commit=False)
         db.set_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, model, commit=False)
         db.set_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, claude_instructions, commit=False)
         if api_key_input is not None:
@@ -1937,6 +2235,7 @@ async def inspector_mcp_relay(request: Request, subpath: str = "") -> StreamingR
         if not api_key:
             raise HTTPException(status_code=500, detail="MCP API key is missing for inspector relay.")
         forward_headers[header_name] = api_key
+    forward_headers["x-protoquery-tool-log-source"] = "inspector"
 
     body = await request.body()
 
@@ -2109,8 +2408,13 @@ def claude_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
             for block in response.content:
                 if block.type != "tool_use":
                     continue
-                _log.info("Calling MCP tool: %s(%s)", block.name, block.input)
-                result_text = _call_mcp_tool(block.name, block.input)
+                tool_name = str(getattr(block, "name", "") or "").strip()
+                arguments = getattr(block, "input", {})
+                if not isinstance(arguments, dict):
+                    arguments = {"value": arguments}
+
+                _log.info("Calling MCP tool: %s(%s)", tool_name, arguments)
+                result_text = _call_mcp_tool(tool_name, arguments)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2169,6 +2473,9 @@ def refresh_catalog(req: RefreshCatalogRequest) -> Dict[str, Any]:
         result = cat.refresh_catalog(
             source_folder=req.source_folder,
             target_folder=req.target_folder,
+            configurations_folder=req.configurations_folder,
+            translations_folder=req.translations_folder,
+            rules_folder=req.rules_folder,
             include_row_counts=req.include_row_counts,
             conn=conn,
         )
@@ -2178,7 +2485,15 @@ def refresh_catalog(req: RefreshCatalogRequest) -> Dict[str, Any]:
             configs,
             saved_folders["source_folder"],
             saved_folders["target_folder"],
+            saved_folders["configurations_folder"],
+            saved_folders["translations_folder"],
+            saved_folders["rules_folder"],
             saved_folders["report_folder"],
+            bool(saved_folders["expose_source_to_tools"]),
+            bool(saved_folders["expose_target_to_tools"]),
+            bool(saved_folders["expose_configurations_to_tools"]),
+            bool(saved_folders["expose_translations_to_tools"]),
+            bool(saved_folders["expose_rules_to_tools"]),
         )
         _save_folder_configs_to_conn(conn, configs, matching_id)
         return result
@@ -2438,10 +2753,13 @@ def list_relationships(
     active_only: bool = False,
     limit: int = 200,
 ) -> List[Dict[str, Any]]:
+    side_filter = (side or "").strip().lower() or None
+    if side_filter in ("any", "all"):
+        side_filter = None
     conn = db.get_connection()
     rows = db.list_relationships(
         conn,
-        side=side,
+        side=side_filter,
         dataset_id=dataset_id,
         active_only=active_only,
         limit=limit,
@@ -2453,10 +2771,10 @@ def list_relationships(
 @app.post("/api/relationships")
 def create_relationship(req: RelationshipUpsertRequest) -> Dict[str, Any]:
     conn = db.get_connection()
-    left_fields, right_fields = _validate_relationship_payload(conn, req)
+    left_fields, right_fields, resolved_side = _validate_relationship_payload(conn, req)
     row = db.upsert_relationship(
         conn,
-        side=req.side.strip().lower(),
+        side=resolved_side,
         left_dataset=req.left_dataset,
         left_field=left_fields[0],
         left_fields=left_fields,
@@ -2477,11 +2795,11 @@ def update_relationship(relationship_id: int, req: RelationshipUpsertRequest) ->
     if not db.get_relationship(conn, relationship_id):
         conn.close()
         raise HTTPException(status_code=404, detail=f"Relationship '{relationship_id}' not found.")
-    left_fields, right_fields = _validate_relationship_payload(conn, req)
+    left_fields, right_fields, resolved_side = _validate_relationship_payload(conn, req)
     row = db.update_relationship(
         conn,
         relationship_id=relationship_id,
-        side=req.side.strip().lower(),
+        side=resolved_side,
         left_dataset=req.left_dataset,
         left_field=left_fields[0],
         right_dataset=req.right_dataset,
@@ -2515,6 +2833,25 @@ def link_related_tables(req: RelationshipLinkRequest) -> Dict[str, Any]:
         min_confidence=req.min_confidence,
         suggest_only=req.suggest_only,
     )
+
+
+@app.post("/api/relationships/auto-link")
+def auto_link_relationships(req: RelationshipScopedLinkRequest) -> Dict[str, Any]:
+    result = rel.auto_link_scoped_relationships(
+        left_side=req.left_side,
+        right_side=req.right_side,
+        left_dataset=req.left_dataset,
+        right_dataset=req.right_dataset,
+        mode=req.mode,
+        min_confidence=req.min_confidence,
+        suggest_only=req.suggest_only,
+        max_links=req.max_links,
+    )
+    if "error" in result:
+        message = str(result["error"])
+        status_code = 404 if "not found" in message.lower() else 400
+        raise HTTPException(status_code=status_code, detail=message)
+    return result
 
 
 @app.get("/api/schema-diff")

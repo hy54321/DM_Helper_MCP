@@ -288,6 +288,29 @@ class TestRelationships(unittest.TestCase):
         self.assertEqual(listed[0]["left_fields"], ["SALESID", "LINENUM"])
         self.assertEqual(listed[0]["right_fields"], ["SALESID", "LINENUM"])
 
+    def test_relationship_supports_cross_side_links(self) -> None:
+        p = self._write_csv("cross.csv", "ID\n1\n")
+        self._register_dataset("source_cross", "source", p, ["ID"])
+        self._register_dataset("target_cross", "target", p, ["ID"])
+
+        row = db.upsert_relationship(
+            self.conn,
+            side="cross",
+            left_dataset="source_cross",
+            left_field="ID",
+            right_dataset="target_cross",
+            right_field="ID",
+            confidence=0.99,
+            method="manual",
+            active=True,
+        )
+        self.assertEqual(row["side"], "cross")
+
+        listed = db.list_relationships(self.conn, side="cross", limit=10)
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["left_dataset"], "source_cross")
+        self.assertEqual(listed[0]["right_dataset"], "target_cross")
+
 
 if __name__ == "__main__":
     unittest.main()

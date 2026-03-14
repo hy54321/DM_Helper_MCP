@@ -1,5 +1,6 @@
-const { useEffect, useState } = React;
+const { useEffect, useRef, useState } = React;
 const THEME_STORAGE_KEY = "protoquery_theme";
+const NEW_FOLDER_CONFIG_OPTION_ID = "__new__";
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -142,6 +143,24 @@ function displayValue(value) {
   return String(formatDateTimeToSeconds(value));
 }
 
+function formatPrettyJson(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return "-";
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch (_err) {
+      return text;
+    }
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_err) {
+    return String(value);
+  }
+}
+
 function getDatasetStatus(dataset) {
   const safeColumns = Array.isArray(dataset?.columns) ? dataset.columns : [];
   const rawColumns = Array.isArray(dataset?.raw_columns) ? dataset.raw_columns : [];
@@ -237,11 +256,11 @@ Operating policy:
    - \`compare_tables\` to respond to user with summary of findings.
    - \`start_comparison_job\` -> \`get_job_status\` -> \`get_job_summary\` to trigger creation of comparison excel report.
 7. Never claim source/target data was modified.
-8. Only run \`upsert_pair_override\`, \`save_key_preset\`, or \`delete_report\` if user explicitly asks.
+8. Only run \`upsert_pair_override\` if user explicitly asks.
 9. If a cross join query is required checl links using 'get_dataset_links'.
 
 Default workflow:
-- Discovery: \`refresh_catalog\`, \`list_datasets\`, use \`list_table_pairs\` to find out which datasets are paired, use \`list_field_pairs\` to find out field and unique index pairings with the pair_id from 'list_table_pairs', \`row_count_summary\`
+- Discovery: \`refresh_catalog\`, \`list_datasets\`, use \`list_table_pairs\` to find out which datasets are paired, use \`list_field_pairs\` to find out field and unique index pairings with the pair_id from 'list_table_pairs', \`row_count_summary\` (per dataset_id)
 - Profiling: \`list_fields\`, \`data_profile\`, \`column_value_summary\`
 - Optional profiling: \`find_duplicates\`, \`value_distribution\`, \`preview_filtered_records\`
 - Comparison: \`schema_diff\`, \`suggest_keys\`, \`compare_tables\` or async job flow, \`compare_field\`
@@ -275,11 +294,27 @@ function App() {
 
   const [sourceFolder, setSourceFolder] = useState("");
   const [targetFolder, setTargetFolder] = useState("");
+  const [configurationsFolder, setConfigurationsFolder] = useState("");
+  const [translationsFolder, setTranslationsFolder] = useState("");
+  const [rulesFolder, setRulesFolder] = useState("");
+  const [exposeSourceToTools, setExposeSourceToTools] = useState(true);
+  const [exposeTargetToTools, setExposeTargetToTools] = useState(true);
+  const [exposeConfigurationsToTools, setExposeConfigurationsToTools] = useState(false);
+  const [exposeTranslationsToTools, setExposeTranslationsToTools] = useState(false);
+  const [exposeRulesToTools, setExposeRulesToTools] = useState(false);
   const [reportFolder, setReportFolder] = useState("");
   const [savedFoldersSnapshot, setSavedFoldersSnapshot] = useState({
     source_folder: "",
     target_folder: "",
+    configurations_folder: "",
+    translations_folder: "",
+    rules_folder: "",
     report_folder: "",
+    expose_source_to_tools: true,
+    expose_target_to_tools: true,
+    expose_configurations_to_tools: false,
+    expose_translations_to_tools: false,
+    expose_rules_to_tools: false,
   });
   const [folderConfigs, setFolderConfigs] = useState([]);
   const [activeFolderConfigId, setActiveFolderConfigId] = useState("");
@@ -321,6 +356,8 @@ function App() {
   const [targetDataset, setTargetDataset] = useState("");
   const [pairId, setPairId] = useState("");
   const [fieldMappings, setFieldMappings] = useState([]);
+  const [compareSuggestBusy, setCompareSuggestBusy] = useState(false);
+  const [compareSuggestMessage, setCompareSuggestMessage] = useState("");
   const [mappingSearch, setMappingSearch] = useState("");
   const [compareResult, setCompareResult] = useState(null);
   const [compareSampleTab, setCompareSampleTab] = useState("added");
@@ -351,15 +388,37 @@ function App() {
   const [sqlResult, setSqlResult] = useState(null);
   const [sqlExportJob, setSqlExportJob] = useState(null);
   const [sqlBusy, setSqlBusy] = useState(false);
-  const [relationshipSide, setRelationshipSide] = useState("target");
+  const [relationshipLeftFolderFilter, setRelationshipLeftFolderFilter] = useState("any");
+  const [relationshipRightFolderFilter, setRelationshipRightFolderFilter] = useState("any");
   const [relationshipId, setRelationshipId] = useState("");
   const [leftDatasetId, setLeftDatasetId] = useState("");
   const [rightDatasetId, setRightDatasetId] = useState("");
   const [relationshipMappings, setRelationshipMappings] = useState([{ left_field: "", right_field: "" }]);
+  const [relationshipSuggestBusy, setRelationshipSuggestBusy] = useState(false);
+  const [relationshipSuggestStopRequested, setRelationshipSuggestStopRequested] = useState(false);
+  const [relationshipSuggestMessage, setRelationshipSuggestMessage] = useState("");
   const [relationshipConfidence, setRelationshipConfidence] = useState(0.95);
   const [relationshipMethod, setRelationshipMethod] = useState("manual");
   const [relationshipActive, setRelationshipActive] = useState(true);
-  const [autoLinkConfidence, setAutoLinkConfidence] = useState(0.9);
+  const [relationshipDeleteModal, setRelationshipDeleteModal] = useState({
+    open: false,
+    relationshipId: "",
+    leftLabel: "",
+    rightLabel: "",
+    busy: false,
+  });
+  const [reportDeleteModal, setReportDeleteModal] = useState({
+    open: false,
+    reportId: "",
+    reportFile: "",
+    busy: false,
+  });
+  const [forceStopModal, setForceStopModal] = useState({
+    open: false,
+    serviceName: "",
+    serviceLabel: "",
+    busy: false,
+  });
   const [serviceState, setServiceState] = useState({
     desktop_mode: false,
     services: {},
@@ -367,6 +426,7 @@ function App() {
   });
   const [serviceBusy, setServiceBusy] = useState({});
   const [settingsTheme, setSettingsTheme] = useState(getStoredTheme);
+  const [settingsToolLoggingEnabled, setSettingsToolLoggingEnabled] = useState(true);
   const [settingsApiKeyInput, setSettingsApiKeyInput] = useState("");
   const [settingsApiKeyMasked, setSettingsApiKeyMasked] = useState("");
   const [settingsApiKeySet, setSettingsApiKeySet] = useState(false);
@@ -393,10 +453,23 @@ function App() {
   const [claudeInput, setClaudeInput] = useState("");
   const [claudeSending, setClaudeSending] = useState(false);
   const [claudeInlineError, setClaudeInlineError] = useState("");
+  const [toolLogs, setToolLogs] = useState([]);
+  const [toolLogTotal, setToolLogTotal] = useState(0);
+  const [toolLogNames, setToolLogNames] = useState([]);
+  const [toolLogStatusFilter, setToolLogStatusFilter] = useState("all");
+  const [toolLogNameFilter, setToolLogNameFilter] = useState("");
+  const [toolLogTextFilter, setToolLogTextFilter] = useState("");
+  const [toolLogSinceDays, setToolLogSinceDays] = useState(7);
+  const [toolLogCleanupDays, setToolLogCleanupDays] = useState(7);
+  const [toolLogLoading, setToolLogLoading] = useState(false);
+  const [toolLogCleaning, setToolLogCleaning] = useState(false);
+  const relationshipSuggestStopRef = useRef(false);
+  const relationshipSuggestAbortRef = useRef(null);
 
   function applyAppSettings(payload) {
     const safe = payload && typeof payload === "object" ? payload : {};
     setSettingsTheme(safe.theme === "dark" ? "dark" : "light");
+    setSettingsToolLoggingEnabled(safe.tool_logging_enabled !== false);
     const cachedModels = Array.isArray(safe.models)
       ? safe.models
           .filter((m) => m && typeof m === "object" && String(m.id || "").trim())
@@ -431,7 +504,15 @@ function App() {
         name: String(item?.name || "").trim(),
         source_folder: String(item?.source_folder || "").trim(),
         target_folder: String(item?.target_folder || "").trim(),
+        configurations_folder: String(item?.configurations_folder || "").trim(),
+        translations_folder: String(item?.translations_folder || "").trim(),
+        rules_folder: String(item?.rules_folder || "").trim(),
         report_folder: String(item?.report_folder || "").trim(),
+        expose_source_to_tools: item?.expose_source_to_tools !== false,
+        expose_target_to_tools: item?.expose_target_to_tools !== false,
+        expose_configurations_to_tools: !!item?.expose_configurations_to_tools,
+        expose_translations_to_tools: !!item?.expose_translations_to_tools,
+        expose_rules_to_tools: !!item?.expose_rules_to_tools,
         updated_at: String(item?.updated_at || ""),
       }))
       .filter((item) => item.id && item.name);
@@ -441,9 +522,10 @@ function App() {
     setFolderConfigs(nextConfigs);
     setActiveFolderConfigId(activeId);
     setSelectedFolderConfigId((prev) => {
+      if (prev === NEW_FOLDER_CONFIG_OPTION_ID) return NEW_FOLDER_CONFIG_OPTION_ID;
       if (prev && validIds.has(prev)) return prev;
       if (activeId) return activeId;
-      return nextConfigs[0]?.id || "";
+      return nextConfigs[0]?.id || NEW_FOLDER_CONFIG_OPTION_ID;
     });
   }
 
@@ -484,6 +566,55 @@ function App() {
     }
   }
 
+  async function loadToolLogs({ silent = false, overrides = null } = {}) {
+    setError("");
+    setToolLogLoading(true);
+    try {
+      const nextFilters = overrides && typeof overrides === "object" ? overrides : {};
+      const statusValue = Object.prototype.hasOwnProperty.call(nextFilters, "status")
+        ? nextFilters.status
+        : toolLogStatusFilter;
+      const nameValue = Object.prototype.hasOwnProperty.call(nextFilters, "tool_name")
+        ? nextFilters.tool_name
+        : toolLogNameFilter;
+      const containsValue = Object.prototype.hasOwnProperty.call(nextFilters, "contains")
+        ? nextFilters.contains
+        : toolLogTextFilter;
+      const sinceDaysValue = Object.prototype.hasOwnProperty.call(nextFilters, "since_days")
+        ? nextFilters.since_days
+        : toolLogSinceDays;
+
+      const safeStatus = ["all", "ok", "error"].includes(statusValue) ? statusValue : "all";
+      const safeDays = Math.max(0, Number.parseInt(String(sinceDaysValue || "0"), 10) || 0);
+      const params = new URLSearchParams({
+        limit: "300",
+        offset: "0",
+        status: safeStatus,
+        since_days: String(safeDays),
+      });
+      if (String(nameValue || "").trim()) {
+        params.set("tool_name", String(nameValue || "").trim());
+      }
+      if (String(containsValue || "").trim()) {
+        params.set("contains", String(containsValue || "").trim());
+      }
+      const payload = await api(`/api/tool-logs?${params.toString()}`);
+      setToolLogs(Array.isArray(payload?.items) ? payload.items : []);
+      setToolLogTotal(Number(payload?.total || 0));
+      setToolLogNames(Array.isArray(payload?.tool_names) ? payload.tool_names : []);
+      if (!silent) {
+        setStatus(`Loaded ${Array.isArray(payload?.items) ? payload.items.length : 0} tool log entr${payload?.items?.length === 1 ? "y" : "ies"}.`);
+      }
+    } catch (err) {
+      setError(err.message);
+      if (!silent) {
+        setStatus("Loading tool logs failed.");
+      }
+    } finally {
+      setToolLogLoading(false);
+    }
+  }
+
   async function refreshBootstrap() {
     setError("");
     try {
@@ -498,11 +629,27 @@ function App() {
       ]);
       setSourceFolder(folders.source_folder || "");
       setTargetFolder(folders.target_folder || "");
+      setConfigurationsFolder(folders.configurations_folder || "");
+      setTranslationsFolder(folders.translations_folder || "");
+      setRulesFolder(folders.rules_folder || "");
       setReportFolder(folders.report_folder || "");
+      setExposeSourceToTools(folders.expose_source_to_tools !== false);
+      setExposeTargetToTools(folders.expose_target_to_tools !== false);
+      setExposeConfigurationsToTools(!!folders.expose_configurations_to_tools);
+      setExposeTranslationsToTools(!!folders.expose_translations_to_tools);
+      setExposeRulesToTools(!!folders.expose_rules_to_tools);
       setSavedFoldersSnapshot({
         source_folder: folders.source_folder || "",
         target_folder: folders.target_folder || "",
+        configurations_folder: folders.configurations_folder || "",
+        translations_folder: folders.translations_folder || "",
+        rules_folder: folders.rules_folder || "",
         report_folder: folders.report_folder || "",
+        expose_source_to_tools: folders.expose_source_to_tools !== false,
+        expose_target_to_tools: folders.expose_target_to_tools !== false,
+        expose_configurations_to_tools: !!folders.expose_configurations_to_tools,
+        expose_translations_to_tools: !!folders.expose_translations_to_tools,
+        expose_rules_to_tools: !!folders.expose_rules_to_tools,
       });
       applyFolderConfigs(folderConfigState);
       setDatasets(ds || []);
@@ -533,9 +680,14 @@ function App() {
 
   useEffect(() => {
     const theme = settingsTheme === "dark" ? "dark" : "light";
+    const bg = theme === "dark" ? "#040b19" : "#f4f6f8";
     document.documentElement.setAttribute("data-theme", theme);
-    document.documentElement.style.backgroundColor = theme === "dark" ? "#040b19" : "#f4f6f8";
-    document.body.style.backgroundColor = theme === "dark" ? "#040b19" : "#f4f6f8";
+    document.documentElement.style.backgroundColor = bg;
+    document.body.style.backgroundColor = bg;
+    const root = document.getElementById("root");
+    if (root) {
+      root.style.backgroundColor = bg;
+    }
     try {
       localStorage.setItem(THEME_STORAGE_KEY, theme);
     } catch (_err) {
@@ -560,16 +712,23 @@ function App() {
   }, [sourceDataset, targetDataset, pairs, pairId]);
 
   useEffect(() => {
-    const sideDatasetIds = new Set(datasets.filter((d) => d.side === relationshipSide).map((d) => d.id));
-    if (leftDatasetId && !sideDatasetIds.has(leftDatasetId)) {
+    const leftScoped = datasets.filter(
+      (d) => relationshipLeftFolderFilter === "any" || d.side === relationshipLeftFolderFilter
+    );
+    const rightScoped = datasets.filter(
+      (d) => relationshipRightFolderFilter === "any" || d.side === relationshipRightFolderFilter
+    );
+    const leftDatasetIds = new Set(leftScoped.map((d) => d.id));
+    const rightDatasetIds = new Set(rightScoped.map((d) => d.id));
+    if (leftDatasetId && !leftDatasetIds.has(leftDatasetId)) {
       setLeftDatasetId("");
       setRelationshipMappings([{ left_field: "", right_field: "" }]);
     }
-    if (rightDatasetId && !sideDatasetIds.has(rightDatasetId)) {
+    if (rightDatasetId && !rightDatasetIds.has(rightDatasetId)) {
       setRightDatasetId("");
       setRelationshipMappings([{ left_field: "", right_field: "" }]);
     }
-  }, [relationshipSide, leftDatasetId, rightDatasetId, datasets]);
+  }, [relationshipLeftFolderFilter, relationshipRightFolderFilter, leftDatasetId, rightDatasetId, datasets]);
 
   useEffect(() => {
     if (!catalogDatasetIssue?.datasetId) return;
@@ -639,6 +798,34 @@ function App() {
   }, [pairId, pairs]);
 
   useEffect(() => {
+    if (!sourceDataset || !targetDataset) return;
+    if (pairId) return;
+    const exactPair = pairs.find((p) => p.source_dataset === sourceDataset && p.target_dataset === targetDataset);
+    if (exactPair) return;
+    if (hasExistingMappings(fieldMappings)) return;
+    const relationshipRows = relationshipMappingsForDatasetPair(sourceDataset, targetDataset);
+    if (!relationshipRows.length) return;
+    setFieldMappings(relationshipRows);
+    setStatus(`Loaded ${relationshipRows.length} key mapping(s) from Relationships.`);
+  }, [sourceDataset, targetDataset, pairId, pairs, relationships, fieldMappings]);
+
+  useEffect(() => {
+    if (!leftDatasetId || !rightDatasetId) return;
+    if (relationshipId) return;
+    const leftSide = datasets.find((d) => d.id === leftDatasetId)?.side || "";
+    const rightSide = datasets.find((d) => d.id === rightDatasetId)?.side || "";
+    const sourceTargetPair =
+      (leftSide === "source" && rightSide === "target") ||
+      (leftSide === "target" && rightSide === "source");
+    if (!sourceTargetPair) return;
+    const hasRows = relationshipMappings.some((m) => String(m.left_field || "").trim() || String(m.right_field || "").trim());
+    if (hasRows) return;
+    const keyRows = pairKeyMappingsForRelationshipPair(leftDatasetId, rightDatasetId);
+    if (!keyRows.length) return;
+    setRelationshipMappings(keyRows);
+  }, [leftDatasetId, rightDatasetId, relationshipId, relationshipMappings, pairs, datasets]);
+
+  useEffect(() => {
     const inspectorRunning = !!serviceState.services?.mcp_inspector?.running;
     if (tab === "inspector" && !inspectorRunning) {
       setTab("settings");
@@ -650,6 +837,11 @@ function App() {
       setTab("settings");
     }
   }, [tab, settingsApiKeyActivated]);
+
+  useEffect(() => {
+    if (tab !== "logs") return;
+    loadToolLogs({ silent: true });
+  }, [tab]);
 
   useEffect(() => {
     const ds = datasets.find((d) => d.id === profileDataset);
@@ -667,6 +859,7 @@ function App() {
     setPairId("");
     setFieldMappings([]);
     setMappingSearch("");
+    setCompareSuggestMessage("");
   }
 
   function onTargetDatasetChange(value) {
@@ -674,6 +867,7 @@ function App() {
     setPairId("");
     setFieldMappings([]);
     setMappingSearch("");
+    setCompareSuggestMessage("");
   }
 
   async function onRefreshCatalog() {
@@ -681,11 +875,43 @@ function App() {
     setCatalogRefreshing(true);
     setStatus("Refreshing catalog...");
     try {
+      const savedFolders = await api("/api/settings/folders", {
+        method: "POST",
+        body: JSON.stringify({
+          source_folder: sourceFolder,
+          target_folder: targetFolder,
+          configurations_folder: configurationsFolder,
+          translations_folder: translationsFolder,
+          rules_folder: rulesFolder,
+          report_folder: reportFolder,
+          expose_source_to_tools: !!exposeSourceToTools,
+          expose_target_to_tools: !!exposeTargetToTools,
+          expose_configurations_to_tools: !!exposeConfigurationsToTools,
+          expose_translations_to_tools: !!exposeTranslationsToTools,
+          expose_rules_to_tools: !!exposeRulesToTools,
+        }),
+      });
+      setSavedFoldersSnapshot({
+        source_folder: savedFolders.source_folder || "",
+        target_folder: savedFolders.target_folder || "",
+        configurations_folder: savedFolders.configurations_folder || "",
+        translations_folder: savedFolders.translations_folder || "",
+        rules_folder: savedFolders.rules_folder || "",
+        report_folder: savedFolders.report_folder || "",
+        expose_source_to_tools: savedFolders.expose_source_to_tools !== false,
+        expose_target_to_tools: savedFolders.expose_target_to_tools !== false,
+        expose_configurations_to_tools: !!savedFolders.expose_configurations_to_tools,
+        expose_translations_to_tools: !!savedFolders.expose_translations_to_tools,
+        expose_rules_to_tools: !!savedFolders.expose_rules_to_tools,
+      });
       const res = await api("/api/catalog/refresh", {
         method: "POST",
         body: JSON.stringify({
           source_folder: sourceFolder || null,
           target_folder: targetFolder || null,
+          configurations_folder: configurationsFolder || null,
+          translations_folder: translationsFolder || null,
+          rules_folder: rulesFolder || null,
           report_folder: reportFolder,
           include_row_counts: includeRowCounts,
         }),
@@ -703,14 +929,115 @@ function App() {
     }
   }
 
+  async function saveFolderConfigurationByName(name, { closeModal = true } = {}) {
+    const normalizedName = String(name || "").trim();
+    if (!normalizedName) {
+      setError("Configuration name is required.");
+      return null;
+    }
+    setError("");
+    setFolderConfigBusy(true);
+    setStatus("Saving folder configuration...");
+    try {
+      const res = await api("/api/settings/folder-configs", {
+        method: "POST",
+        body: JSON.stringify({
+          name: normalizedName,
+          source_folder: sourceFolder,
+          target_folder: targetFolder,
+          configurations_folder: configurationsFolder,
+          translations_folder: translationsFolder,
+          rules_folder: rulesFolder,
+          report_folder: reportFolder,
+          expose_source_to_tools: !!exposeSourceToTools,
+          expose_target_to_tools: !!exposeTargetToTools,
+          expose_configurations_to_tools: !!exposeConfigurationsToTools,
+          expose_translations_to_tools: !!exposeTranslationsToTools,
+          expose_rules_to_tools: !!exposeRulesToTools,
+          set_active: true,
+        }),
+      });
+      const folders = res?.folders || {};
+      setSourceFolder(folders.source_folder || "");
+      setTargetFolder(folders.target_folder || "");
+      setConfigurationsFolder(folders.configurations_folder || "");
+      setTranslationsFolder(folders.translations_folder || "");
+      setRulesFolder(folders.rules_folder || "");
+      setReportFolder(folders.report_folder || "");
+      setExposeSourceToTools(folders.expose_source_to_tools !== false);
+      setExposeTargetToTools(folders.expose_target_to_tools !== false);
+      setExposeConfigurationsToTools(!!folders.expose_configurations_to_tools);
+      setExposeTranslationsToTools(!!folders.expose_translations_to_tools);
+      setExposeRulesToTools(!!folders.expose_rules_to_tools);
+      setSavedFoldersSnapshot({
+        source_folder: folders.source_folder || "",
+        target_folder: folders.target_folder || "",
+        configurations_folder: folders.configurations_folder || "",
+        translations_folder: folders.translations_folder || "",
+        rules_folder: folders.rules_folder || "",
+        report_folder: folders.report_folder || "",
+        expose_source_to_tools: folders.expose_source_to_tools !== false,
+        expose_target_to_tools: folders.expose_target_to_tools !== false,
+        expose_configurations_to_tools: !!folders.expose_configurations_to_tools,
+        expose_translations_to_tools: !!folders.expose_translations_to_tools,
+        expose_rules_to_tools: !!folders.expose_rules_to_tools,
+      });
+      applyFolderConfigs(res);
+      if (res?.saved_id) {
+        setSelectedFolderConfigId(String(res.saved_id));
+      }
+      setFolderConfigNameInput(String(res?.saved_name || normalizedName));
+      setStatus(res?.created ? `Configuration "${res.saved_name}" created.` : `Configuration "${res.saved_name}" updated.`);
+      if (closeModal) {
+        setFolderConfigModal((prev) => ({ ...prev, open: false }));
+      }
+      return res;
+    } catch (err) {
+      setError(err.message);
+      setStatus("Saving configuration failed.");
+      return null;
+    } finally {
+      setFolderConfigBusy(false);
+    }
+  }
+
   function onSaveFolderConfig() {
-    const suggestedName = String(folderConfigNameInput || activeFolderConfig?.name || "").trim();
+    const selectedId = String(selectedFolderConfigId || "").trim();
+    if (!selectedId || selectedId === NEW_FOLDER_CONFIG_OPTION_ID) {
+      setFolderConfigModal({
+        open: true,
+        mode: "save",
+        name: "",
+        configId: "",
+        configName: "",
+      });
+      return;
+    }
+    const selectedConfig = folderConfigs.find((cfg) => cfg.id === selectedId);
+    if (!selectedConfig) {
+      setError("Select a configuration first.");
+      return;
+    }
+    void saveFolderConfigurationByName(selectedConfig.name, { closeModal: false });
+  }
+
+  function onRenameFolderConfig() {
+    const selectedId = String(selectedFolderConfigId || "").trim();
+    if (!selectedId || selectedId === NEW_FOLDER_CONFIG_OPTION_ID) {
+      setError("Select an existing configuration to rename.");
+      return;
+    }
+    const selectedConfig = folderConfigs.find((cfg) => cfg.id === selectedId);
+    if (!selectedConfig) {
+      setError("Select an existing configuration to rename.");
+      return;
+    }
     setFolderConfigModal({
       open: true,
-      mode: "save",
-      name: suggestedName,
-      configId: "",
-      configName: "",
+      mode: "rename",
+      name: selectedConfig.name,
+      configId: selectedConfig.id,
+      configName: selectedConfig.name,
     });
   }
 
@@ -723,53 +1050,54 @@ function App() {
   }
 
   async function onConfirmSaveFolderConfig() {
-    const name = String(folderConfigModal.name || "").trim();
-    if (!name) {
+    await saveFolderConfigurationByName(folderConfigModal.name, { closeModal: true });
+  }
+
+  async function onConfirmRenameFolderConfig() {
+    const configId = String(folderConfigModal.configId || "").trim();
+    const oldName = String(folderConfigModal.configName || "").trim();
+    const nextName = String(folderConfigModal.name || "").trim();
+    if (!configId || !oldName) {
+      setError("Select a configuration to rename.");
+      return;
+    }
+    if (!nextName) {
       setError("Configuration name is required.");
       return;
     }
-    setError("");
-    setFolderConfigBusy(true);
-    setStatus("Saving folder configuration...");
-    try {
-      const res = await api("/api/settings/folder-configs", {
-        method: "POST",
-        body: JSON.stringify({
-          name,
-          source_folder: sourceFolder,
-          target_folder: targetFolder,
-          report_folder: reportFolder,
-          set_active: true,
-        }),
-      });
-      const folders = res?.folders || {};
-      setSourceFolder(folders.source_folder || "");
-      setTargetFolder(folders.target_folder || "");
-      setReportFolder(folders.report_folder || "");
-      setSavedFoldersSnapshot({
-        source_folder: folders.source_folder || "",
-        target_folder: folders.target_folder || "",
-        report_folder: folders.report_folder || "",
-      });
-      applyFolderConfigs(res);
-      if (res?.saved_id) {
-        setSelectedFolderConfigId(String(res.saved_id));
-      }
-      setFolderConfigNameInput(String(res?.saved_name || name));
-      setStatus(res?.created ? `Configuration "${res.saved_name}" created.` : `Configuration "${res.saved_name}" updated.`);
+    if (nextName.toLowerCase() === oldName.toLowerCase()) {
       setFolderConfigModal((prev) => ({ ...prev, open: false }));
-    } catch (err) {
-      setError(err.message);
-      setStatus("Saving configuration failed.");
-    } finally {
-      setFolderConfigBusy(false);
+      return;
     }
+    const saveRes = await saveFolderConfigurationByName(nextName, { closeModal: false });
+    if (!saveRes) return;
+    const savedId = String(saveRes.saved_id || "").trim();
+    if (savedId && savedId !== configId) {
+      setFolderConfigBusy(true);
+      setStatus(`Renaming "${oldName}" to "${nextName}"...`);
+      try {
+        const deleteRes = await api(`/api/settings/folder-configs/${encodeURIComponent(configId)}`, {
+          method: "DELETE",
+        });
+        applyFolderConfigs(deleteRes);
+        setSelectedFolderConfigId(savedId);
+      } catch (err) {
+        setError(err.message);
+        setStatus("Rename partially completed. New configuration saved, but old configuration could not be deleted.");
+        setFolderConfigBusy(false);
+        return;
+      } finally {
+        setFolderConfigBusy(false);
+      }
+    }
+    setFolderConfigModal((prev) => ({ ...prev, open: false }));
+    setStatus(`Configuration renamed to "${nextName}".`);
   }
 
   async function onSelectFolderConfig(nextConfigId) {
     const configId = String(nextConfigId || "").trim();
-    if (!configId) {
-      setError("Select a configuration to apply.");
+    if (!configId || configId === NEW_FOLDER_CONFIG_OPTION_ID) {
+      setStatus("New configuration mode selected. Click save to create a named configuration.");
       return;
     }
     setError("");
@@ -782,11 +1110,27 @@ function App() {
       const folders = res?.folders || {};
       setSourceFolder(folders.source_folder || "");
       setTargetFolder(folders.target_folder || "");
+      setConfigurationsFolder(folders.configurations_folder || "");
+      setTranslationsFolder(folders.translations_folder || "");
+      setRulesFolder(folders.rules_folder || "");
       setReportFolder(folders.report_folder || "");
+      setExposeSourceToTools(folders.expose_source_to_tools !== false);
+      setExposeTargetToTools(folders.expose_target_to_tools !== false);
+      setExposeConfigurationsToTools(!!folders.expose_configurations_to_tools);
+      setExposeTranslationsToTools(!!folders.expose_translations_to_tools);
+      setExposeRulesToTools(!!folders.expose_rules_to_tools);
       setSavedFoldersSnapshot({
         source_folder: folders.source_folder || "",
         target_folder: folders.target_folder || "",
+        configurations_folder: folders.configurations_folder || "",
+        translations_folder: folders.translations_folder || "",
+        rules_folder: folders.rules_folder || "",
         report_folder: folders.report_folder || "",
+        expose_source_to_tools: folders.expose_source_to_tools !== false,
+        expose_target_to_tools: folders.expose_target_to_tools !== false,
+        expose_configurations_to_tools: !!folders.expose_configurations_to_tools,
+        expose_translations_to_tools: !!folders.expose_translations_to_tools,
+        expose_rules_to_tools: !!folders.expose_rules_to_tools,
       });
       applyFolderConfigs(res);
       setStatus(`Configuration "${res?.applied_name || ""}" applied.`);
@@ -800,7 +1144,7 @@ function App() {
 
   function onDeleteFolderConfig() {
     const configId = String(selectedFolderConfigId || "").trim();
-    if (!configId) {
+    if (!configId || configId === NEW_FOLDER_CONFIG_OPTION_ID) {
       setError("Select a configuration to delete.");
       return;
     }
@@ -984,6 +1328,7 @@ function App() {
       const payload = {
         theme: settingsTheme,
         mcp_auth_mode: settingsMcpAuthMode,
+        tool_logging_enabled: !!settingsToolLoggingEnabled,
         model: String(settingsModel || "").trim(),
         anthropic_api_key: String(settingsApiKeyInput || "").trim() || null,
         ngrok_authtoken: String(settingsNgrokTokenInput || "").trim() || null,
@@ -1054,6 +1399,9 @@ function App() {
         content: String(res?.message?.content || "").trim() || "(No text response)",
       };
       setClaudeMessages((prev) => [...prev, assistantMessage]);
+      if (tab === "logs") {
+        await loadToolLogs({ silent: true });
+      }
       setStatus("Claude response received.");
     } catch (err) {
       setClaudeInlineError(String(err.message || "Failed to send Claude message."));
@@ -1070,13 +1418,79 @@ function App() {
     setClaudeInlineError("");
   }
 
+  async function onClearAllToolLogs() {
+    if (toolLogCleaning) return;
+    const confirmed = window.confirm("Delete all tool call logs?");
+    if (!confirmed) return;
+    setError("");
+    setToolLogCleaning(true);
+    setStatus("Deleting all tool logs...");
+    try {
+      const res = await api("/api/tool-logs", { method: "DELETE" });
+      setStatus(`Deleted ${Number(res?.deleted || 0)} tool log entr${Number(res?.deleted || 0) === 1 ? "y" : "ies"}.`);
+      await loadToolLogs({ silent: true });
+    } catch (err) {
+      setError(err.message);
+      setStatus("Deleting tool logs failed.");
+    } finally {
+      setToolLogCleaning(false);
+    }
+  }
+
+  async function onClearToolLogsOlderThanDays() {
+    if (toolLogCleaning) return;
+    const days = Math.max(1, Number.parseInt(String(toolLogCleanupDays || "1"), 10) || 1);
+    setError("");
+    setToolLogCleaning(true);
+    setStatus(`Deleting tool logs older than ${days} day(s)...`);
+    try {
+      const res = await api("/api/tool-logs/cleanup-older-than", {
+        method: "POST",
+        body: JSON.stringify({ days }),
+      });
+      setStatus(`Deleted ${Number(res?.deleted || 0)} log entr${Number(res?.deleted || 0) === 1 ? "y" : "ies"} older than ${days} day(s).`);
+      await loadToolLogs({ silent: true });
+    } catch (err) {
+      setError(err.message);
+      setStatus("Deleting old tool logs failed.");
+    } finally {
+      setToolLogCleaning(false);
+    }
+  }
+
+  async function onResetToolLogFilters() {
+    const defaults = {
+      status: "all",
+      tool_name: "",
+      contains: "",
+      since_days: 7,
+    };
+    setToolLogStatusFilter(defaults.status);
+    setToolLogNameFilter(defaults.tool_name);
+    setToolLogTextFilter(defaults.contains);
+    setToolLogSinceDays(defaults.since_days);
+    await loadToolLogs({ silent: true, overrides: defaults });
+    setStatus("Tool log filters reset.");
+  }
+
   function onLoadDefaultClaudeInstructions() {
     setSettingsClaudeInstructions(DEFAULT_CLAUDE_INSTRUCTIONS);
   }
 
   async function onBrowseFolder(kind) {
     setError("");
-    const current = kind === "source" ? sourceFolder : kind === "target" ? targetFolder : reportFolder;
+    const current =
+      kind === "source"
+        ? sourceFolder
+        : kind === "target"
+          ? targetFolder
+          : kind === "configurations"
+            ? configurationsFolder
+            : kind === "translations"
+              ? translationsFolder
+              : kind === "rules"
+                ? rulesFolder
+                : reportFolder;
     try {
       const path = current ? `?initial=${encodeURIComponent(current)}` : "";
       const res = await api(`/api/system/browse-folder${path}`);
@@ -1085,25 +1499,63 @@ function App() {
       }
       const nextSource = kind === "source" ? res.folder : sourceFolder;
       const nextTarget = kind === "target" ? res.folder : targetFolder;
+      const nextConfigurations = kind === "configurations" ? res.folder : configurationsFolder;
+      const nextTranslations = kind === "translations" ? res.folder : translationsFolder;
+      const nextRules = kind === "rules" ? res.folder : rulesFolder;
       const nextReport = kind === "report" ? res.folder : reportFolder;
       const saved = await api("/api/settings/folders", {
         method: "POST",
         body: JSON.stringify({
           source_folder: nextSource,
           target_folder: nextTarget,
+          configurations_folder: nextConfigurations,
+          translations_folder: nextTranslations,
+          rules_folder: nextRules,
           report_folder: nextReport,
+          expose_source_to_tools: !!exposeSourceToTools,
+          expose_target_to_tools: !!exposeTargetToTools,
+          expose_configurations_to_tools: !!exposeConfigurationsToTools,
+          expose_translations_to_tools: !!exposeTranslationsToTools,
+          expose_rules_to_tools: !!exposeRulesToTools,
         }),
       });
       setSourceFolder(saved.source_folder || "");
       setTargetFolder(saved.target_folder || "");
+      setConfigurationsFolder(saved.configurations_folder || "");
+      setTranslationsFolder(saved.translations_folder || "");
+      setRulesFolder(saved.rules_folder || "");
       setReportFolder(saved.report_folder || "");
+      setExposeSourceToTools(saved.expose_source_to_tools !== false);
+      setExposeTargetToTools(saved.expose_target_to_tools !== false);
+      setExposeConfigurationsToTools(!!saved.expose_configurations_to_tools);
+      setExposeTranslationsToTools(!!saved.expose_translations_to_tools);
+      setExposeRulesToTools(!!saved.expose_rules_to_tools);
       setSavedFoldersSnapshot({
         source_folder: saved.source_folder || "",
         target_folder: saved.target_folder || "",
+        configurations_folder: saved.configurations_folder || "",
+        translations_folder: saved.translations_folder || "",
+        rules_folder: saved.rules_folder || "",
         report_folder: saved.report_folder || "",
+        expose_source_to_tools: saved.expose_source_to_tools !== false,
+        expose_target_to_tools: saved.expose_target_to_tools !== false,
+        expose_configurations_to_tools: !!saved.expose_configurations_to_tools,
+        expose_translations_to_tools: !!saved.expose_translations_to_tools,
+        expose_rules_to_tools: !!saved.expose_rules_to_tools,
       });
       applyFolderConfigs(await api("/api/settings/folder-configs"));
-      const label = kind === "source" ? "Source" : kind === "target" ? "Target" : "Report";
+      const label =
+        kind === "source"
+          ? "Source"
+          : kind === "target"
+            ? "Target"
+            : kind === "configurations"
+              ? "Configurations"
+              : kind === "translations"
+                ? "Translations"
+                : kind === "rules"
+                  ? "Rules"
+                  : "Report";
       setStatus(`${label} folder selected.`);
     } catch (err) {
       setError(err.message);
@@ -1297,8 +1749,95 @@ function App() {
     );
   }
 
+  function relationshipMappingsForDatasetPair(sourceId, targetId) {
+    if (!sourceId || !targetId) return [];
+    const rows = [];
+    const seen = new Set();
+    const activeRelationships = Array.isArray(relationships)
+      ? relationships.filter((r) => r && r.active !== false)
+      : [];
+    for (const relRow of activeRelationships) {
+      const direct = relRow.left_dataset === sourceId && relRow.right_dataset === targetId;
+      const reverse = relRow.left_dataset === targetId && relRow.right_dataset === sourceId;
+      if (!direct && !reverse) continue;
+      const pairs =
+        Array.isArray(relRow.field_pairs) && relRow.field_pairs.length
+          ? relRow.field_pairs
+          : (() => {
+              const leftFields = Array.isArray(relRow.left_fields)
+                ? relRow.left_fields
+                : relRow.left_field
+                  ? [relRow.left_field]
+                  : [];
+              const rightFields = Array.isArray(relRow.right_fields)
+                ? relRow.right_fields
+                : relRow.right_field
+                  ? [relRow.right_field]
+                  : [];
+              const count = Math.min(leftFields.length, rightFields.length);
+              const fallback = [];
+              for (let i = 0; i < count; i += 1) {
+                fallback.push({ left_field: leftFields[i], right_field: rightFields[i] });
+              }
+              return fallback;
+            })();
+      for (const pair of pairs) {
+        const sourceField = direct ? pair.left_field : pair.right_field;
+        const targetField = direct ? pair.right_field : pair.left_field;
+        if (!sourceField || !targetField) continue;
+        const sig = `${normalizeFieldName(sourceField)}|||${normalizeFieldName(targetField)}`;
+        if (seen.has(sig)) continue;
+        seen.add(sig);
+        rows.push(
+          mappingRowFromPayload(
+            {
+              source_field: sourceField,
+              target_field: targetField,
+              origin_mode: relRow.method || "manual",
+            },
+            { use_key: true, use_compare: true }
+          )
+        );
+      }
+    }
+    return rows;
+  }
+
+  function pairKeyMappingsForRelationshipPair(leftId, rightId) {
+    if (!leftId || !rightId) return [];
+    const leftSide = datasets.find((d) => d.id === leftId)?.side || "";
+    const rightSide = datasets.find((d) => d.id === rightId)?.side || "";
+    const sourceTargetPair =
+      (leftSide === "source" && rightSide === "target") ||
+      (leftSide === "target" && rightSide === "source");
+    if (!sourceTargetPair) return [];
+    const directPair = pairs.find((p) => p.source_dataset === leftId && p.target_dataset === rightId);
+    const reversePair = !directPair
+      ? pairs.find((p) => p.source_dataset === rightId && p.target_dataset === leftId)
+      : null;
+    const pair = directPair || reversePair;
+    if (!pair) return [];
+    const reverse = !!reversePair;
+    const keyMappings = Array.isArray(pair.key_mappings) ? pair.key_mappings : [];
+    return keyMappings
+      .map((m) => ({
+        left_field: reverse ? m.target_field || m.target : m.source_field || m.source,
+        right_field: reverse ? m.source_field || m.source : m.target_field || m.target,
+      }))
+      .filter((m) => String(m.left_field || "").trim() && String(m.right_field || "").trim());
+  }
+
+  function inferRelationshipSide(leftId, rightId) {
+    const leftSide = datasets.find((d) => d.id === leftId)?.side || "";
+    const rightSide = datasets.find((d) => d.id === rightId)?.side || "";
+    if (!leftSide || !rightSide) return "cross";
+    if (leftSide === rightSide) return leftSide;
+    return "cross";
+  }
+
   async function applyNameMappings() {
     setError("");
+    setCompareSuggestMessage("");
     if (!sourceDataset || !targetDataset) {
       setError("Select source and target datasets first.");
       return;
@@ -1338,6 +1877,8 @@ function App() {
       setError("Select source and target datasets first.");
       return;
     }
+    setCompareSuggestBusy(true);
+    setCompareSuggestMessage("");
     setStatus("Suggesting content-aware mappings...");
     try {
       const result = await api(
@@ -1349,6 +1890,7 @@ function App() {
         ? result.compare_mappings.map((m) => mappingRowFromPayload(m, { use_compare: true }))
         : [];
       if (!mapped.length) {
+        setCompareSuggestMessage("No content-based mapping candidates were found for the selected datasets.");
         setStatus("No high-confidence content-aware mappings found.");
         return;
       }
@@ -1356,14 +1898,19 @@ function App() {
         setQuickMapPendingMappings(mapped);
         setQuickMapPendingLabel("content-aware");
         setQuickMapChoiceOpen(true);
+        setCompareSuggestMessage(`Found ${mapped.length} content-based mapping candidate(s). Choose how to apply them.`);
         return;
       }
       setFieldMappings(mapped);
       const keyMarked = mapped.filter((m) => m.use_key).length;
+      setCompareSuggestMessage(`Found ${mapped.length} content-based mapping candidate(s).`);
       setStatus(`Suggested ${mapped.length} content-aware mapping(s). Key-marked: ${keyMarked}.`);
     } catch (err) {
       setError(err.message);
+      setCompareSuggestMessage("Content-based mapping suggestion failed.");
       setStatus("Content-aware mapping suggestion failed.");
+    } finally {
+      setCompareSuggestBusy(false);
     }
   }
 
@@ -1643,17 +2190,38 @@ function App() {
     }
   }
 
-  async function onDeleteReport(reportId) {
-    if (!confirm(`Delete report ${reportId}?`)) {
-      return;
-    }
+  function closeReportDeleteModal() {
+    setReportDeleteModal((prev) => {
+      if (prev.busy) return prev;
+      return { open: false, reportId: "", reportFile: "", busy: false };
+    });
+  }
+
+  function onDeleteReport(reportId) {
+    const report = reports.find((r) => String(r.id) === String(reportId));
+    setReportDeleteModal({
+      open: true,
+      reportId: String(reportId || ""),
+      reportFile: String(report?.file_name || ""),
+      busy: false,
+    });
+  }
+
+  async function confirmDeleteReport() {
+    const reportId = String(reportDeleteModal.reportId || "").trim();
+    if (!reportId || reportDeleteModal.busy) return;
+    setReportDeleteModal((prev) => ({ ...prev, busy: true }));
     setError("");
+    setStatus(`Deleting report ${reportId}...`);
     try {
       await api(`/api/reports/${encodeURIComponent(reportId)}`, { method: "DELETE" });
       await refreshBootstrap();
       setStatus(`Deleted report ${reportId}.`);
+      setReportDeleteModal({ open: false, reportId: "", reportFile: "", busy: false });
     } catch (err) {
       setError(err.message);
+      setStatus("Deleting report failed.");
+      setReportDeleteModal((prev) => ({ ...prev, busy: false }));
     }
   }
 
@@ -1765,11 +2333,14 @@ function App() {
     await onOpenReport(reportId);
   }
 
-  function clearRelationshipForm() {
+  function clearRelationshipForm({ keepDatasets = false } = {}) {
     setRelationshipId("");
-    setLeftDatasetId("");
-    setRightDatasetId("");
+    if (!keepDatasets) {
+      setLeftDatasetId("");
+      setRightDatasetId("");
+    }
     setRelationshipMappings([{ left_field: "", right_field: "" }]);
+    setRelationshipSuggestMessage("");
     setRelationshipConfidence(0.95);
     setRelationshipMethod("manual");
     setRelationshipActive(true);
@@ -1785,10 +2356,13 @@ function App() {
 
   function editRelationship(row) {
     setRelationshipId(String(row.id || ""));
-    setRelationshipSide(row.side || "target");
     setLeftDatasetId(row.left_dataset || "");
+    const leftSide = datasets.find((d) => d.id === row.left_dataset)?.side || "any";
+    setRelationshipLeftFolderFilter(leftSide);
     const lf = row.left_fields || (row.left_field ? [row.left_field] : []);
     setRightDatasetId(row.right_dataset || "");
+    const rightSide = datasets.find((d) => d.id === row.right_dataset)?.side || "any";
+    setRelationshipRightFolderFilter(rightSide);
     const rf = row.right_fields || (row.right_field ? [row.right_field] : []);
     const rowCount = Math.max(lf.length, rf.length, 1);
     const rows = [];
@@ -1799,8 +2373,9 @@ function App() {
       });
     }
     setRelationshipMappings(rows);
-    setRelationshipConfidence(Number(row.confidence || 0.95));
-    setRelationshipMethod(row.method || "manual");
+    // Editing is always a manual action; keep confidence read-only ("-") until user re-suggests.
+    setRelationshipConfidence(0.95);
+    setRelationshipMethod("manual");
     setRelationshipActive(!!row.active);
     setTab("relationships");
   }
@@ -1820,10 +2395,269 @@ function App() {
     setRelationshipMappings((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   }
 
-  async function saveRelationship() {
+  function stopRelationshipSuggestion() {
+    if (!relationshipSuggestBusy) return;
+    relationshipSuggestStopRef.current = true;
+    setRelationshipSuggestStopRequested(true);
+    try {
+      relationshipSuggestAbortRef.current?.abort();
+    } catch (_err) {}
+    setStatus("Stopping relationship suggestion...");
+  }
+
+  async function suggestRelationshipMappings(mode) {
+    relationshipSuggestStopRef.current = false;
+    setRelationshipSuggestStopRequested(false);
+    const requestedMode = mode === "content" ? "content" : "name";
+    const contentMode = requestedMode === "content";
+    const leftScopeSelected = !!leftDatasetId || relationshipLeftFolderFilter !== "any";
+    const rightScopeSelected = !!rightDatasetId || relationshipRightFolderFilter !== "any";
     if (!leftDatasetId || !rightDatasetId) {
-      setError("Select left and right datasets first.");
-      return;
+      if (relationshipId) {
+        setError("Select left and right datasets first.");
+        return;
+      }
+      if (!leftScopeSelected || !rightScopeSelected) {
+        setError("Select a left and right dataset or folder prefilter scope first.");
+        return;
+      }
+      setError("");
+      setRelationshipSuggestMessage("");
+      setRelationshipSuggestBusy(true);
+      setStatus(`Auto-matching relationships by ${requestedMode} for selected scope...`);
+      try {
+        const leftScopeDatasets = leftDatasetId
+          ? datasets.filter((d) => d.id === leftDatasetId)
+          : datasets.filter((d) => d.side === relationshipLeftFolderFilter);
+        const rightScopeDatasets = rightDatasetId
+          ? datasets.filter((d) => d.id === rightDatasetId)
+          : datasets.filter((d) => d.side === relationshipRightFolderFilter);
+
+        const pairQueue = [];
+        const seenPairSigs = new Set();
+        for (const leftDs of leftScopeDatasets) {
+          for (const rightDs of rightScopeDatasets) {
+            if (!leftDs?.id || !rightDs?.id) continue;
+            if (leftDs.id === rightDs.id) continue;
+            const sig = [leftDs.id, rightDs.id].sort().join("|||");
+            if (seenPairSigs.has(sig)) continue;
+            seenPairSigs.add(sig);
+            pairQueue.push({ left_dataset: leftDs.id, right_dataset: rightDs.id });
+          }
+        }
+
+        if (!pairQueue.length) {
+          setRelationshipSuggestMessage("No dataset pairs found for the selected folder scope.");
+          setStatus("No dataset pairs available for scoped matching.");
+          return;
+        }
+
+        let totalApplied = 0;
+        let totalSkippedExisting = 0;
+        let failedPairs = 0;
+        let lastFailureMessage = "";
+
+        for (let i = 0; i < pairQueue.length; i += 1) {
+          if (relationshipSuggestStopRef.current) {
+            break;
+          }
+          const pair = pairQueue[i];
+          const progressLabel = `${i + 1}/${pairQueue.length}`;
+          setStatus(`Auto-matching by ${requestedMode}: ${progressLabel} pairs processed...`);
+          setRelationshipSuggestMessage(
+            `Processing pair ${progressLabel}: ${pair.left_dataset} -> ${pair.right_dataset}`
+          );
+          try {
+            const controller = new AbortController();
+            relationshipSuggestAbortRef.current = controller;
+            const result = await api("/api/relationships/auto-link", {
+              method: "POST",
+              signal: controller.signal,
+              body: JSON.stringify({
+                left_side: relationshipLeftFolderFilter || "any",
+                right_side: relationshipRightFolderFilter || "any",
+                left_dataset: pair.left_dataset,
+                right_dataset: pair.right_dataset,
+                mode: requestedMode,
+                min_confidence: requestedMode === "content" ? 0.6 : 0.75,
+                suggest_only: false,
+                max_links: 1,
+              }),
+            });
+            totalApplied += Number(result?.applied_count || 0);
+            totalSkippedExisting += Number(result?.pairs_skipped_existing || 0);
+          } catch (err) {
+            if (relationshipSuggestStopRef.current) {
+              break;
+            }
+            failedPairs += 1;
+            lastFailureMessage = String(err?.message || err || "");
+          } finally {
+            relationshipSuggestAbortRef.current = null;
+          }
+        }
+
+        await refreshBootstrap();
+        const unresolvedPairs = Math.max(0, pairQueue.length - totalApplied - totalSkippedExisting - failedPairs);
+        const skippedNoMatch = unresolvedPairs;
+        const stopped = relationshipSuggestStopRef.current;
+        if (failedPairs > 0) {
+          setError(
+            `Scoped matching completed with ${failedPairs} failed pair(s).${lastFailureMessage ? ` Last error: ${lastFailureMessage}` : ""}`
+          );
+        }
+        setRelationshipSuggestMessage(
+          `Processed ${pairQueue.length}/${pairQueue.length} pairs. Created: ${totalApplied}. Skipped existing: ${totalSkippedExisting}. No match: ${skippedNoMatch}. Failed: ${failedPairs}.`
+        );
+        setStatus(
+          stopped
+            ? `Scoped ${requestedMode} matching stopped. Created ${totalApplied} relationship(s).`
+            : `Scoped ${requestedMode} matching finished. Created ${totalApplied} relationship(s) across ${pairQueue.length} pair(s).`
+        );
+        return;
+      } catch (err) {
+        if (relationshipSuggestStopRef.current) {
+          setStatus(`Scoped ${requestedMode} matching stopped.`);
+        } else {
+          setError(err.message);
+          setStatus(`Auto-matching by ${requestedMode} failed.`);
+        }
+        return;
+      } finally {
+        relationshipSuggestAbortRef.current = null;
+        relationshipSuggestStopRef.current = false;
+        setRelationshipSuggestStopRequested(false);
+        setRelationshipSuggestBusy(false);
+      }
+    }
+
+    setError("");
+    setRelationshipSuggestMessage("");
+    setRelationshipSuggestBusy(true);
+    setStatus(`Suggesting relationship mappings by ${requestedMode}...`);
+    try {
+      const controller = new AbortController();
+      relationshipSuggestAbortRef.current = controller;
+      const res = await api(
+        `/api/pairs/quick-map?source_dataset_id=${encodeURIComponent(leftDatasetId)}&target_dataset_id=${encodeURIComponent(
+          rightDatasetId
+        )}&mode=${requestedMode}${requestedMode === "content" ? "&min_confidence=0.6" : ""}`,
+        { signal: controller.signal }
+      );
+      const keyCandidates = Array.isArray(res?.compare_mappings)
+        ? res.compare_mappings.filter((m) => !!m && (m.is_key_pair === true || m.use_key === true))
+        : [];
+      const contentConfidences = contentMode
+        ? keyCandidates
+            .map((m) => Number(m?.confidence))
+            .filter((v) => Number.isFinite(v))
+        : [];
+      const rows = keyCandidates
+            .map((m) => ({
+              left_field: String(m?.source_field || "").trim(),
+              right_field: String(m?.target_field || "").trim(),
+            }))
+            .filter((m) => m.left_field && m.right_field)
+      if (!rows.length) {
+        if (contentMode) {
+          setRelationshipSuggestMessage("No content-based key mapping candidates were found for relationship creation.");
+        }
+        setStatus(`No ${requestedMode}-based key mappings found for relationship creation.`);
+        return;
+      }
+      const merged = relationshipMappings.filter(
+        (m) => String(m.left_field || "").trim() || String(m.right_field || "").trim()
+      );
+      const seen = new Set(
+        merged
+          .filter((m) => (m.left_field || "").trim() && (m.right_field || "").trim())
+          .map((m) => `${normalizeFieldName(m.left_field)}|||${normalizeFieldName(m.right_field)}`)
+      );
+      let added = 0;
+      rows.forEach((row) => {
+        const sig = `${normalizeFieldName(row.left_field)}|||${normalizeFieldName(row.right_field)}`;
+        if (seen.has(sig)) return;
+        seen.add(sig);
+        merged.push(row);
+        added += 1;
+      });
+      if (!merged.length && !added) {
+        merged.push({ left_field: "", right_field: "" });
+      }
+      setRelationshipMappings(merged);
+      if (contentMode) {
+        if (contentConfidences.length) {
+          const avgConfidence = contentConfidences.reduce((sum, v) => sum + v, 0) / contentConfidences.length;
+          const boundedConfidence = Math.max(0, Math.min(1, avgConfidence));
+          setRelationshipMethod("content");
+          setRelationshipConfidence(boundedConfidence.toFixed(3));
+          setRelationshipSuggestMessage(
+            `Found ${rows.length} content-based key mapping candidate(s). Added ${added} row(s). Confidence set to ${boundedConfidence.toFixed(3)}.`
+          );
+        } else {
+          setRelationshipSuggestMessage(`Found ${rows.length} content-based key mapping candidate(s). Added ${added} row(s).`);
+        }
+      }
+      setStatus(`Suggested ${rows.length} ${requestedMode}-based key mapping(s). Added ${added} new row(s).`);
+    } catch (err) {
+      if (relationshipSuggestStopRef.current) {
+        setStatus(`Suggestion by ${requestedMode} stopped.`);
+      } else {
+        setError(err.message);
+        if (contentMode) {
+          setRelationshipSuggestMessage("Content-based relationship mapping suggestion failed.");
+        }
+        setStatus("Relationship mapping suggestion failed.");
+      }
+    } finally {
+      relationshipSuggestAbortRef.current = null;
+      relationshipSuggestStopRef.current = false;
+      setRelationshipSuggestStopRequested(false);
+      setRelationshipSuggestBusy(false);
+    }
+  }
+
+  async function saveRelationship() {
+    const leftScopeSelected = !!leftDatasetId || relationshipLeftFolderFilter !== "any";
+    const rightScopeSelected = !!rightDatasetId || relationshipRightFolderFilter !== "any";
+    if (!leftDatasetId || !rightDatasetId) {
+      if (relationshipId) {
+        setError("Select left and right datasets first.");
+        return;
+      }
+      if (!leftScopeSelected || !rightScopeSelected) {
+        setError("Select a left and right dataset or folder prefilter scope first.");
+        return;
+      }
+      setError("");
+      setStatus("Auto-creating relationships for selected folder/dataset scope...");
+      try {
+        const result = await api("/api/relationships/auto-link", {
+          method: "POST",
+          body: JSON.stringify({
+            left_side: relationshipLeftFolderFilter || "any",
+            right_side: relationshipRightFolderFilter || "any",
+            left_dataset: leftDatasetId || "",
+            right_dataset: rightDatasetId || "",
+            min_confidence: 0.6,
+            suggest_only: false,
+            max_links: 500,
+          }),
+        });
+        await refreshBootstrap();
+        const appliedCount = Number(result?.applied_count || 0);
+        const skippedExisting = Number(result?.pairs_skipped_existing || 0);
+        if (appliedCount > 0) {
+          setStatus(`Auto-created ${appliedCount} relationship(s). Skipped existing dataset pairs: ${skippedExisting}.`);
+        } else {
+          setStatus(`No new relationships were created. Existing pairs skipped: ${skippedExisting}.`);
+        }
+        return;
+      } catch (err) {
+        setError(err.message);
+        setStatus("Auto-creating relationships failed.");
+        return;
+      }
     }
 
     const nonEmptyRows = relationshipMappings.filter((m) => (m.left_field || "").trim() || (m.right_field || "").trim());
@@ -1839,18 +2673,20 @@ function App() {
 
     const leftFields = nonEmptyRows.map((m) => m.left_field.trim());
     const rightFields = nonEmptyRows.map((m) => m.right_field.trim());
+    const normalizedMethod = String(relationshipMethod || "manual").trim().toLowerCase() || "manual";
 
     setError("");
     setStatus(relationshipId ? "Updating relationship..." : "Creating relationship...");
+    const resolvedSide = inferRelationshipSide(leftDatasetId, rightDatasetId);
     const payload = {
-      side: relationshipSide,
+      side: resolvedSide,
       left_dataset: leftDatasetId,
       left_field: leftFields[0],
       left_fields: leftFields,
       right_dataset: rightDatasetId,
       right_field: rightFields[0],
       right_fields: rightFields,
-      confidence: Number(relationshipConfidence),
+      confidence: normalizedMethod === "manual" ? 1 : Number(relationshipConfidence),
       method: relationshipMethod || "manual",
       active: !!relationshipActive,
     };
@@ -1867,7 +2703,7 @@ function App() {
         });
       }
       await refreshBootstrap();
-      clearRelationshipForm();
+      clearRelationshipForm({ keepDatasets: true });
       setStatus("Relationship saved.");
     } catch (err) {
       setError(err.message);
@@ -1875,37 +2711,38 @@ function App() {
     }
   }
 
-  async function removeRelationship(id) {
-    if (!confirm(`Delete relationship ${id}?`)) return;
+  function closeRelationshipDeleteModal() {
+    setRelationshipDeleteModal((prev) => {
+      if (prev.busy) return prev;
+      return { open: false, relationshipId: "", leftLabel: "", rightLabel: "", busy: false };
+    });
+  }
+
+  function removeRelationship(row) {
+    setRelationshipDeleteModal({
+      open: true,
+      relationshipId: String(row?.id || ""),
+      leftLabel: row ? `${row.left_dataset}.${relationshipFieldLabel(row, "left")}` : "",
+      rightLabel: row ? `${row.right_dataset}.${relationshipFieldLabel(row, "right")}` : "",
+      busy: false,
+    });
+  }
+
+  async function confirmDeleteRelationship() {
+    const relationshipId = String(relationshipDeleteModal.relationshipId || "").trim();
+    if (!relationshipId || relationshipDeleteModal.busy) return;
+    setRelationshipDeleteModal((prev) => ({ ...prev, busy: true }));
     setError("");
     setStatus("Deleting relationship...");
     try {
-      await api(`/api/relationships/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await api(`/api/relationships/${encodeURIComponent(relationshipId)}`, { method: "DELETE" });
       await refreshBootstrap();
-      setStatus(`Deleted relationship ${id}.`);
+      setRelationshipDeleteModal({ open: false, relationshipId: "", leftLabel: "", rightLabel: "", busy: false });
+      setStatus(`Deleted relationship ${relationshipId}.`);
     } catch (err) {
       setError(err.message);
       setStatus("Delete relationship failed.");
-    }
-  }
-
-  async function runAutoLink() {
-    setError("");
-    setStatus("Auto-linking related tables...");
-    try {
-      const res = await api("/api/relationships/link-related", {
-        method: "POST",
-        body: JSON.stringify({
-          side: relationshipSide,
-          min_confidence: Number(autoLinkConfidence),
-          suggest_only: false,
-        }),
-      });
-      await refreshBootstrap();
-      setStatus(`Auto-link complete. Suggested=${res.suggested_count}, Applied=${res.applied_count}.`);
-    } catch (err) {
-      setError(err.message);
-      setStatus("Auto-link failed.");
+      setRelationshipDeleteModal((prev) => ({ ...prev, busy: false }));
     }
   }
 
@@ -1935,7 +2772,15 @@ function App() {
           body: JSON.stringify({
             source_folder: src,
             target_folder: tgt,
+            configurations_folder: configurationsFolder,
+            translations_folder: translationsFolder,
+            rules_folder: rulesFolder,
             report_folder: rpt,
+            expose_source_to_tools: !!exposeSourceToTools,
+            expose_target_to_tools: !!exposeTargetToTools,
+            expose_configurations_to_tools: !!exposeConfigurationsToTools,
+            expose_translations_to_tools: !!exposeTranslationsToTools,
+            expose_rules_to_tools: !!exposeRulesToTools,
           }),
         });
       } catch (err) {
@@ -1962,20 +2807,27 @@ function App() {
     }
   }
 
-  async function onForceStopService(serviceName) {
+  function closeForceStopModal() {
+    setForceStopModal((prev) => {
+      if (prev.busy) return prev;
+      return { open: false, serviceName: "", serviceLabel: "", busy: false };
+    });
+  }
+
+  function onForceStopService(serviceName) {
     const labels = {
       mcp_server: "MCP server",
       mcp_inspector: "MCP inspector",
     };
     const label = labels[serviceName] || serviceName;
-    if (
-      !confirm(
-        `Force stop ${label}? This will kill any process listening on its port(s), even if it was started outside this app.`
-      )
-    ) {
-      return;
-    }
+    setForceStopModal({ open: true, serviceName, serviceLabel: label, busy: false });
+  }
 
+  async function confirmForceStopService() {
+    const serviceName = String(forceStopModal.serviceName || "").trim();
+    const label = String(forceStopModal.serviceLabel || serviceName).trim();
+    if (!serviceName || forceStopModal.busy) return;
+    setForceStopModal((prev) => ({ ...prev, busy: true }));
     setError("");
     setStatus(`Force stopping ${label}...`);
     setServiceBusy((prev) => ({ ...prev, [serviceName]: true }));
@@ -1992,9 +2844,11 @@ function App() {
           ? `${label} force-stopped. Killed ${killed} process(es).`
           : `${label} force-stop completed. No external listener process was killed.${checkedText}`
       );
+      setForceStopModal({ open: false, serviceName: "", serviceLabel: "", busy: false });
     } catch (err) {
       setError(err.message);
       setStatus(`Force stop ${label} failed.`);
+      setForceStopModal((prev) => ({ ...prev, busy: false }));
     } finally {
       setServiceBusy((prev) => ({ ...prev, [serviceName]: false }));
     }
@@ -2002,12 +2856,30 @@ function App() {
 
   const sourceOptions = datasets.filter((d) => d.side === "source");
   const targetOptions = datasets.filter((d) => d.side === "target");
-  const relationshipDatasets = datasets.filter((d) => d.side === relationshipSide);
-  const leftDatasetObj = relationshipDatasets.find((d) => d.id === leftDatasetId);
-  const rightDatasetObj = relationshipDatasets.find((d) => d.id === rightDatasetId);
+  const relationshipLeftDatasets = datasets.filter(
+    (d) => relationshipLeftFolderFilter === "any" || d.side === relationshipLeftFolderFilter
+  );
+  const relationshipRightDatasets = datasets.filter(
+    (d) => relationshipRightFolderFilter === "any" || d.side === relationshipRightFolderFilter
+  );
+  const leftDatasetObj = relationshipLeftDatasets.find((d) => d.id === leftDatasetId);
+  const rightDatasetObj = relationshipRightDatasets.find((d) => d.id === rightDatasetId);
   const leftFieldOptions = leftDatasetObj?.columns || [];
   const rightFieldOptions = rightDatasetObj?.columns || [];
-  const filteredRelationships = relationships.filter((r) => r.side === relationshipSide);
+  const relationshipDatasetSideById = new Map(datasets.map((d) => [d.id, d.side]));
+  const filteredRelationships = relationships.filter((r) => {
+    if (relationshipLeftFolderFilter !== "any") {
+      const leftSide = relationshipDatasetSideById.get(r.left_dataset) || "";
+      if (leftSide !== relationshipLeftFolderFilter) return false;
+    }
+    if (relationshipRightFolderFilter !== "any") {
+      const rightSide = relationshipDatasetSideById.get(r.right_dataset) || "";
+      if (rightSide !== relationshipRightFolderFilter) return false;
+    }
+    return true;
+  });
+  const relationshipPairKeyRows = pairKeyMappingsForRelationshipPair(leftDatasetId, rightDatasetId);
+  const relationshipMethodNormalized = String(relationshipMethod || "").trim().toLowerCase() || "manual";
   const profileDatasetObj = datasets.find((d) => d.id === profileDataset);
   const profileFieldOptions = profileDatasetObj?.columns || [];
   const selectedSource = sourceOptions.find((d) => d.id === sourceDataset);
@@ -2026,6 +2898,9 @@ function App() {
     });
   const sourceFolderTrimmed = String(sourceFolder || "").trim();
   const targetFolderTrimmed = String(targetFolder || "").trim();
+  const configurationsFolderTrimmed = String(configurationsFolder || "").trim();
+  const translationsFolderTrimmed = String(translationsFolder || "").trim();
+  const rulesFolderTrimmed = String(rulesFolder || "").trim();
   const reportFolderTrimmed = String(reportFolder || "").trim();
   const activeFolderConfig =
     folderConfigs.find((cfg) => cfg.id === activeFolderConfigId) ||
@@ -2038,7 +2913,15 @@ function App() {
   const foldersDirty =
     sourceFolderTrimmed !== String(savedFoldersSnapshot.source_folder || "").trim() ||
     targetFolderTrimmed !== String(savedFoldersSnapshot.target_folder || "").trim() ||
-    reportFolderTrimmed !== String(savedFoldersSnapshot.report_folder || "").trim();
+    configurationsFolderTrimmed !== String(savedFoldersSnapshot.configurations_folder || "").trim() ||
+    translationsFolderTrimmed !== String(savedFoldersSnapshot.translations_folder || "").trim() ||
+    rulesFolderTrimmed !== String(savedFoldersSnapshot.rules_folder || "").trim() ||
+    reportFolderTrimmed !== String(savedFoldersSnapshot.report_folder || "").trim() ||
+    !!exposeSourceToTools !== !!savedFoldersSnapshot.expose_source_to_tools ||
+    !!exposeTargetToTools !== !!savedFoldersSnapshot.expose_target_to_tools ||
+    !!exposeConfigurationsToTools !== !!savedFoldersSnapshot.expose_configurations_to_tools ||
+    !!exposeTranslationsToTools !== !!savedFoldersSnapshot.expose_translations_to_tools ||
+    !!exposeRulesToTools !== !!savedFoldersSnapshot.expose_rules_to_tools;
   const lastCatalogRefreshLabel = formatDateTimeForBadge(lastCatalogRefreshAt);
   const canValidateAnthropicKey = String(settingsApiKeyInput || "").trim().length > 0 || settingsApiKeySet;
   const canLookupAnthropicModels = canValidateAnthropicKey || settingsApiKeySet;
@@ -2190,6 +3073,9 @@ function App() {
               title={!claudeTabEnabled ? "Validate your saved Anthropic API key in Settings first." : "Open Claude chat"}
             >
               Claude
+            </button>
+            <button className={`tab ${tab === "logs" ? "active" : ""}`} onClick={() => setTab("logs")}>
+              Tool Logs
             </button>
             <button
               className={`tab ${tab === "inspector" ? "active" : ""}`}
@@ -2344,6 +3230,16 @@ function App() {
                     <option value="dark">Dark</option>
                   </select>
                   <div className="sub">Choose app theme for the admin UI.</div>
+                  <label className="catalog-check-row" style={{ marginTop: 8 }}>
+                    <input
+                      type="checkbox"
+                      className="check-input"
+                      checked={!!settingsToolLoggingEnabled}
+                      onChange={(e) => setSettingsToolLoggingEnabled(e.target.checked)}
+                    />
+                    <span>Enable tool call logging (Claude + external MCP + Inspector)</span>
+                  </label>
+                  <div className="sub">Turn off to stop creating new entries in the Tool Logs tab.</div>
                 </div>
                 <div className="settings-panel">
                   <h3>ngrok</h3>
@@ -2598,6 +3494,142 @@ function App() {
         </>
       ) : null}
 
+      {tab === "logs" ? (
+        <>
+          <div className="card">
+            <h3>Tool Call Logs</h3>
+            <div className="sub">
+              Shows request and response payloads for MCP tool calls executed through the Claude tab.
+            </div>
+
+            <div className="tool-logs-filter-grid">
+              <div>
+                <label>Status</label>
+                <select value={toolLogStatusFilter} onChange={(e) => setToolLogStatusFilter(e.target.value)}>
+                  <option value="all">All</option>
+                  <option value="ok">Success</option>
+                  <option value="error">Error</option>
+                </select>
+              </div>
+              <div>
+                <label>Tool</label>
+                <select value={toolLogNameFilter} onChange={(e) => setToolLogNameFilter(e.target.value)}>
+                  <option value="">All tools</option>
+                  {toolLogNames.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label>Contains Text</label>
+                <input
+                  value={toolLogTextFilter}
+                  onChange={(e) => setToolLogTextFilter(e.target.value)}
+                  placeholder="Find payload/error text..."
+                />
+              </div>
+              <div>
+                <label>Since (days)</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="3650"
+                  value={toolLogSinceDays}
+                  onChange={(e) => setToolLogSinceDays(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="actions">
+              <button className="secondary" onClick={() => loadToolLogs()} disabled={toolLogLoading || toolLogCleaning}>
+                {toolLogLoading ? "Loading..." : "Apply / Refresh"}
+              </button>
+              <button className="secondary" onClick={onResetToolLogFilters} disabled={toolLogLoading || toolLogCleaning}>
+                Reset Filters
+              </button>
+            </div>
+
+            <div className="tool-logs-cleanup">
+              <div className="tool-logs-cleanup-days">
+                <label>Cleanup: older than X days</label>
+                <input
+                  type="number"
+                  min="1"
+                  max="3650"
+                  value={toolLogCleanupDays}
+                  onChange={(e) => setToolLogCleanupDays(e.target.value)}
+                />
+              </div>
+              <div className="actions">
+                <button
+                  className="secondary"
+                  onClick={onClearToolLogsOlderThanDays}
+                  disabled={toolLogCleaning || toolLogLoading}
+                >
+                  {toolLogCleaning ? "Cleaning..." : "Delete Older Than X Day(s)"}
+                </button>
+                <button className="danger" onClick={onClearAllToolLogs} disabled={toolLogCleaning || toolLogLoading}>
+                  Delete Everything
+                </button>
+              </div>
+            </div>
+
+            <div className="sub">
+              Showing {toolLogs.length} of {toolLogTotal} entr{toolLogTotal === 1 ? "y" : "ies"}.
+            </div>
+
+            <div className="scroll tool-logs-table-wrap">
+              <table className="tool-logs-table">
+                <thead>
+                  <tr>
+                    <th>Status</th>
+                    <th>Tool</th>
+                    <th>Called</th>
+                    <th>Responded</th>
+                    <th>Duration (ms)</th>
+                    <th>Request</th>
+                    <th>Response</th>
+                    <th>Error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {toolLogs.length ? (
+                    toolLogs.map((item) => (
+                      <tr key={`tool-log-${item.id}`}>
+                        <td>
+                          <span className={`tool-log-status-pill ${item.status === "error" ? "error" : "ok"}`}>
+                            {item.status === "error" ? "Error" : "OK"}
+                          </span>
+                        </td>
+                        <td>{displayValue(item.tool_name)}</td>
+                        <td>{formatDateTimeForBadge(item.called_at)}</td>
+                        <td>{formatDateTimeForBadge(item.responded_at)}</td>
+                        <td>{displayValue(item.duration_ms)}</td>
+                        <td>
+                          <pre className="tool-log-json">{formatPrettyJson(item.request_payload)}</pre>
+                        </td>
+                        <td>
+                          <pre className="tool-log-json">{formatPrettyJson(item.response_payload)}</pre>
+                        </td>
+                        <td>
+                          <pre className="tool-log-json">{formatPrettyJson(item.error_message)}</pre>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={8}>No tool log entries found for the current filters.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      ) : null}
+
       {inspectorRunning ? (
         <div style={{ display: tab === "inspector" ? "block" : "none" }}>
           <div className="card inspector-card">
@@ -2686,15 +3718,19 @@ function App() {
                         onChange={async (e) => {
                           const nextId = e.target.value;
                           setSelectedFolderConfigId(nextId);
+                          if (nextId === NEW_FOLDER_CONFIG_OPTION_ID) {
+                            setFolderConfigNameInput("");
+                            return;
+                          }
                           const selected = folderConfigs.find((cfg) => cfg.id === nextId);
                           setFolderConfigNameInput(selected ? selected.name : "");
                           if (nextId && nextId !== activeFolderConfigId) {
                             await onSelectFolderConfig(nextId);
                           }
                         }}
-                        disabled={folderConfigBusy || !folderConfigs.length}
+                        disabled={folderConfigBusy}
                       >
-                        {!folderConfigs.length ? <option value="">No saved configurations yet</option> : null}
+                        <option value={NEW_FOLDER_CONFIG_OPTION_ID}>New configuration</option>
                         {folderConfigs.map((cfg) => (
                           <option key={cfg.id} value={cfg.id}>
                             {cfg.name}
@@ -2704,20 +3740,41 @@ function App() {
                       </select>
                       <button
                         type="button"
-                        className="danger"
-                        onClick={onDeleteFolderConfig}
-                        disabled={folderConfigBusy || !selectedFolderConfigId}
+                        className="secondary catalog-icon-btn"
+                        onClick={onRenameFolderConfig}
+                        disabled={folderConfigBusy || !selectedFolderConfigId || selectedFolderConfigId === NEW_FOLDER_CONFIG_OPTION_ID}
+                        title="Rename selected configuration"
+                        aria-label="Rename selected configuration"
                       >
-                        Delete
+                        ✎
                       </button>
                       <button
                         type="button"
-                        className="secondary"
+                        className="danger catalog-icon-btn"
+                        onClick={onDeleteFolderConfig}
+                        disabled={folderConfigBusy || !selectedFolderConfigId || selectedFolderConfigId === NEW_FOLDER_CONFIG_OPTION_ID}
+                        title="Delete selected configuration"
+                        aria-label="Delete selected configuration"
+                      >
+                        🗑
+                      </button>
+                      <button
+                        type="button"
+                        className="secondary catalog-icon-btn"
                         onClick={onSaveFolderConfig}
                         disabled={folderConfigBusy}
-                        title="Save current folders as a configuration"
+                        title={
+                          selectedFolderConfigId === NEW_FOLDER_CONFIG_OPTION_ID
+                            ? "Save current folders as a new configuration"
+                            : "Save current folders to selected configuration"
+                        }
+                        aria-label={
+                          selectedFolderConfigId === NEW_FOLDER_CONFIG_OPTION_ID
+                            ? "Save current folders as a new configuration"
+                            : "Save current folders to selected configuration"
+                        }
                       >
-                        {folderConfigBusy ? "Working..." : "Save"}
+                        💾
                       </button>
                     </div>
                     <div className="catalog-config-meta">
@@ -2768,6 +3825,69 @@ function App() {
                       </div>
                     </div>
                     <div>
+                      <label>Configurations folder</label>
+                      <div className="field-with-action">
+                        <input
+                          className="catalog-path-input"
+                          title={configurationsFolder}
+                          value={configurationsFolder}
+                          onChange={(e) => setConfigurationsFolder(e.target.value)}
+                          placeholder="C:\\data\\configurations"
+                        />
+                        <button
+                          type="button"
+                          className="secondary browse-btn browse-icon-btn"
+                          onClick={() => onBrowseFolder("configurations")}
+                          title="Browse configurations folder"
+                          aria-label="Browse configurations folder"
+                        >
+                          ...
+                        </button>
+                      </div>
+                    </div>
+                    <div>
+                      <label>Translations folder</label>
+                      <div className="field-with-action">
+                        <input
+                          className="catalog-path-input"
+                          title={translationsFolder}
+                          value={translationsFolder}
+                          onChange={(e) => setTranslationsFolder(e.target.value)}
+                          placeholder="C:\\data\\translations"
+                        />
+                        <button
+                          type="button"
+                          className="secondary browse-btn browse-icon-btn"
+                          onClick={() => onBrowseFolder("translations")}
+                          title="Browse translations folder"
+                          aria-label="Browse translations folder"
+                        >
+                          ...
+                        </button>
+                      </div>
+                    </div>
+                    <div>
+                      <label>Rules folder</label>
+                      <div className="field-with-action">
+                        <input
+                          className="catalog-path-input"
+                          title={rulesFolder}
+                          value={rulesFolder}
+                          onChange={(e) => setRulesFolder(e.target.value)}
+                          placeholder="C:\\data\\rules"
+                        />
+                        <button
+                          type="button"
+                          className="secondary browse-btn browse-icon-btn"
+                          onClick={() => onBrowseFolder("rules")}
+                          title="Browse rules folder"
+                          aria-label="Browse rules folder"
+                        >
+                          ...
+                        </button>
+                      </div>
+                    </div>
+                    <div>
                       <label>Report folder</label>
                       <div className="field-with-action">
                         <input
@@ -2793,24 +3913,72 @@ function App() {
 
                 <div className="settings-panel catalog-run-panel">
                   <h3>Catalog Run</h3>
-                  <div className="sub">Run discovery after locations are ready.</div>
-                  <label>Options</label>
-                  <label className="catalog-check-row">
-                    <input
-                      type="checkbox"
-                      className="check-input"
-                      checked={includeRowCounts}
-                      onChange={(e) => setIncludeRowCounts(e.target.checked)}
-                    />
-                    <span>Include row counts (slow)</span>
-                  </label>
-                  <button
-                    className="refresh-catalog-btn"
-                    onClick={onRefreshCatalog}
-                    disabled={!foldersConfigured || catalogRefreshing || catalogReloading}
-                  >
-                    {catalogRefreshing ? "Refreshing..." : "Refresh Catalog"}
-                  </button>
+                  <div className="catalog-run-compact">
+                    <label className="catalog-check-row compact">
+                      <input
+                        type="checkbox"
+                        className="check-input"
+                        checked={includeRowCounts}
+                        onChange={(e) => setIncludeRowCounts(e.target.checked)}
+                      />
+                      <span>Include row counts (slow)</span>
+                    </label>
+                    <button
+                      className="refresh-catalog-btn"
+                      onClick={onRefreshCatalog}
+                      disabled={!foldersConfigured || catalogRefreshing || catalogReloading}
+                    >
+                      {catalogRefreshing ? "Refreshing..." : "Refresh Catalog"}
+                    </button>
+                  </div>
+                  <div className="catalog-expose-grid">
+                    <h4 style={{ margin: 0 }}>Expose to MCP tools</h4>
+                    <label className="catalog-check-row compact">
+                      <input
+                        type="checkbox"
+                        className="check-input"
+                        checked={exposeSourceToTools}
+                        onChange={(e) => setExposeSourceToTools(e.target.checked)}
+                      />
+                      <span>Source</span>
+                    </label>
+                    <label className="catalog-check-row compact">
+                      <input
+                        type="checkbox"
+                        className="check-input"
+                        checked={exposeTargetToTools}
+                        onChange={(e) => setExposeTargetToTools(e.target.checked)}
+                      />
+                      <span>Target</span>
+                    </label>
+                    <label className="catalog-check-row compact">
+                      <input
+                        type="checkbox"
+                        className="check-input"
+                        checked={exposeConfigurationsToTools}
+                        onChange={(e) => setExposeConfigurationsToTools(e.target.checked)}
+                      />
+                      <span>Configurations</span>
+                    </label>
+                    <label className="catalog-check-row compact">
+                      <input
+                        type="checkbox"
+                        className="check-input"
+                        checked={exposeTranslationsToTools}
+                        onChange={(e) => setExposeTranslationsToTools(e.target.checked)}
+                      />
+                      <span>Translations</span>
+                    </label>
+                    <label className="catalog-check-row compact">
+                      <input
+                        type="checkbox"
+                        className="check-input"
+                        checked={exposeRulesToTools}
+                        onChange={(e) => setExposeRulesToTools(e.target.checked)}
+                      />
+                      <span>Rules</span>
+                    </label>
+                  </div>
                   <div className="catalog-run-meta">
                     <span className="anthropic-meta-pill">Last refresh: {lastCatalogRefreshLabel}</span>
                     <span className={`anthropic-meta-pill ${foldersConfigured ? "is-active" : "is-inactive"}`}>
@@ -2818,6 +3986,15 @@ function App() {
                     </span>
                     <span className={`anthropic-meta-pill ${includeRowCounts ? "is-active" : "is-inactive"}`}>
                       Row counts: {includeRowCounts ? "on" : "off"}
+                    </span>
+                    <span className={`anthropic-meta-pill ${exposeConfigurationsToTools ? "is-active" : "is-inactive"}`}>
+                      Config tools: {exposeConfigurationsToTools ? "on" : "off"}
+                    </span>
+                    <span className={`anthropic-meta-pill ${exposeTranslationsToTools ? "is-active" : "is-inactive"}`}>
+                      Translation tools: {exposeTranslationsToTools ? "on" : "off"}
+                    </span>
+                    <span className={`anthropic-meta-pill ${exposeRulesToTools ? "is-active" : "is-inactive"}`}>
+                      Rules tools: {exposeRulesToTools ? "on" : "off"}
                     </span>
                   </div>
                 </div>
@@ -3448,8 +4625,15 @@ function App() {
                   <button type="button" className="secondary" onClick={applyNameMappings}>
                     Suggest By Name
                   </button>
-                  <button type="button" className="secondary" onClick={applyContentAwareMappings}>
-                    Suggest By Content
+                  <button type="button" className="secondary" onClick={applyContentAwareMappings} disabled={compareSuggestBusy}>
+                    {compareSuggestBusy ? (
+                      <span className="button-progress">
+                        <span className="button-progress-spinner" />
+                        Suggesting...
+                      </span>
+                    ) : (
+                      "Suggest By Content"
+                    )}
                   </button>
                   <button type="button" className="secondary" onClick={addMappingRow}>
                     Add Mapping Row
@@ -3458,6 +4642,7 @@ function App() {
                     Save Pair Mappings
                   </button>
                 </div>
+                {compareSuggestMessage ? <div className="sub suggestion-feedback">{compareSuggestMessage}</div> : null}
               </div>
             </div>
           </div>
@@ -3801,43 +4986,47 @@ function App() {
       {tab === "relationships" ? (
         <>
           <div className="card">
+            <div className="card-header-row">
+              <h3 style={{ margin: 0 }}>{relationshipId ? `Edit Relationship #${relationshipId}` : "Create Relationship"}</h3>
+              <button className="secondary header-action-btn" onClick={refreshBootstrap}>
+                Refresh
+              </button>
+            </div>
             <div className="row">
-              <div className="col-2">
-                <label>Side</label>
-                <select value={relationshipSide} onChange={(e) => setRelationshipSide(e.target.value)}>
+              <div className="col-6">
+                <label>Left folder prefilter</label>
+                <select
+                  value={relationshipLeftFolderFilter}
+                  onChange={(e) => {
+                    setRelationshipLeftFolderFilter(e.target.value);
+                    setError("");
+                  }}
+                >
+                  <option value="any">any</option>
                   <option value="source">source</option>
                   <option value="target">target</option>
+                  <option value="configurations">configurations</option>
+                  <option value="translations">translations</option>
+                  <option value="rules">rules</option>
                 </select>
               </div>
-              <div className="col-3">
-                <label>Auto-link min confidence</label>
-                <input
-                  type="number"
-                  min="0"
-                  max="1"
-                  step="0.01"
-                  value={autoLinkConfidence}
-                  onChange={(e) => setAutoLinkConfidence(e.target.value)}
-                />
+              <div className="col-6">
+                <label>Right folder prefilter</label>
+                <select
+                  value={relationshipRightFolderFilter}
+                  onChange={(e) => {
+                    setRelationshipRightFolderFilter(e.target.value);
+                    setError("");
+                  }}
+                >
+                  <option value="any">any</option>
+                  <option value="source">source</option>
+                  <option value="target">target</option>
+                  <option value="configurations">configurations</option>
+                  <option value="translations">translations</option>
+                  <option value="rules">rules</option>
+                </select>
               </div>
-              <div className="col-2">
-                <label>&nbsp;</label>
-                <button className="auto-link-btn" onClick={runAutoLink}>
-                  Auto-link
-                </button>
-              </div>
-              <div className="col-2">
-                <label>&nbsp;</label>
-                <button className="secondary" onClick={refreshBootstrap}>
-                  Refresh
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div className="card">
-            <h3>{relationshipId ? `Edit Relationship #${relationshipId}` : "Create Relationship"}</h3>
-            <div className="row">
               <div className="col-6">
                 <label>Left dataset</label>
                 <select
@@ -3845,10 +5034,12 @@ function App() {
                   onChange={(e) => {
                     setLeftDatasetId(e.target.value);
                     setRelationshipMappings([{ left_field: "", right_field: "" }]);
+                    setRelationshipSuggestMessage("");
+                    setError("");
                   }}
                 >
                   <option value="">Select...</option>
-                  {relationshipDatasets.map((d) => (
+                  {relationshipLeftDatasets.map((d) => (
                     <option key={d.id} value={d.id}>
                       {d.id}
                     </option>
@@ -3862,10 +5053,12 @@ function App() {
                   onChange={(e) => {
                     setRightDatasetId(e.target.value);
                     setRelationshipMappings([{ left_field: "", right_field: "" }]);
+                    setRelationshipSuggestMessage("");
+                    setError("");
                   }}
                 >
                   <option value="">Select...</option>
-                  {relationshipDatasets.map((d) => (
+                  {relationshipRightDatasets.map((d) => (
                     <option key={d.id} value={d.id}>
                       {d.id}
                     </option>
@@ -3874,13 +5067,47 @@ function App() {
               </div>
               <div className="col-12">
                 <label>Field mappings</label>
-                <div className="actions" style={{ marginBottom: 8 }}>
+                <div className="actions actions-right" style={{ marginBottom: 8 }}>
                   <button type="button" className="secondary" onClick={addRelationshipMappingRow}>
                     Add Mapping Row
                   </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => suggestRelationshipMappings("name")}
+                    disabled={relationshipSuggestBusy}
+                  >
+                    Suggest By Name
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => suggestRelationshipMappings("content")}
+                    disabled={relationshipSuggestBusy}
+                  >
+                    {relationshipSuggestBusy ? (
+                      <span className="button-progress">
+                        <span className="button-progress-spinner" />
+                        Suggesting...
+                      </span>
+                    ) : (
+                      "Suggest By Content"
+                    )}
+                  </button>
+                  {relationshipSuggestBusy ? (
+                    <button type="button" className="danger" onClick={stopRelationshipSuggestion}>
+                      {relationshipSuggestStopRequested ? "Stopping..." : "Stop"}
+                    </button>
+                  ) : null}
                 </div>
+                {relationshipPairKeyRows.length ? (
+                  <div className="sub" style={{ marginBottom: 8 }}>
+                    Compare keys were detected for this source/target pair and will auto-fill when mappings are empty.
+                  </div>
+                ) : null}
+                {relationshipSuggestMessage ? <div className="sub suggestion-feedback">{relationshipSuggestMessage}</div> : null}
                 <div className="scroll">
-                  <table>
+                  <table className="relationship-mappings-table">
                     <thead>
                       <tr>
                         <th>Left field</th>
@@ -3932,14 +5159,18 @@ function App() {
             <div className="row">
               <div className="col-2">
                 <label>Confidence</label>
-                <input
-                  type="number"
-                  min="0"
-                  max="1"
-                  step="0.001"
-                  value={relationshipConfidence}
-                  onChange={(e) => setRelationshipConfidence(e.target.value)}
-                />
+                {relationshipMethodNormalized === "manual" ? (
+                  <input value="-" readOnly disabled />
+                ) : (
+                  <input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.001"
+                    value={relationshipConfidence}
+                    onChange={(e) => setRelationshipConfidence(e.target.value)}
+                  />
+                )}
               </div>
               <div className="col-3">
                 <label>Method</label>
@@ -3987,7 +5218,7 @@ function App() {
                       <td>{r.id}</td>
                       <td>{`${r.left_dataset}.${relationshipFieldLabel(r, "left")}`}</td>
                       <td>{`${r.right_dataset}.${relationshipFieldLabel(r, "right")}`}</td>
-                      <td>{r.confidence}</td>
+                      <td>{String(r.method || "").trim().toLowerCase() === "manual" ? "-" : displayValue(r.confidence)}</td>
                       <td>{r.method}</td>
                       <td>{r.active ? "Yes" : "No"}</td>
                       <td>{displayValue(r.updated_at)}</td>
@@ -3996,7 +5227,7 @@ function App() {
                           <button className="secondary" onClick={() => editRelationship(r)}>
                             Edit
                           </button>
-                          <button className="danger" onClick={() => removeRelationship(r.id)}>
+                          <button className="danger" onClick={() => removeRelationship(r)}>
                             Delete
                           </button>
                         </div>
@@ -4032,9 +5263,13 @@ function App() {
               </>
             ) : (
               <>
-                <h4 style={{ margin: "0 0 6px" }}>Save Folder Configuration</h4>
+                <h4 style={{ margin: "0 0 6px" }}>
+                  {folderConfigModal.mode === "rename" ? "Rename Folder Configuration" : "Save Folder Configuration"}
+                </h4>
                 <div className="sub" style={{ margin: "0 0 8px" }}>
-                  Name this folder setup so you can switch to it later.
+                  {folderConfigModal.mode === "rename"
+                    ? "Choose a new name for this configuration."
+                    : "Name this folder setup so you can switch to it later."}
                 </div>
                 <label>Configuration name</label>
                 <input
@@ -4050,14 +5285,91 @@ function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={onConfirmSaveFolderConfig}
+                    onClick={folderConfigModal.mode === "rename" ? onConfirmRenameFolderConfig : onConfirmSaveFolderConfig}
                     disabled={folderConfigBusy || !String(folderConfigModal.name || "").trim()}
                   >
-                    {folderConfigBusy ? "Saving..." : "Save"}
+                    {folderConfigBusy ? (folderConfigModal.mode === "rename" ? "Renaming..." : "Saving...") : folderConfigModal.mode === "rename" ? "Rename" : "Save"}
                   </button>
                 </div>
               </>
             )}
+          </div>
+        </div>
+      ) : null}
+      {reportDeleteModal.open ? (
+        <div className="modal-backdrop" onClick={closeReportDeleteModal}>
+          <div className="modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ margin: "0 0 6px" }}>Delete Report</h4>
+            <div className="sub" style={{ margin: "0 0 8px" }}>
+              Delete this report permanently?
+            </div>
+            <div className="folder-config-delete-name">
+              {reportDeleteModal.reportId}
+              {reportDeleteModal.reportFile ? ` | ${reportDeleteModal.reportFile}` : ""}
+            </div>
+            <div className="actions actions-right modal-actions">
+              <button type="button" className="secondary" onClick={closeReportDeleteModal} disabled={reportDeleteModal.busy}>
+                Cancel
+              </button>
+              <button type="button" className="danger" onClick={confirmDeleteReport} disabled={reportDeleteModal.busy}>
+                {reportDeleteModal.busy ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {relationshipDeleteModal.open ? (
+        <div className="modal-backdrop" onClick={closeRelationshipDeleteModal}>
+          <div className="modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ margin: "0 0 6px" }}>Delete Relationship</h4>
+            <div className="sub" style={{ margin: "0 0 8px" }}>
+              Remove this relationship mapping?
+            </div>
+            <div className="folder-config-delete-name">
+              ID: {relationshipDeleteModal.relationshipId}
+            </div>
+            <div className="sub" style={{ margin: "8px 0 0" }}>
+              Left: {relationshipDeleteModal.leftLabel || "-"}
+            </div>
+            <div className="sub" style={{ margin: "6px 0 0" }}>
+              Right: {relationshipDeleteModal.rightLabel || "-"}
+            </div>
+            <div className="actions actions-right modal-actions">
+              <button
+                type="button"
+                className="secondary"
+                onClick={closeRelationshipDeleteModal}
+                disabled={relationshipDeleteModal.busy}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger"
+                onClick={confirmDeleteRelationship}
+                disabled={relationshipDeleteModal.busy}
+              >
+                {relationshipDeleteModal.busy ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {forceStopModal.open ? (
+        <div className="modal-backdrop" onClick={closeForceStopModal}>
+          <div className="modal-card" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
+            <h4 style={{ margin: "0 0 6px" }}>Force Stop Service</h4>
+            <div className="sub" style={{ margin: "0 0 8px" }}>
+              Force stop {forceStopModal.serviceLabel}? This may kill external processes listening on the service ports.
+            </div>
+            <div className="actions actions-right modal-actions">
+              <button type="button" className="secondary" onClick={closeForceStopModal} disabled={forceStopModal.busy}>
+                Cancel
+              </button>
+              <button type="button" className="danger" onClick={confirmForceStopService} disabled={forceStopModal.busy}>
+                {forceStopModal.busy ? "Force stopping..." : "Force Stop"}
+              </button>
+            </div>
           </div>
         </div>
       ) : null}

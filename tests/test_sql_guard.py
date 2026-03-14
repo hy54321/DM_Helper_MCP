@@ -63,6 +63,27 @@ WHERE s.AccountCode = 'Table'
         self.assertFalse(ok)
         self.assertEqual(err, "Multiple statements are not allowed.")
 
+    def test_allows_replace_scalar_function(self) -> None:
+        ok, err = sql_guard.validate("SELECT REPLACE('2025.01.01', '.', '-') AS normalized_date")
+        self.assertTrue(ok, err)
+
+    def test_allows_keyword_in_string_literal(self) -> None:
+        ok, err = sql_guard.validate("SELECT 'create drop load export' AS txt")
+        self.assertTrue(ok, err)
+
+    def test_allows_keyword_in_quoted_identifier(self) -> None:
+        ok, err = sql_guard.validate('SELECT 1 AS "DROP"')
+        self.assertTrue(ok, err)
+
+    def test_allows_keyword_like_cte_name(self) -> None:
+        ok, err = sql_guard.validate("WITH load AS (SELECT 1 AS x) SELECT x FROM load")
+        self.assertTrue(ok, err)
+
+    def test_rejects_destructive_statement_inside_cte(self) -> None:
+        ok, err = sql_guard.validate("WITH bad AS (DELETE FROM t RETURNING *) SELECT * FROM bad")
+        self.assertFalse(ok)
+        self.assertIn("DELETE", err)
+
 
 if __name__ == "__main__":
     unittest.main()

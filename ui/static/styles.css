@@ -1,6 +1,6 @@
 :root {
   --app-shell-top: 14px;
-  --app-header-height: 64px;
+  --app-header-height: 52px;
   --bg: #f4f6f8;
   --card: #ffffff;
   --text: #0f1720;
@@ -40,8 +40,20 @@
   box-sizing: border-box;
 }
 
+html,
+body,
+#root {
+  min-height: 100%;
+  background-color: var(--bg);
+}
+
+#root {
+  min-height: 100vh;
+}
+
 body {
   margin: 0;
+  min-height: 100vh;
   font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
   color: var(--text);
   background: radial-gradient(circle at top right, #d9f6f1 0%, var(--bg) 35%);
@@ -59,8 +71,8 @@ body {
 }
 
 .header {
-  margin-bottom: 0;
-  padding-bottom: 10px;
+  margin-bottom: 8px;
+  padding-bottom: 2px;
   background-color: var(--bg);
 }
 
@@ -77,7 +89,7 @@ body {
   margin-inline: -18px;
   height: var(--app-header-height);
   min-height: var(--app-header-height);
-  padding: 8px 18px;
+  padding: 6px 18px;
   background-color: var(--bg);
   border: 0;
   border-radius: 0;
@@ -409,6 +421,7 @@ button.danger {
   grid-template-columns: 210px minmax(0, 1fr);
   gap: 12px;
   align-items: start;
+  margin-top: 6px;
 }
 
 .sidebar {
@@ -817,6 +830,23 @@ pre {
   table-layout: fixed;
 }
 
+.relationship-mappings-table {
+  table-layout: fixed;
+}
+
+.relationship-mappings-table th:nth-child(1),
+.relationship-mappings-table td:nth-child(1),
+.relationship-mappings-table th:nth-child(2),
+.relationship-mappings-table td:nth-child(2) {
+  width: calc((100% - 180px) / 2);
+}
+
+.relationship-mappings-table th:nth-child(3),
+.relationship-mappings-table td:nth-child(3) {
+  width: 180px;
+  white-space: nowrap;
+}
+
 .jobs-table th,
 .jobs-table td,
 .relationships-table th,
@@ -1035,7 +1065,7 @@ pre {
 
 .catalog-setup-grid {
   display: grid;
-  grid-template-columns: minmax(420px, 1.35fr) minmax(280px, 0.85fr);
+  grid-template-columns: minmax(620px, 1.75fr) minmax(240px, 0.55fr);
   gap: 12px;
   align-items: stretch;
 }
@@ -1045,6 +1075,10 @@ pre {
   display: grid;
   gap: 10px;
   align-content: start;
+}
+
+.catalog-run-panel {
+  gap: 8px;
 }
 
 .catalog-panel-head {
@@ -1088,7 +1122,7 @@ pre {
 
 .catalog-config-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
   gap: 8px;
   align-items: center;
 }
@@ -1100,6 +1134,14 @@ pre {
 .catalog-config-row button {
   width: auto;
   min-width: 96px;
+}
+
+.catalog-config-row .catalog-icon-btn {
+  width: 38px;
+  min-width: 38px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
 }
 
 .catalog-config-meta {
@@ -1146,7 +1188,17 @@ pre {
 
 .catalog-fields-grid {
   display: grid;
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 10px;
+}
+
+.catalog-expose-grid {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-soft) 64%, var(--card));
 }
 
 .catalog-path-input {
@@ -1172,6 +1224,36 @@ pre {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.catalog-run-compact {
+  display: grid;
+  gap: 8px;
+}
+
+.button-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.button-progress-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: buttonSpin 0.8s linear infinite;
+}
+
+@keyframes buttonSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.suggestion-feedback {
+  margin-top: 6px;
 }
 
 .mapping-toolbar {
@@ -1334,6 +1416,112 @@ pre {
   margin-top: 8px;
   color: var(--danger);
   font-size: 12px;
+}
+
+.tool-logs-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.tool-logs-cleanup {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-soft) 62%, var(--card));
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: end;
+  justify-content: space-between;
+}
+
+.tool-logs-cleanup-days {
+  min-width: 210px;
+  max-width: 280px;
+}
+
+.tool-logs-table-wrap {
+  margin-top: 8px;
+}
+
+.tool-logs-table {
+  table-layout: fixed;
+}
+
+.tool-logs-table th,
+.tool-logs-table td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.tool-logs-table th:nth-child(1),
+.tool-logs-table td:nth-child(1) {
+  width: 74px;
+}
+
+.tool-logs-table th:nth-child(2),
+.tool-logs-table td:nth-child(2) {
+  width: 160px;
+}
+
+.tool-logs-table th:nth-child(3),
+.tool-logs-table td:nth-child(3),
+.tool-logs-table th:nth-child(4),
+.tool-logs-table td:nth-child(4) {
+  width: 170px;
+}
+
+.tool-logs-table th:nth-child(5),
+.tool-logs-table td:nth-child(5) {
+  width: 100px;
+}
+
+.tool-log-status-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 52px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tool-log-status-pill.ok {
+  color: #0d6a62;
+  border-color: rgba(15, 118, 110, 0.45);
+  background: rgba(15, 118, 110, 0.12);
+}
+
+.tool-log-status-pill.error {
+  color: #a23131;
+  border-color: rgba(180, 35, 24, 0.42);
+  background: rgba(180, 35, 24, 0.11);
+}
+
+:root[data-theme="dark"] .tool-log-status-pill.ok {
+  color: #9de3da;
+  border-color: rgba(61, 186, 173, 0.45);
+  background: rgba(61, 186, 173, 0.16);
+}
+
+:root[data-theme="dark"] .tool-log-status-pill.error {
+  color: #f3a8a8;
+  border-color: rgba(207, 75, 75, 0.45);
+  background: rgba(207, 75, 75, 0.17);
+}
+
+.tool-log-json {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .settings-collapsible {
@@ -1711,6 +1899,20 @@ pre {
     min-width: 0;
   }
 
+  .catalog-config-row .catalog-icon-btn {
+    width: 38px;
+    min-width: 38px;
+    justify-self: end;
+  }
+
+  .catalog-fields-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .catalog-expose-grid {
+    grid-template-columns: 1fr;
+  }
+
   .mcp-auth-row {
     grid-template-columns: 1fr;
   }
@@ -1777,6 +1979,24 @@ pre {
 
   .anthropic-model-lookup-btn {
     width: 100%;
+  }
+
+  .tool-logs-filter-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .tool-logs-cleanup {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .tool-logs-cleanup-days {
+    min-width: 0;
+    max-width: none;
+  }
+
+  .tool-logs-table {
+    table-layout: auto;
   }
 
 }

@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 REL_FIELD_JOIN_TOKEN = "|||"
+DATASET_SIDES = ("source", "target", "configurations", "translations", "rules")
+RELATIONSHIP_SIDES = DATASET_SIDES + ("cross",)
 
 
 def _app_base_dir() -> str:
@@ -51,7 +53,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS datasets (
             id          TEXT PRIMARY KEY,
-            side        TEXT NOT NULL CHECK(side IN ('source', 'target')),
+            side        TEXT NOT NULL CHECK(side IN ('source', 'target', 'configurations', 'translations', 'rules')),
             file_name   TEXT NOT NULL,
             file_path   TEXT NOT NULL,
             file_size   INTEGER,
@@ -144,9 +146,34 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_reports_job_id
             ON reports(job_id);
 
+        -- —— Tool Call Logs ———————————————————————————————————————————————
+
+        CREATE TABLE IF NOT EXISTS tool_call_logs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            source          TEXT NOT NULL DEFAULT 'claude_chat',
+            request_id      TEXT NOT NULL DEFAULT '',
+            tool_name       TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok', 'error')),
+            request_payload_json TEXT NOT NULL DEFAULT '{}',
+            response_payload TEXT NOT NULL DEFAULT '',
+            error_message   TEXT NOT NULL DEFAULT '',
+            called_at       TEXT NOT NULL,
+            responded_at    TEXT NOT NULL,
+            duration_ms     INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tool_call_logs_called_at
+            ON tool_call_logs(called_at DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_tool_call_logs_status_called
+            ON tool_call_logs(status, called_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_tool_call_logs_tool_called
+            ON tool_call_logs(tool_name, called_at DESC);
+
         CREATE TABLE IF NOT EXISTS dataset_relationships (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            side          TEXT NOT NULL CHECK(side IN ('source', 'target')),
+            side          TEXT NOT NULL CHECK(side IN ('source', 'target', 'configurations', 'translations', 'rules', 'cross')),
             left_dataset  TEXT NOT NULL,
             left_field    TEXT NOT NULL,
             left_fields_json TEXT NOT NULL DEFAULT '[]',
@@ -196,7 +223,244 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE dataset_relationships ADD COLUMN left_fields_json TEXT NOT NULL DEFAULT '[]'")
     if "right_fields_json" not in rel_cols:
         conn.execute("ALTER TABLE dataset_relationships ADD COLUMN right_fields_json TEXT NOT NULL DEFAULT '[]'")
+    _migrate_dataset_side_constraint(conn)
+    _repair_pairs_dataset_foreign_keys(conn)
+    _migrate_relationship_side_constraint(conn)
     conn.commit()
+
+
+def _table_ddl(conn: sqlite3.Connection, table_name: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return str((row["sql"] if row else "") or "").lower()
+
+
+def _ddl_contains_sides(table_ddl: str, allowed: tuple[str, ...]) -> bool:
+    if not table_ddl:
+        return False
+    return all(f"'{side}'" in table_ddl for side in allowed)
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return bool(row)
+
+
+def _foreign_key_targets(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    if not _table_exists(conn, table_name):
+        return set()
+    rows = conn.execute(f"PRAGMA foreign_key_list({table_name})").fetchall()
+    targets: set[str] = set()
+    for row in rows:
+        value = row["table"] if isinstance(row, sqlite3.Row) else row[2]
+        targets.add(str(value or "").strip().lower())
+    return targets
+
+
+def _repair_pairs_dataset_foreign_keys(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "pairs"):
+        return
+
+    fk_targets = _foreign_key_targets(conn, "pairs")
+    needs_rebuild = (
+        "datasets__old" in fk_targets
+        or (bool(fk_targets) and "datasets" not in fk_targets)
+        or (not fk_targets)
+    )
+    if not needs_rebuild:
+        return
+
+    pair_cols = {r["name"] for r in conn.execute("PRAGMA table_info(pairs)").fetchall()}
+    id_expr = "id" if "id" in pair_cols else "''"
+    source_expr = "source_dataset" if "source_dataset" in pair_cols else "''"
+    target_expr = "target_dataset" if "target_dataset" in pair_cols else "''"
+    auto_expr = "auto_matched" if "auto_matched" in pair_cols else "1"
+    enabled_expr = "enabled" if "enabled" in pair_cols else "1"
+    key_expr = "COALESCE(key_mappings_json, '[]')" if "key_mappings_json" in pair_cols else "'[]'"
+    compare_expr = "COALESCE(compare_mappings_json, '[]')" if "compare_mappings_json" in pair_cols else "'[]'"
+    created_expr = "created_at" if "created_at" in pair_cols else f"'{utcnow()}'"
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("DROP TABLE IF EXISTS pairs__new")
+        conn.execute(
+            """
+            CREATE TABLE pairs__new (
+                id              TEXT PRIMARY KEY,
+                source_dataset  TEXT NOT NULL,
+                target_dataset  TEXT NOT NULL,
+                auto_matched    INTEGER NOT NULL DEFAULT 1,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                key_mappings_json TEXT NOT NULL DEFAULT '[]',
+                compare_mappings_json TEXT NOT NULL DEFAULT '[]',
+                created_at      TEXT NOT NULL,
+                FOREIGN KEY (source_dataset) REFERENCES datasets(id) ON DELETE CASCADE,
+                FOREIGN KEY (target_dataset) REFERENCES datasets(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO pairs__new (
+                id, source_dataset, target_dataset, auto_matched, enabled,
+                key_mappings_json, compare_mappings_json, created_at
+            )
+            SELECT
+                {id_expr},
+                {source_expr},
+                {target_expr},
+                {auto_expr},
+                {enabled_expr},
+                {key_expr},
+                {compare_expr},
+                {created_expr}
+            FROM pairs
+            """
+        )
+        conn.execute("DROP TABLE pairs")
+        conn.execute("ALTER TABLE pairs__new RENAME TO pairs")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pairs_unique ON pairs(source_dataset, target_dataset)")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_dataset_side_constraint(conn: sqlite3.Connection) -> None:
+    if _ddl_contains_sides(_table_ddl(conn, "datasets"), DATASET_SIDES):
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("ALTER TABLE datasets RENAME TO datasets__old")
+        conn.execute(
+            """
+            CREATE TABLE datasets (
+                id          TEXT PRIMARY KEY,
+                side        TEXT NOT NULL CHECK(side IN ('source', 'target', 'configurations', 'translations', 'rules')),
+                file_name   TEXT NOT NULL,
+                file_path   TEXT NOT NULL,
+                file_size   INTEGER,
+                file_mtime_ns INTEGER,
+                sheet_name  TEXT NOT NULL DEFAULT '',
+                ext         TEXT NOT NULL DEFAULT '',
+                columns_json TEXT NOT NULL DEFAULT '[]',
+                raw_columns_json TEXT NOT NULL DEFAULT '[]',
+                column_map_json TEXT NOT NULL DEFAULT '{}',
+                csv_encoding TEXT NOT NULL DEFAULT '',
+                row_count   INTEGER,
+                discovered_at TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO datasets (
+                id, side, file_name, file_path, file_size, file_mtime_ns,
+                sheet_name, ext, columns_json, raw_columns_json, column_map_json,
+                csv_encoding, row_count, discovered_at, updated_at
+            )
+            SELECT
+                id,
+                CASE
+                    WHEN lower(trim(side)) IN ('source', 'target', 'configurations', 'translations', 'rules')
+                        THEN lower(trim(side))
+                    ELSE 'source'
+                END AS side,
+                file_name,
+                file_path,
+                file_size,
+                file_mtime_ns,
+                sheet_name,
+                ext,
+                columns_json,
+                raw_columns_json,
+                column_map_json,
+                csv_encoding,
+                row_count,
+                discovered_at,
+                updated_at
+            FROM datasets__old
+            """
+        )
+        conn.execute("DROP TABLE datasets__old")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_side ON datasets(side)")
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_relationship_side_constraint(conn: sqlite3.Connection) -> None:
+    if _ddl_contains_sides(_table_ddl(conn, "dataset_relationships"), RELATIONSHIP_SIDES):
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute("ALTER TABLE dataset_relationships RENAME TO dataset_relationships__old")
+        conn.execute(
+            """
+            CREATE TABLE dataset_relationships (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                side          TEXT NOT NULL CHECK(side IN ('source', 'target', 'configurations', 'translations', 'rules', 'cross')),
+                left_dataset  TEXT NOT NULL,
+                left_field    TEXT NOT NULL,
+                left_fields_json TEXT NOT NULL DEFAULT '[]',
+                right_dataset TEXT NOT NULL,
+                right_field   TEXT NOT NULL,
+                right_fields_json TEXT NOT NULL DEFAULT '[]',
+                confidence    REAL NOT NULL DEFAULT 1.0,
+                method        TEXT NOT NULL DEFAULT 'manual',
+                active        INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                FOREIGN KEY (left_dataset) REFERENCES datasets(id) ON DELETE CASCADE,
+                FOREIGN KEY (right_dataset) REFERENCES datasets(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO dataset_relationships (
+                id, side, left_dataset, left_field, left_fields_json,
+                right_dataset, right_field, right_fields_json,
+                confidence, method, active, created_at, updated_at
+            )
+            SELECT
+                id,
+                CASE
+                    WHEN lower(trim(side)) IN ('source', 'target', 'configurations', 'translations', 'rules', 'cross')
+                        THEN lower(trim(side))
+                    ELSE 'cross'
+                END AS side,
+                left_dataset,
+                left_field,
+                COALESCE(left_fields_json, '[]'),
+                right_dataset,
+                right_field,
+                COALESCE(right_fields_json, '[]'),
+                confidence,
+                method,
+                active,
+                created_at,
+                updated_at
+            FROM dataset_relationships__old
+            """
+        )
+        conn.execute("DROP TABLE dataset_relationships__old")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_relationships_unique "
+            "ON dataset_relationships(side, left_dataset, left_field, right_dataset, right_field)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dataset_relationships_side ON dataset_relationships(side)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_relationships_side_updated "
+            "ON dataset_relationships(side, updated_at DESC, id DESC)"
+        )
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -282,7 +546,7 @@ def list_datasets(
     sql = "SELECT * FROM datasets"
     params: list = []
     clauses: list[str] = []
-    if side and side in ("source", "target"):
+    if side:
         clauses.append("side = ?")
         params.append(side)
     if filter_text:
@@ -722,6 +986,152 @@ def _row_to_report(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
+def create_tool_call_log(
+    conn: sqlite3.Connection,
+    *,
+    source: str = "claude_chat",
+    request_id: str = "",
+    tool_name: str,
+    status: str = "ok",
+    request_payload: Dict[str, Any] | List[Any] | str | None = None,
+    response_payload: str = "",
+    error_message: str = "",
+    called_at: str,
+    responded_at: str,
+    duration_ms: int = 0,
+    commit: bool = True,
+) -> int:
+    normalized_status = "error" if str(status).strip().lower() == "error" else "ok"
+    payload_json = (
+        request_payload
+        if isinstance(request_payload, str)
+        else json.dumps(request_payload if request_payload is not None else {})
+    )
+    cur = conn.execute(
+        """
+        INSERT INTO tool_call_logs (
+            source, request_id, tool_name, status,
+            request_payload_json, response_payload, error_message,
+            called_at, responded_at, duration_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(source or "claude_chat").strip() or "claude_chat",
+            str(request_id or "").strip(),
+            str(tool_name or "").strip(),
+            normalized_status,
+            payload_json,
+            str(response_payload or ""),
+            str(error_message or ""),
+            str(called_at or ""),
+            str(responded_at or ""),
+            int(max(0, duration_ms)),
+        ),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.lastrowid or 0)
+
+
+def list_tool_call_logs(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 200,
+    offset: int = 0,
+    status: str | None = None,
+    tool_name: str | None = None,
+    contains: str | None = None,
+    called_since: str | None = None,
+) -> tuple[List[Dict[str, Any]], int]:
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    normalized_status = (status or "").strip().lower()
+    if normalized_status in ("ok", "error"):
+        clauses.append("status = ?")
+        params.append(normalized_status)
+
+    normalized_tool_name = (tool_name or "").strip()
+    if normalized_tool_name:
+        clauses.append("lower(tool_name) = lower(?)")
+        params.append(normalized_tool_name)
+
+    text_filter = (contains or "").strip()
+    if text_filter:
+        like = f"%{text_filter}%"
+        clauses.append(
+            "(tool_name LIKE ? OR request_payload_json LIKE ? OR response_payload LIKE ? OR error_message LIKE ?)"
+        )
+        params.extend([like, like, like, like])
+
+    since = (called_since or "").strip()
+    if since:
+        clauses.append("called_at >= ?")
+        params.append(since)
+
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    count_row = conn.execute(
+        f"SELECT COUNT(*) AS total FROM tool_call_logs{where}",
+        params,
+    ).fetchone()
+    total = int((count_row["total"] if count_row else 0) or 0)
+
+    capped_limit = max(1, min(int(limit), 1000))
+    safe_offset = max(0, int(offset))
+    rows = conn.execute(
+        f"""
+        SELECT *
+        FROM tool_call_logs
+        {where}
+        ORDER BY called_at DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        [*params, capped_limit, safe_offset],
+    ).fetchall()
+    return ([_row_to_tool_call_log(r) for r in rows], total)
+
+
+def list_tool_call_log_names(conn: sqlite3.Connection) -> List[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT tool_name FROM tool_call_logs WHERE tool_name <> '' ORDER BY lower(tool_name)"
+    ).fetchall()
+    return [str(r["tool_name"]) for r in rows if r["tool_name"]]
+
+
+def delete_tool_call_logs(conn: sqlite3.Connection) -> int:
+    cur = conn.execute("DELETE FROM tool_call_logs")
+    conn.commit()
+    return int(cur.rowcount or 0)
+
+
+def delete_tool_call_logs_older_than(conn: sqlite3.Connection, called_before: str) -> int:
+    cur = conn.execute("DELETE FROM tool_call_logs WHERE called_at < ?", (called_before,))
+    conn.commit()
+    return int(cur.rowcount or 0)
+
+
+def _row_to_tool_call_log(row: sqlite3.Row) -> Dict[str, Any]:
+    raw_payload = row["request_payload_json"] if "request_payload_json" in row.keys() else "{}"
+    try:
+        request_payload = json.loads(raw_payload or "{}")
+    except Exception:
+        request_payload = raw_payload or "{}"
+    return {
+        "id": row["id"],
+        "source": row["source"],
+        "request_id": row["request_id"],
+        "tool_name": row["tool_name"],
+        "status": row["status"],
+        "request_payload": request_payload,
+        "response_payload": row["response_payload"],
+        "error_message": row["error_message"],
+        "called_at": row["called_at"],
+        "responded_at": row["responded_at"],
+        "duration_ms": int(row["duration_ms"] or 0),
+    }
+
+
 def _row_to_relationship(row: sqlite3.Row) -> Dict[str, Any]:
     raw_left_field = row["left_field"]
     raw_right_field = row["right_field"]
@@ -875,7 +1285,7 @@ def list_relationships(
     sql = "SELECT * FROM dataset_relationships"
     params: list[Any] = []
     clauses: list[str] = []
-    if side in ("source", "target"):
+    if side:
         clauses.append("side = ?")
         params.append(side)
     if dataset_id:
