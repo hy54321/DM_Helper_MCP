@@ -237,6 +237,102 @@ def test_auto_link_relationships_supports_dataset_to_folder_scope(monkeypatch, t
     assert created["right_field"] == "HEADER_REF"
 
 
+def test_auto_link_relationships_accepts_sparse_fk_candidate_without_marking_compare_key(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    cfg_csv = tmp_path / "config_price_groups.csv"
+    tgt_csv = tmp_path / "target_customers_sparse_price_group.csv"
+    cfg_csv.write_text(
+        "Price_groups,Description\n"
+        "PG-A,Group A\n"
+        "PG-B,Group B\n"
+        "PG-C,Group C\n"
+        "PG-D,Group D\n",
+        encoding="utf-8",
+    )
+    tgt_csv.write_text(
+        "CUSTOMERACCOUNT,DISCOUNTPRICEGROUPID\n"
+        "C0001,PG-A\n"
+        "C0002,\n"
+        "C0003,\n"
+        "C0004,PG-B\n"
+        "C0005,\n"
+        "C0006,\n"
+        "C0007,PG-C\n"
+        "C0008,\n"
+        "C0009,\n"
+        "C0010,PG-D\n",
+        encoding="utf-8",
+    )
+
+    conn = db.get_connection(path=str(db_path))
+    try:
+        _register_csv_dataset(
+            conn,
+            "configurations_price_groups_Sheet1",
+            "configurations",
+            cfg_csv,
+            ["Price_groups", "Description"],
+        )
+        _register_csv_dataset(
+            conn,
+            "target_SLS_Customers_V3_Customers_V3",
+            "target",
+            tgt_csv,
+            ["CUSTOMERACCOUNT", "DISCOUNTPRICEGROUPID"],
+        )
+    finally:
+        conn.close()
+
+    quick_map = client.get(
+        "/api/pairs/quick-map",
+        params={
+            "source_dataset_id": "configurations_price_groups_Sheet1",
+            "target_dataset_id": "target_SLS_Customers_V3_Customers_V3",
+            "mode": "content",
+            "min_confidence": 0.6,
+        },
+    )
+    assert quick_map.status_code == 200
+    mappings = quick_map.json()["compare_mappings"]
+    price_mapping = next(
+        m
+        for m in mappings
+        if m["source_field"] == "Price_groups" and m["target_field"] == "DISCOUNTPRICEGROUPID"
+    )
+    assert price_mapping["is_key_pair"] is False
+    assert price_mapping["use_key"] is False
+    assert price_mapping["is_relationship_pair"] is True
+
+    response = client.post(
+        "/api/relationships/auto-link",
+        json={
+            "left_side": "configurations",
+            "right_side": "target",
+            "min_confidence": 0.6,
+            "max_links": 100,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["applied_count"] == 1
+
+    rows_response = client.get("/api/relationships", params={"limit": 200})
+    assert rows_response.status_code == 200
+    rows = rows_response.json()
+    created = next(
+        r
+        for r in rows
+        if r["left_dataset"] == "configurations_price_groups_Sheet1"
+        and r["right_dataset"] == "target_SLS_Customers_V3_Customers_V3"
+    )
+    assert created["left_field"] == "Price_groups"
+    assert created["right_field"] == "DISCOUNTPRICEGROUPID"
+
+
 def test_auto_link_relationships_supports_name_mode(monkeypatch, tmp_path: Path) -> None:
     ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
     client = TestClient(ui_api.app)

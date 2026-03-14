@@ -1,5 +1,6 @@
 const { useEffect, useRef, useState } = React;
 const THEME_STORAGE_KEY = "protoquery_theme";
+const CHAT_PROVIDER_STORAGE_KEY = "protoquery_chat_provider";
 const NEW_FOLDER_CONFIG_OPTION_ID = "__new__";
 
 async function api(path, options = {}) {
@@ -137,10 +138,194 @@ function getStoredTheme() {
   return "dark";
 }
 
+function getStoredChatProvider() {
+  try {
+    const stored = localStorage.getItem(CHAT_PROVIDER_STORAGE_KEY);
+    if (stored === "anthropic" || stored === "openai") {
+      return stored;
+    }
+  } catch (_err) {
+    // Ignore localStorage access issues and fallback.
+  }
+  return "";
+}
+
+function resolveChatProvider({
+  anthropicActive,
+  openaiActive,
+  lastProvider,
+}) {
+  const hasAnthropic = !!anthropicActive;
+  const hasOpenAi = !!openaiActive;
+  if (hasAnthropic && hasOpenAi) {
+    if (lastProvider === "openai" || lastProvider === "anthropic") {
+      return lastProvider;
+    }
+    return "anthropic";
+  }
+  if (hasAnthropic) return "anthropic";
+  if (hasOpenAi) return "openai";
+  return "";
+}
+
 function displayValue(value) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "object") return JSON.stringify(value);
   return String(formatDateTimeToSeconds(value));
+}
+
+function renderInlineMarkdown(text, keyPrefix = "md-inline") {
+  const source = String(text || "");
+  if (!source) return [];
+  const pattern = /(`[^`]+`)|(\[[^\]]+\]\((https?:\/\/[^\s)]+)\))|(\*\*[^*]+\*\*)|(\*[^*]+\*)/g;
+  const nodes = [];
+  let lastIdx = 0;
+  let match;
+  let idx = 0;
+  while ((match = pattern.exec(source)) !== null) {
+    if (match.index > lastIdx) {
+      nodes.push(source.slice(lastIdx, match.index));
+    }
+    const token = match[0];
+    if (token.startsWith("`") && token.endsWith("`")) {
+      nodes.push(<code key={`${keyPrefix}-code-${idx}`}>{token.slice(1, -1)}</code>);
+    } else if (token.startsWith("[") && token.includes("](") && token.endsWith(")")) {
+      const closeBracket = token.indexOf("](");
+      const label = token.slice(1, closeBracket);
+      const href = token.slice(closeBracket + 2, -1);
+      nodes.push(
+        <a key={`${keyPrefix}-a-${idx}`} href={href} target="_blank" rel="noopener noreferrer">
+          {label || href}
+        </a>
+      );
+    } else if (token.startsWith("**") && token.endsWith("**")) {
+      nodes.push(<strong key={`${keyPrefix}-strong-${idx}`}>{token.slice(2, -2)}</strong>);
+    } else if (token.startsWith("*") && token.endsWith("*")) {
+      nodes.push(<em key={`${keyPrefix}-em-${idx}`}>{token.slice(1, -1)}</em>);
+    } else {
+      nodes.push(token);
+    }
+    lastIdx = pattern.lastIndex;
+    idx += 1;
+  }
+  if (lastIdx < source.length) {
+    nodes.push(source.slice(lastIdx));
+  }
+  return nodes;
+}
+
+function renderMarkdownContent(text, keyPrefix = "md") {
+  const source = String(text || "");
+  const lines = source.replace(/\r\n/g, "\n").split("\n");
+  const nodes = [];
+  let i = 0;
+  let blockIdx = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i += 1;
+      continue;
+    }
+
+    if (line.trim().startsWith("```")) {
+      const lang = line.trim().slice(3).trim();
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !lines[i].trim().startsWith("```")) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length && lines[i].trim().startsWith("```")) i += 1;
+      nodes.push(
+        <pre key={`${keyPrefix}-pre-${blockIdx}`} className="chat-md-pre">
+          {lang ? <div className="chat-md-lang">{lang}</div> : null}
+          <code>{codeLines.join("\n")}</code>
+        </pre>
+      );
+      blockIdx += 1;
+      continue;
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    if (headingMatch) {
+      const level = Math.min(6, headingMatch[1].length);
+      const Tag = `h${level}`;
+      nodes.push(<Tag key={`${keyPrefix}-h-${blockIdx}`}>{renderInlineMarkdown(headingMatch[2], `${keyPrefix}-h-${blockIdx}`)}</Tag>);
+      blockIdx += 1;
+      i += 1;
+      continue;
+    }
+
+    if (/^>\s+/.test(line)) {
+      const quoteLines = [];
+      while (i < lines.length && /^>\s+/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^>\s+/, ""));
+        i += 1;
+      }
+      nodes.push(
+        <blockquote key={`${keyPrefix}-q-${blockIdx}`}>
+          {quoteLines.map((q, qIdx) => (
+            <p key={`${keyPrefix}-q-${blockIdx}-${qIdx}`}>{renderInlineMarkdown(q, `${keyPrefix}-q-${blockIdx}-${qIdx}`)}</p>
+          ))}
+        </blockquote>
+      );
+      blockIdx += 1;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^[-*]\s+/, ""));
+        i += 1;
+      }
+      nodes.push(
+        <ul key={`${keyPrefix}-ul-${blockIdx}`}>
+          {items.map((item, itemIdx) => (
+            <li key={`${keyPrefix}-ul-${blockIdx}-${itemIdx}`}>{renderInlineMarkdown(item, `${keyPrefix}-ul-${blockIdx}-${itemIdx}`)}</li>
+          ))}
+        </ul>
+      );
+      blockIdx += 1;
+      continue;
+    }
+
+    if (/^\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\d+\.\s+/, ""));
+        i += 1;
+      }
+      nodes.push(
+        <ol key={`${keyPrefix}-ol-${blockIdx}`}>
+          {items.map((item, itemIdx) => (
+            <li key={`${keyPrefix}-ol-${blockIdx}-${itemIdx}`}>{renderInlineMarkdown(item, `${keyPrefix}-ol-${blockIdx}-${itemIdx}`)}</li>
+          ))}
+        </ol>
+      );
+      blockIdx += 1;
+      continue;
+    }
+
+    const paragraphLines = [line];
+    i += 1;
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6})\s+/.test(lines[i]) && !/^>\s+/.test(lines[i]) && !/^[-*]\s+/.test(lines[i]) && !/^\d+\.\s+/.test(lines[i]) && !lines[i].trim().startsWith("```")) {
+      paragraphLines.push(lines[i]);
+      i += 1;
+    }
+    nodes.push(
+      <p key={`${keyPrefix}-p-${blockIdx}`}>
+        {renderInlineMarkdown(paragraphLines.join(" "), `${keyPrefix}-p-${blockIdx}`)}
+      </p>
+    );
+    blockIdx += 1;
+  }
+
+  if (!nodes.length) {
+    return <p>{displayValue(text)}</p>;
+  }
+  return nodes;
 }
 
 function formatPrettyJson(value) {
@@ -241,7 +426,7 @@ function buildInspectorEmbedUrl(baseUrl, mcpPort) {
 }
 
 const SUMMARY_TOP_N = 10;
-const DEFAULT_CLAUDE_INSTRUCTIONS = `You are a Data Migration Assistant using MCP server
+const DEFAULT_CLAUDE_INSTRUCTIONS = `You are a Data Migration Assistant using MCP server that is accessing local files via DuckDB
 
 Mission:
 Reconcile source vs target datasets with tool-based evidence only.
@@ -256,23 +441,22 @@ Operating policy:
    - \`compare_tables\` to respond to user with summary of findings.
    - \`start_comparison_job\` -> \`get_job_status\` -> \`get_job_summary\` to trigger creation of comparison excel report.
 7. Never claim source/target data was modified.
-8. Only run \`upsert_pair_override\` if user explicitly asks.
-9. If a cross join query is required checl links using 'get_dataset_links'.
+8. If a cross join query is required check links using 'get_dataset_links'.
 
 Default workflow:
-- Discovery: \`refresh_catalog\`, \`list_datasets\`, use \`list_table_pairs\` to find out which datasets are paired, use \`list_field_pairs\` to find out field and unique index pairings with the pair_id from 'list_table_pairs', \`row_count_summary\` (per dataset_id)
+- Discovery: \`refresh_catalog\`, \`list_datasets\`, use \`list_table_pairs\` to find out which datasets are paired, use \`list_field_pairs\` to find out field and unique index pairings with the pair_id from 'list_table_pairs', you can also use \`get_dataset_links\` to explore the datasets linked to a dataset, \`row_count_summary\` to get row count.
 - Profiling: \`list_fields\`, \`data_profile\`, \`column_value_summary\`
 - Optional profiling: \`find_duplicates\`, \`value_distribution\`, \`preview_filtered_records\`
-- Comparison: \`schema_diff\`, \`suggest_keys\`, \`compare_tables\` or async job flow, \`compare_field\`
+- Comparison: \`schema_diff\`, \`suggest_keys\`, \`compare_tables\` , \`compare_field\`
 - Reporting:
   - If user asks a report on a single table/dataset/file then use \`export_column_value_summary\` for Excel-style Top N + Blanks
-  - \`export_query\` for custom SQL results exports only.
+  - \`export_query\` for custom SQL results exports to Excel.
   - \`list_reports\`, \`get_report_metadata\`
 
 SQL rules:
 - Use \`run_sql_preview\` for read-only exploration.
 - Keep SQL minimal and purpose-driven.
-- Use \`export_query\` for full export requests.
+- Use \`export_query\` for full export requests to Excel.
 - On SQL error, explain cause and provide corrected next call.
 
 Response format (always):
@@ -286,6 +470,7 @@ Error recovery:
 - Column not found -> \`list_fields\`, propose valid columns
 - Schema drift issue -> report drift, recommend compare field subset/mapping
 - Long job -> poll \`get_job_status\` and report progress`;
+const DEFAULT_OPENAI_INSTRUCTIONS = DEFAULT_CLAUDE_INSTRUCTIONS;
 
 function App() {
   const [tab, setTab] = useState("catalog");
@@ -432,6 +617,11 @@ function App() {
   const [settingsApiKeySet, setSettingsApiKeySet] = useState(false);
   const [settingsApiKeyNeedsReset, setSettingsApiKeyNeedsReset] = useState(false);
   const [settingsApiKeyActivated, setSettingsApiKeyActivated] = useState(false);
+  const [settingsOpenAiApiKeyInput, setSettingsOpenAiApiKeyInput] = useState("");
+  const [settingsOpenAiApiKeyMasked, setSettingsOpenAiApiKeyMasked] = useState("");
+  const [settingsOpenAiApiKeySet, setSettingsOpenAiApiKeySet] = useState(false);
+  const [settingsOpenAiApiKeyNeedsReset, setSettingsOpenAiApiKeyNeedsReset] = useState(false);
+  const [settingsOpenAiApiKeyActivated, setSettingsOpenAiApiKeyActivated] = useState(false);
   const [settingsNgrokTokenInput, setSettingsNgrokTokenInput] = useState("");
   const [settingsNgrokTokenMasked, setSettingsNgrokTokenMasked] = useState("");
   const [settingsNgrokTokenSet, setSettingsNgrokTokenSet] = useState(false);
@@ -444,15 +634,24 @@ function App() {
   const [settingsMcpGeneratedApiKey, setSettingsMcpGeneratedApiKey] = useState("");
   const [settingsModel, setSettingsModel] = useState("");
   const [settingsModels, setSettingsModels] = useState([]);
+  const [settingsOpenAiModel, setSettingsOpenAiModel] = useState("");
+  const [settingsOpenAiModels, setSettingsOpenAiModels] = useState([]);
   const [settingsClaudeInstructions, setSettingsClaudeInstructions] = useState("");
+  const [settingsOpenAiInstructions, setSettingsOpenAiInstructions] = useState("");
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsValidating, setSettingsValidating] = useState(false);
   const [settingsLoadingModels, setSettingsLoadingModels] = useState(false);
+  const [settingsOpenAiValidating, setSettingsOpenAiValidating] = useState(false);
+  const [settingsOpenAiLoadingModels, setSettingsOpenAiLoadingModels] = useState(false);
   const [settingsGeneratingMcpApiKey, setSettingsGeneratingMcpApiKey] = useState(false);
-  const [claudeMessages, setClaudeMessages] = useState([]);
-  const [claudeInput, setClaudeInput] = useState("");
-  const [claudeSending, setClaudeSending] = useState(false);
-  const [claudeInlineError, setClaudeInlineError] = useState("");
+  const [chatProvider, setChatProvider] = useState("anthropic");
+  const [chatMessagesByProvider, setChatMessagesByProvider] = useState({
+    anthropic: [],
+    openai: [],
+  });
+  const [chatInput, setChatInput] = useState("");
+  const [chatSending, setChatSending] = useState(false);
+  const [chatInlineError, setChatInlineError] = useState("");
   const [toolLogs, setToolLogs] = useState([]);
   const [toolLogTotal, setToolLogTotal] = useState(0);
   const [toolLogNames, setToolLogNames] = useState([]);
@@ -465,6 +664,7 @@ function App() {
   const [toolLogCleaning, setToolLogCleaning] = useState(false);
   const relationshipSuggestStopRef = useRef(false);
   const relationshipSuggestAbortRef = useRef(null);
+  const chatWindowRef = useRef(null);
 
   function applyAppSettings(payload) {
     const safe = payload && typeof payload === "object" ? payload : {};
@@ -478,11 +678,24 @@ function App() {
             display_name: String(m.display_name || m.id || "").trim(),
           }))
       : [];
+    const cachedOpenAiModels = Array.isArray(safe.openai_models)
+      ? safe.openai_models
+          .filter((m) => m && typeof m === "object" && String(m.id || "").trim())
+          .map((m) => ({
+            id: String(m.id || "").trim(),
+            display_name: String(m.display_name || m.id || "").trim(),
+          }))
+      : [];
     setSettingsModels(cachedModels);
+    setSettingsOpenAiModels(cachedOpenAiModels);
     setSettingsApiKeySet(!!safe.anthropic_api_key_set);
     setSettingsApiKeyMasked(String(safe.anthropic_api_key_masked || ""));
     setSettingsApiKeyNeedsReset(!!safe.anthropic_api_key_needs_reset);
     setSettingsApiKeyActivated(!!safe.anthropic_api_key_activated);
+    setSettingsOpenAiApiKeySet(!!safe.openai_api_key_set);
+    setSettingsOpenAiApiKeyMasked(String(safe.openai_api_key_masked || ""));
+    setSettingsOpenAiApiKeyNeedsReset(!!safe.openai_api_key_needs_reset);
+    setSettingsOpenAiApiKeyActivated(!!safe.openai_api_key_activated);
     setSettingsNgrokTokenSet(!!safe.ngrok_authtoken_set);
     setSettingsNgrokTokenMasked(String(safe.ngrok_authtoken_masked || ""));
     setSettingsNgrokTokenNeedsReset(!!safe.ngrok_authtoken_needs_reset);
@@ -492,7 +705,9 @@ function App() {
     setSettingsMcpApiKeyMasked(String(safe.mcp_api_key_masked || ""));
     setSettingsMcpApiKeyNeedsReset(!!safe.mcp_api_key_needs_reset);
     setSettingsModel(String(safe.model || ""));
+    setSettingsOpenAiModel(String(safe.openai_model || ""));
     setSettingsClaudeInstructions(String(safe.claude_instructions || ""));
+    setSettingsOpenAiInstructions(String(safe.openai_instructions || ""));
   }
 
   function applyFolderConfigs(payload) {
@@ -833,15 +1048,50 @@ function App() {
   }, [tab, serviceState]);
 
   useEffect(() => {
-    if (tab === "claude" && !settingsApiKeyActivated) {
+    if (tab === "chat" && !settingsApiKeyActivated && !settingsOpenAiApiKeyActivated) {
       setTab("settings");
     }
-  }, [tab, settingsApiKeyActivated]);
+  }, [tab, settingsApiKeyActivated, settingsOpenAiApiKeyActivated]);
+
+  useEffect(() => {
+    const nextProvider = resolveChatProvider({
+      anthropicActive: settingsApiKeyActivated,
+      openaiActive: settingsOpenAiApiKeyActivated,
+      lastProvider: getStoredChatProvider(),
+    });
+    if (!nextProvider) return;
+    setChatProvider((prev) => {
+      if (prev === nextProvider) return prev;
+      return nextProvider;
+    });
+  }, [settingsApiKeyActivated, settingsOpenAiApiKeyActivated]);
+
+  useEffect(() => {
+    if (chatProvider !== "anthropic" && chatProvider !== "openai") return;
+    try {
+      localStorage.setItem(CHAT_PROVIDER_STORAGE_KEY, chatProvider);
+    } catch (_err) {
+      // Ignore localStorage write issues.
+    }
+  }, [chatProvider]);
 
   useEffect(() => {
     if (tab !== "logs") return;
     loadToolLogs({ silent: true });
   }, [tab]);
+
+  useEffect(() => {
+    if (tab !== "chat") return;
+    const provider = resolveChatProvider({
+      anthropicActive: settingsApiKeyActivated,
+      openaiActive: settingsOpenAiApiKeyActivated,
+      lastProvider: chatProvider,
+    });
+    if (!provider) return;
+    const el = chatWindowRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [tab, chatProvider, chatMessagesByProvider, settingsApiKeyActivated, settingsOpenAiApiKeyActivated]);
 
   useEffect(() => {
     const ds = datasets.find((d) => d.id === profileDataset);
@@ -1262,6 +1512,64 @@ function App() {
     }
   }
 
+  async function onValidateOpenAiKey() {
+    const key = String(settingsOpenAiApiKeyInput || "").trim();
+    if (!key && !settingsOpenAiApiKeySet) {
+      setError("Enter and save an OpenAI API key before validating.");
+      return;
+    }
+    setError("");
+    setSettingsOpenAiValidating(true);
+    setStatus("Validating OpenAI API key...");
+    try {
+      const res = await api("/api/settings/openai/validate", {
+        method: "POST",
+        body: JSON.stringify({ api_key: key }),
+      });
+      if (res?.app_settings) {
+        applyAppSettings(res.app_settings);
+      }
+      setStatus(res?.message || "OpenAI API key is valid.");
+    } catch (err) {
+      setError(err.message);
+      setStatus("OpenAI API key validation failed.");
+    } finally {
+      setSettingsOpenAiValidating(false);
+    }
+  }
+
+  async function onLookupOpenAiModels() {
+    const inputKey = String(settingsOpenAiApiKeyInput || "").trim();
+    if (!inputKey && !settingsOpenAiApiKeySet) {
+      setError("Enter an OpenAI API key or save one before looking up models.");
+      return;
+    }
+    setError("");
+    setSettingsOpenAiLoadingModels(true);
+    setStatus("Loading OpenAI models...");
+    try {
+      const res = await api("/api/settings/openai/models", {
+        method: "POST",
+        body: JSON.stringify({ api_key: inputKey }),
+      });
+      const models = Array.isArray(res?.models) ? res.models : [];
+      setSettingsOpenAiModels(models);
+      if (!settingsOpenAiModel) {
+        if (res?.selected_model) {
+          setSettingsOpenAiModel(res.selected_model);
+        } else if (models.length) {
+          setSettingsOpenAiModel(models[0].id);
+        }
+      }
+      setStatus(`Loaded ${models.length} model(s) from OpenAI.`);
+    } catch (err) {
+      setError(err.message);
+      setStatus("OpenAI model lookup failed.");
+    } finally {
+      setSettingsOpenAiLoadingModels(false);
+    }
+  }
+
   async function onGenerateMcpApiKey() {
     if (settingsMcpAuthMode !== "api") {
       setStatus("Switch MCP authentication mode to API first.");
@@ -1330,9 +1638,12 @@ function App() {
         mcp_auth_mode: settingsMcpAuthMode,
         tool_logging_enabled: !!settingsToolLoggingEnabled,
         model: String(settingsModel || "").trim(),
+        openai_model: String(settingsOpenAiModel || "").trim(),
         anthropic_api_key: String(settingsApiKeyInput || "").trim() || null,
+        openai_api_key: String(settingsOpenAiApiKeyInput || "").trim() || null,
         ngrok_authtoken: String(settingsNgrokTokenInput || "").trim() || null,
         claude_instructions: String(settingsClaudeInstructions || "").trim(),
+        openai_instructions: String(settingsOpenAiInstructions || "").trim(),
       };
       const saved = await api("/api/settings/app", {
         method: "POST",
@@ -1340,6 +1651,7 @@ function App() {
       });
       applyAppSettings(saved);
       setSettingsApiKeyInput("");
+      setSettingsOpenAiApiKeyInput("");
       setSettingsNgrokTokenInput("");
       setStatus("Settings saved.");
     } catch (err) {
@@ -1350,46 +1662,74 @@ function App() {
     }
   }
 
-  async function onSendClaudeMessage() {
-    const message = String(claudeInput || "").trim();
-    if (!message || claudeSending) {
+  async function onSendChatMessage() {
+    const message = String(chatInput || "").trim();
+    if (!message || chatSending) {
       return;
     }
-    setClaudeInlineError("");
-    if (!settingsApiKeyActivated) {
-      setClaudeInlineError("Validate your saved Anthropic API key in Settings first.");
+    const provider = resolveChatProvider({
+      anthropicActive: settingsApiKeyActivated,
+      openaiActive: settingsOpenAiApiKeyActivated,
+      lastProvider: chatProvider,
+    });
+    if (!provider) {
+      setChatInlineError("Activate and validate at least one chat provider in Settings first.");
       setTab("settings");
       return;
     }
-    if (!String(settingsModel || "").trim()) {
-      setClaudeInlineError("Select and save an Anthropic model in Settings first.");
+    const providerLabel = provider === "openai" ? "ChatGPT" : "Claude";
+    setChatInlineError("");
+
+    if (provider === "anthropic" && !settingsApiKeyActivated) {
+      setChatInlineError("Validate your saved Anthropic API key in Settings first.");
       setTab("settings");
       return;
     }
+    if (provider === "openai" && !settingsOpenAiApiKeyActivated) {
+      setChatInlineError("Validate your saved OpenAI API key in Settings first.");
+      setTab("settings");
+      return;
+    }
+    if (provider === "anthropic" && !String(settingsModel || "").trim()) {
+      setChatInlineError("Select and save an Anthropic model in Settings first.");
+      setTab("settings");
+      return;
+    }
+    if (provider === "openai" && !String(settingsOpenAiModel || "").trim()) {
+      setChatInlineError("Select and save an OpenAI model in Settings first.");
+      setTab("settings");
+      return;
+    }
+
     const liveState = await loadServices({ silent: true });
     const effectiveState = liveState || serviceState;
     const mcpServerRunning = !!effectiveState?.services?.mcp_server?.running;
     if (!mcpServerRunning) {
-      setClaudeInlineError("MCP server is not started. Start MCP server in Settings before sending a message.");
-      setStatus("Claude message not sent.");
+      setChatInlineError("MCP server is not started. Start MCP server in Settings before sending a message.");
+      setStatus(`${providerLabel} message not sent.`);
       return;
     }
 
-    const history = claudeMessages.map((item) => ({
+    const providerMessages = Array.isArray(chatMessagesByProvider?.[provider]) ? chatMessagesByProvider[provider] : [];
+    const history = providerMessages.map((item) => ({
       role: String(item.role || ""),
       content: String(item.content || ""),
     }));
     const nextUserMessage = { role: "user", content: message };
 
     setError("");
-    setClaudeSending(true);
-    setClaudeMessages((prev) => [...prev, nextUserMessage]);
-    setClaudeInput("");
-    setStatus("Sending message to Claude...");
+    setChatSending(true);
+    setChatMessagesByProvider((prev) => ({
+      ...prev,
+      [provider]: [...(Array.isArray(prev?.[provider]) ? prev[provider] : []), nextUserMessage],
+    }));
+    setChatInput("");
+    setStatus(`Sending message to ${providerLabel}...`);
     try {
-      const res = await api("/api/claude/chat", {
+      const res = await api("/api/chat", {
         method: "POST",
         body: JSON.stringify({
+          provider,
           message,
           history,
         }),
@@ -1398,24 +1738,41 @@ function App() {
         role: "assistant",
         content: String(res?.message?.content || "").trim() || "(No text response)",
       };
-      setClaudeMessages((prev) => [...prev, assistantMessage]);
+      setChatMessagesByProvider((prev) => ({
+        ...prev,
+        [provider]: [...(Array.isArray(prev?.[provider]) ? prev[provider] : []), assistantMessage],
+      }));
       if (tab === "logs") {
         await loadToolLogs({ silent: true });
       }
-      setStatus("Claude response received.");
+      setStatus(`${providerLabel} response received.`);
     } catch (err) {
-      setClaudeInlineError(String(err.message || "Failed to send Claude message."));
+      setChatInlineError(String(err.message || `Failed to send ${providerLabel} message.`));
       setError(err.message);
-      setStatus("Claude chat failed.");
+      setStatus(`${providerLabel} chat failed.`);
     } finally {
-      setClaudeSending(false);
+      setChatSending(false);
     }
   }
 
-  function onClearClaudeChat() {
-    setClaudeMessages([]);
-    setClaudeInput("");
-    setClaudeInlineError("");
+  function onClearChat() {
+    const provider = resolveChatProvider({
+      anthropicActive: settingsApiKeyActivated,
+      openaiActive: settingsOpenAiApiKeyActivated,
+      lastProvider: chatProvider,
+    });
+    if (!provider) {
+      setChatMessagesByProvider({ anthropic: [], openai: [] });
+      setChatInput("");
+      setChatInlineError("");
+      return;
+    }
+    setChatMessagesByProvider((prev) => ({
+      ...prev,
+      [provider]: [],
+    }));
+    setChatInput("");
+    setChatInlineError("");
   }
 
   async function onClearAllToolLogs() {
@@ -1475,6 +1832,10 @@ function App() {
 
   function onLoadDefaultClaudeInstructions() {
     setSettingsClaudeInstructions(DEFAULT_CLAUDE_INSTRUCTIONS);
+  }
+
+  function onLoadDefaultOpenAiInstructions() {
+    setSettingsOpenAiInstructions(DEFAULT_OPENAI_INSTRUCTIONS);
   }
 
   async function onBrowseFolder(kind) {
@@ -2925,15 +3286,34 @@ function App() {
   const lastCatalogRefreshLabel = formatDateTimeForBadge(lastCatalogRefreshAt);
   const canValidateAnthropicKey = String(settingsApiKeyInput || "").trim().length > 0 || settingsApiKeySet;
   const canLookupAnthropicModels = canValidateAnthropicKey || settingsApiKeySet;
-  const settingsBusy = settingsSaving || settingsValidating || settingsLoadingModels || settingsGeneratingMcpApiKey;
+  const canValidateOpenAiKey = String(settingsOpenAiApiKeyInput || "").trim().length > 0 || settingsOpenAiApiKeySet;
+  const canLookupOpenAiModels = canValidateOpenAiKey || settingsOpenAiApiKeySet;
+  const settingsBusy =
+    settingsSaving ||
+    settingsValidating ||
+    settingsLoadingModels ||
+    settingsOpenAiValidating ||
+    settingsOpenAiLoadingModels ||
+    settingsGeneratingMcpApiKey;
   const mcpApiAuthEnabled = settingsMcpAuthMode === "api";
   const canCopyMcpApiKey = String(settingsMcpGeneratedApiKey || "").trim().length > 0;
-  const claudeTabEnabled = settingsApiKeyActivated;
-  const claudeCanSend =
-    claudeTabEnabled &&
-    String(settingsModel || "").trim().length > 0 &&
-    String(claudeInput || "").trim().length > 0 &&
-    !claudeSending;
+  const chatTabEnabled = settingsApiKeyActivated || settingsOpenAiApiKeyActivated;
+  const activeChatProvider = resolveChatProvider({
+    anthropicActive: settingsApiKeyActivated,
+    openaiActive: settingsOpenAiApiKeyActivated,
+    lastProvider: chatProvider,
+  });
+  const chatProviderLabel = activeChatProvider === "openai" ? "ChatGPT" : "Claude";
+  const activeProviderModel = activeChatProvider === "openai" ? settingsOpenAiModel : settingsModel;
+  const activeChatMessages = Array.isArray(chatMessagesByProvider?.[activeChatProvider])
+    ? chatMessagesByProvider[activeChatProvider]
+    : [];
+  const chatCanSend =
+    chatTabEnabled &&
+    !!activeChatProvider &&
+    String(activeProviderModel || "").trim().length > 0 &&
+    String(chatInput || "").trim().length > 0 &&
+    !chatSending;
   const sqlCanExecute = String(sqlText || "").trim().length > 0 && !sqlBusy;
   const sqlGridHeaders = Array.isArray(sqlResult?.headers) ? sqlResult.headers : [];
   const sqlGridRows = Array.isArray(sqlResult?.rows) ? sqlResult.rows : [];
@@ -3067,12 +3447,12 @@ function App() {
               Reports
             </button>
             <button
-              className={`tab ${tab === "claude" ? "active" : ""}`}
-              onClick={() => setTab("claude")}
-              disabled={!claudeTabEnabled}
-              title={!claudeTabEnabled ? "Validate your saved Anthropic API key in Settings first." : "Open Claude chat"}
+              className={`tab ${tab === "chat" ? "active" : ""}`}
+              onClick={() => setTab("chat")}
+              disabled={!chatTabEnabled}
+              title={!chatTabEnabled ? "Validate at least one provider key in Settings first." : "Open chat"}
             >
-              Claude
+              Chat
             </button>
             <button className={`tab ${tab === "logs" ? "active" : ""}`} onClick={() => setTab("logs")}>
               Tool Logs
@@ -3090,7 +3470,7 @@ function App() {
             </button>
           </div>
         </aside>
-        <main className={tab === "sql" ? "content content-sql" : "content"}>
+        <main className={tab === "sql" ? "content content-sql" : tab === "chat" ? "content content-chat" : "content"}>
       {tab === "settings" ? (
         <>
           <div className="card">
@@ -3237,7 +3617,7 @@ function App() {
                       checked={!!settingsToolLoggingEnabled}
                       onChange={(e) => setSettingsToolLoggingEnabled(e.target.checked)}
                     />
-                    <span>Enable tool call logging (Claude + external MCP + Inspector)</span>
+                    <span>Enable tool call logging (Chat + external MCP + Inspector)</span>
                   </label>
                   <div className="sub">Turn off to stop creating new entries in the Tool Logs tab.</div>
                 </div>
@@ -3343,10 +3723,11 @@ function App() {
             </div>
           </div>
 
-          <div className="card anthropic-card">
-            <h3>Anthropic</h3>
-            <div className="sub anthropic-subtitle">Configure API key and model used by the Claude chat tab.</div>
-            <div className="anthropic-grid">
+          <div className="provider-settings-grid">
+            <div className="card anthropic-card">
+              <h3>Anthropic</h3>
+              <div className="sub anthropic-subtitle">Configure API key and model used by Chat when Claude is selected.</div>
+              <div className="anthropic-grid">
               <div className="anthropic-key-block">
                 <label>Anthropic API Key</label>
                 <input
@@ -3377,7 +3758,7 @@ function App() {
                 ) : null}
               </div>
 
-              <div className="anthropic-actions">
+              <div className="anthropic-actions anthropic-key-actions">
                 <button
                   className="secondary anthropic-action-btn"
                   onClick={onValidateAnthropicKey}
@@ -3401,15 +3782,17 @@ function App() {
                       </option>
                     ))}
                   </select>
-                  <button
-                    className="secondary anthropic-action-btn anthropic-model-lookup-btn"
-                    onClick={onLookupAnthropicModels}
-                    disabled={!canLookupAnthropicModels || settingsLoadingModels || settingsSaving}
-                  >
-                    {settingsLoadingModels ? "Loading..." : "Lookup Models"}
-                  </button>
                 </div>
-                <div className="sub">Selected model is used by the Claude tab chat.</div>
+                <div className="sub">Selected model is used by Chat when Claude is selected.</div>
+              </div>
+              <div className="anthropic-actions anthropic-model-actions">
+                <button
+                  className="secondary anthropic-action-btn anthropic-model-lookup-btn"
+                  onClick={onLookupAnthropicModels}
+                  disabled={!canLookupAnthropicModels || settingsLoadingModels || settingsSaving}
+                >
+                  {settingsLoadingModels ? "Loading..." : "Lookup Models"}
+                </button>
               </div>
 
               <div className="anthropic-instructions-block">
@@ -3429,40 +3812,174 @@ function App() {
                       </button>
                     </div>
                     <div className="sub">
-                      These instructions are saved and applied automatically to every message in the Claude tab.
+                      These instructions are saved and applied automatically to every message when Claude is selected.
                     </div>
                   </div>
                 </details>
               </div>
 
-              <div className="anthropic-save-row">
-                <button className="anthropic-save-btn" onClick={onSaveAppSettings} disabled={settingsBusy}>
-                  {settingsSaving ? "Saving..." : "Save Settings"}
+                <div className="anthropic-save-row">
+                  <button className="anthropic-save-btn" onClick={onSaveAppSettings} disabled={settingsBusy}>
+                    {settingsSaving ? "Saving..." : "Save Settings"}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="card anthropic-card">
+              <h3>OpenAI</h3>
+              <div className="sub anthropic-subtitle">Configure API key and model used by Chat when ChatGPT is selected.</div>
+              <div className="anthropic-grid">
+              <div className="anthropic-key-block">
+                <label>OpenAI API Key</label>
+                <input
+                  className="anthropic-key-input"
+                  type="password"
+                  value={settingsOpenAiApiKeyInput}
+                  onChange={(e) => setSettingsOpenAiApiKeyInput(e.target.value)}
+                  placeholder="sk-..."
+                  autoComplete="off"
+                />
+                <div className="anthropic-meta">
+                  <span className="anthropic-meta-pill">
+                    Stored key:{" "}
+                    {settingsOpenAiApiKeySet
+                      ? settingsOpenAiApiKeyMasked
+                        ? settingsOpenAiApiKeyMasked
+                        : "configured"
+                      : "not set"}
+                  </span>
+                  <span className={`anthropic-meta-pill ${settingsOpenAiApiKeyActivated ? "is-active" : "is-inactive"}`}>
+                    Activation: {settingsOpenAiApiKeyActivated ? "active" : "inactive"}
+                  </span>
+                </div>
+                {settingsOpenAiApiKeyNeedsReset ? (
+                  <div className="anthropic-warning">
+                    Stored API key cannot be decrypted. Enter a new key and save.
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="anthropic-actions anthropic-key-actions">
+                <button
+                  className="secondary anthropic-action-btn"
+                  onClick={onValidateOpenAiKey}
+                  disabled={!canValidateOpenAiKey || settingsOpenAiValidating || settingsSaving}
+                >
+                  {settingsOpenAiValidating ? "Validating..." : "Validate Key"}
                 </button>
+              </div>
+
+              <div className="anthropic-model-block">
+                <label>Model</label>
+                <div className="anthropic-model-row">
+                  <select className="anthropic-model-select" value={settingsOpenAiModel} onChange={(e) => setSettingsOpenAiModel(e.target.value)}>
+                    <option value="">Select a model...</option>
+                    {settingsOpenAiModel && !settingsOpenAiModels.some((m) => m.id === settingsOpenAiModel) ? (
+                      <option value={settingsOpenAiModel}>{settingsOpenAiModel} (saved)</option>
+                    ) : null}
+                    {settingsOpenAiModels.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.id}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="sub">Selected model is used by Chat when ChatGPT is selected.</div>
+              </div>
+              <div className="anthropic-actions anthropic-model-actions">
+                <button
+                  className="secondary anthropic-action-btn anthropic-model-lookup-btn"
+                  onClick={onLookupOpenAiModels}
+                  disabled={!canLookupOpenAiModels || settingsOpenAiLoadingModels || settingsSaving}
+                >
+                  {settingsOpenAiLoadingModels ? "Loading..." : "Lookup Models"}
+                </button>
+              </div>
+
+              <div className="anthropic-instructions-block">
+                <details className="settings-collapsible anthropic-collapsible">
+                  <summary>OpenAI System Instructions</summary>
+                  <div className="settings-collapsible-body">
+                    <label>Instructions sent as system prompt for OpenAI chat</label>
+                    <textarea
+                      className="instructions-input"
+                      value={settingsOpenAiInstructions}
+                      onChange={(e) => setSettingsOpenAiInstructions(e.target.value)}
+                      placeholder="Add task-specific instructions for ChatGPT..."
+                    />
+                    <div className="actions">
+                      <button className="secondary" type="button" onClick={onLoadDefaultOpenAiInstructions} disabled={settingsBusy}>
+                        Load Instructions
+                      </button>
+                    </div>
+                    <div className="sub">
+                      These instructions are saved and applied automatically to every message when ChatGPT is selected.
+                    </div>
+                  </div>
+                </details>
+              </div>
+
+                <div className="anthropic-save-row">
+                  <button className="anthropic-save-btn" onClick={onSaveAppSettings} disabled={settingsBusy}>
+                    {settingsSaving ? "Saving..." : "Save Settings"}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
         </>
       ) : null}
 
-      {tab === "claude" ? (
+      {tab === "chat" ? (
         <>
-          <div className="card">
-            <h3>Claude</h3>
-            <div className="sub">Chat using your saved Anthropic key and selected model ({settingsModel || "not selected"}).</div>
-            <div className="claude-chat-window">
-              {claudeMessages.length ? (
-                claudeMessages.map((msg, idx) => (
+          <div className="card chat-card">
+            <h3>Chat</h3>
+            <div className="sub">Chat with Claude or ChatGPT using the selected provider's saved key and model.</div>
+            <div className="chat-provider-switch" role="radiogroup" aria-label="Chat provider">
+              <label className={`chat-provider-option ${settingsApiKeyActivated ? "" : "is-disabled"}`}>
+                <input
+                  type="radio"
+                  name="chat-provider"
+                  value="anthropic"
+                  checked={activeChatProvider === "anthropic"}
+                  disabled={!settingsApiKeyActivated}
+                  onChange={() => setChatProvider("anthropic")}
+                />
+                <span>Claude</span>
+              </label>
+              <label className={`chat-provider-option ${settingsOpenAiApiKeyActivated ? "" : "is-disabled"}`}>
+                <input
+                  type="radio"
+                  name="chat-provider"
+                  value="openai"
+                  checked={activeChatProvider === "openai"}
+                  disabled={!settingsOpenAiApiKeyActivated}
+                  onChange={() => setChatProvider("openai")}
+                />
+                <span>ChatGPT</span>
+              </label>
+            </div>
+            <div className="sub">
+              Active provider: {chatProviderLabel} ({activeProviderModel || "model not selected"}).
+            </div>
+            <div ref={chatWindowRef} className="claude-chat-window">
+              {activeChatMessages.length ? (
+                activeChatMessages.map((msg, idx) => (
                   <div
-                    key={`claude-message-${idx}`}
+                    key={`chat-message-${activeChatProvider}-${idx}`}
                     className={`claude-message ${msg.role === "assistant" ? "assistant" : "user"}`}
                   >
-                    <div className="claude-message-role">{msg.role === "assistant" ? "Claude" : "You"}</div>
-                    <div className="claude-message-text">{displayValue(msg.content)}</div>
+                    <div className="claude-message-role">{msg.role === "assistant" ? chatProviderLabel : "You"}</div>
+                    <div className="claude-message-text">
+                      {msg.role === "assistant"
+                        ? renderMarkdownContent(msg.content, `msg-${activeChatProvider}-${idx}`)
+                        : displayValue(msg.content)}
+                    </div>
                   </div>
                 ))
               ) : (
-                <div className="claude-empty">No messages yet. Ask Claude something to start.</div>
+                <div className="claude-empty">No messages yet. Ask {chatProviderLabel} something to start.</div>
               )}
             </div>
             <div className="row">
@@ -3470,24 +3987,24 @@ function App() {
                 <label>Message</label>
                 <textarea
                   className="claude-input"
-                  value={claudeInput}
+                  value={chatInput}
                   onChange={(e) => {
-                    setClaudeInput(e.target.value);
-                    if (claudeInlineError) setClaudeInlineError("");
+                    setChatInput(e.target.value);
+                    if (chatInlineError) setChatInlineError("");
                   }}
-                  placeholder="Type your message for Claude..."
+                  placeholder={`Type your message for ${chatProviderLabel}...`}
                 />
               </div>
               <div className="col-12">
                 <div className="actions">
-                  <button onClick={onSendClaudeMessage} disabled={!claudeCanSend}>
-                    {claudeSending ? "Sending..." : "Send"}
+                  <button onClick={onSendChatMessage} disabled={!chatCanSend}>
+                    {chatSending ? "Sending..." : "Send"}
                   </button>
-                  <button className="secondary" onClick={onClearClaudeChat} disabled={claudeSending || !claudeMessages.length}>
+                  <button className="secondary" onClick={onClearChat} disabled={chatSending || !activeChatMessages.length}>
                     Clear Chat
                   </button>
                 </div>
-                {claudeInlineError ? <div className="claude-inline-error">{claudeInlineError}</div> : null}
+                {chatInlineError ? <div className="claude-inline-error">{chatInlineError}</div> : null}
               </div>
             </div>
           </div>
@@ -3499,7 +4016,7 @@ function App() {
           <div className="card">
             <h3>Tool Call Logs</h3>
             <div className="sub">
-              Shows request and response payloads for MCP tool calls executed through the Claude tab.
+              Shows request and response payloads for MCP tool calls executed through the Chat tab.
             </div>
 
             <div className="tool-logs-filter-grid">

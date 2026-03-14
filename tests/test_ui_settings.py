@@ -1,4 +1,5 @@
 import importlib
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import types
@@ -374,6 +375,30 @@ def test_save_settings_persists_claude_instructions(monkeypatch, tmp_path: Path)
     assert stored == instructions
 
 
+def test_save_settings_persists_openai_instructions(monkeypatch, tmp_path: Path) -> None:
+    ui_api, db_path = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    instructions = "Use MCP tools first and provide concise summaries."
+    response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "openai_api_key": "sk-openai-stored-key",
+            "openai_model": "gpt-4o-mini",
+            "openai_instructions": instructions,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["openai_instructions"] == instructions
+
+    conn = db.get_connection(path=str(db_path))
+    stored = db.get_meta(conn, "openai_system_instructions", "")
+    conn.close()
+    assert stored == instructions
+
+
 def test_validate_stored_key_activates_claude_tab(monkeypatch, tmp_path: Path) -> None:
     ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
     client = TestClient(ui_api.app)
@@ -581,6 +606,213 @@ def test_claude_chat_logs_tool_calls(monkeypatch, tmp_path: Path) -> None:
     assert entry["called_at"]
     assert entry["responded_at"]
     assert entry["duration_ms"] >= 0
+
+
+def test_validate_stored_openai_key_activates_chat_provider(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "openai_api_key": "sk-openai-stored-key",
+            "openai_model": "gpt-4.1-mini",
+        },
+    )
+    assert save_response.status_code == 200
+    assert save_response.json()["openai_api_key_activated"] is False
+
+    monkeypatch.setattr(
+        ui_api,
+        "_list_openai_models",
+        lambda api_key, limit=1: [{"id": "gpt-4.1-mini", "display_name": "gpt-4.1-mini"}],
+    )
+
+    validate_response = client.post("/api/settings/openai/validate", json={"api_key": ""})
+    assert validate_response.status_code == 200
+    payload = validate_response.json()
+    assert payload["activated"] is True
+    assert payload["app_settings"]["openai_api_key_activated"] is True
+
+    settings_response = client.get("/api/settings/app")
+    assert settings_response.status_code == 200
+    assert settings_response.json()["openai_api_key_activated"] is True
+
+
+def test_chat_endpoint_supports_openai_provider(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "openai_api_key": "sk-openai-stored-key",
+            "openai_model": "gpt-4.1-mini",
+            "openai_instructions": "Always call out risks.",
+        },
+    )
+    assert save_response.status_code == 200
+
+    monkeypatch.setattr(
+        ui_api,
+        "_list_openai_models",
+        lambda api_key, limit=1: [{"id": "gpt-4.1-mini", "display_name": "gpt-4.1-mini"}],
+    )
+    validate_response = client.post("/api/settings/openai/validate", json={"api_key": ""})
+    assert validate_response.status_code == 200
+    assert validate_response.json()["activated"] is True
+
+    captured = {}
+
+    def fake_openai_post(*, api_key: str, endpoint: str, payload: dict, timeout: float = 120.0):
+        captured["api_key"] = api_key
+        captured["endpoint"] = endpoint
+        captured["payload"] = json.loads(json.dumps(payload))
+        captured["timeout"] = timeout
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello from ChatGPT",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(ui_api, "_openai_post", fake_openai_post)
+
+    chat_response = client.post(
+        "/api/chat",
+        json={
+            "provider": "openai",
+            "message": "How many rows changed?",
+            "history": [{"role": "user", "content": "Summary please"}],
+        },
+    )
+    assert chat_response.status_code == 200
+    payload = chat_response.json()
+    assert payload["provider"] == "openai"
+    assert payload["model"] == "gpt-4.1-mini"
+    assert payload["message"]["role"] == "assistant"
+    assert payload["message"]["content"] == "Hello from ChatGPT"
+
+    assert captured["api_key"] == "sk-openai-stored-key"
+    assert captured["endpoint"] == "chat/completions"
+    assert captured["payload"]["model"] == "gpt-4.1-mini"
+    assert captured["payload"]["messages"] == [
+        {"role": "system", "content": "Always call out risks."},
+        {"role": "user", "content": "Summary please"},
+        {"role": "user", "content": "How many rows changed?"},
+    ]
+
+
+def test_openai_chat_tool_results_are_json_safe(monkeypatch, tmp_path: Path) -> None:
+    ui_api, _ = _load_ui_api(monkeypatch, tmp_path)
+    client = TestClient(ui_api.app)
+
+    save_response = client.post(
+        "/api/settings/app",
+        json={
+            "theme": "light",
+            "openai_api_key": "sk-openai-stored-key",
+            "openai_model": "gpt-5.4",
+        },
+    )
+    assert save_response.status_code == 200
+
+    monkeypatch.setattr(
+        ui_api,
+        "_list_openai_models",
+        lambda api_key, limit=1: [{"id": "gpt-5.4", "display_name": "gpt-5.4"}],
+    )
+    validate_response = client.post("/api/settings/openai/validate", json={"api_key": ""})
+    assert validate_response.status_code == 200
+    assert validate_response.json()["activated"] is True
+
+    import mcp_server
+
+    class _FakeTextItem:
+        type = "text"
+        text = "tool completed"
+
+    class _FakeCallToolResult:
+        def __init__(self):
+            self.isError = False
+            self.structuredContent = {"ok": True}
+            self.content = [_FakeTextItem()]
+
+    ui_api._mcp_instance._tool_manager._tools["json_safe_tool"] = types.SimpleNamespace(
+        name="json_safe_tool",
+        description="Returns a CallToolResult-like object",
+        parameters={"type": "object", "properties": {"limit": {"type": "integer"}}},
+        fn=lambda limit=1: _FakeCallToolResult(),
+    )
+    mcp_server._instrument_tool_call_logging()
+
+    calls = {"count": 0}
+    captured_tool_message = {}
+
+    def fake_openai_post(*, api_key: str, endpoint: str, payload: dict, timeout: float = 120.0):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "json_safe_tool",
+                                        "arguments": "{\"limit\": 1}",
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            }
+
+        # Second round should include a JSON-safe tool message payload.
+        tool_msg = payload["messages"][-1]
+        assert tool_msg["role"] == "tool"
+        assert isinstance(tool_msg["content"], str)
+        parsed = json.loads(tool_msg["content"])
+        assert parsed["is_error"] is False
+        assert parsed["structured_content"] == {"ok": True}
+        assert parsed["content_text"] == ["tool completed"]
+        captured_tool_message["content"] = tool_msg["content"]
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "Done via tool",
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(ui_api, "_openai_post", fake_openai_post)
+
+    chat_response = client.post(
+        "/api/chat",
+        json={
+            "provider": "openai",
+            "message": "Run tool",
+            "history": [],
+        },
+    )
+    assert chat_response.status_code == 200
+    assert chat_response.json()["message"]["content"] == "Done via tool"
+    assert calls["count"] == 2
+    assert captured_tool_message["content"]
 
 
 def test_external_mcp_tool_calls_are_logged(monkeypatch, tmp_path: Path) -> None:

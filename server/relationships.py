@@ -383,7 +383,9 @@ def auto_link_scoped_relationships(
             key_candidates = [
                 m
                 for m in mappings
-                if bool(m.get("is_key_pair")) or bool(m.get("use_key"))
+                if bool(m.get("is_relationship_pair"))
+                or bool(m.get("is_key_pair"))
+                or bool(m.get("use_key"))
             ]
             if not key_candidates:
                 continue

@@ -193,6 +193,16 @@ def _is_key_pair_candidate(metrics: Dict[str, float]) -> bool:
     )
 
 
+def _is_relationship_pair_candidate(metrics: Dict[str, float]) -> bool:
+    """Relationship candidate heuristic (PK->FK friendly, completeness-agnostic)."""
+    max_uniqueness = max(metrics["src_uniqueness"], metrics["tgt_uniqueness"])
+    return bool(
+        min(metrics["src_distinct"], metrics["tgt_distinct"]) >= MIN_KEYLIKE_DISTINCT
+        and max_uniqueness >= MIN_KEYLIKE_UNIQUENESS
+        and metrics["containment"] >= MIN_KEYLIKE_CONTAINMENT
+    )
+
+
 def _content_confidence(name_score: float, metrics: Dict[str, float]) -> float:
     is_low_cardinality = metrics["low_cardinality"] >= 0.5
     penalty = 0.25 if is_low_cardinality else 0.0
@@ -868,6 +878,7 @@ def suggest_field_mappings(
                     stats_cache=stats_cache,
                 )
                 is_key_pair = _is_key_pair_candidate(metrics)
+                is_relationship_pair = _is_relationship_pair_candidate(metrics)
                 mappings.append(
                     {
                         "source_field": s_col,
@@ -877,6 +888,7 @@ def suggest_field_mappings(
                         "use_key": bool(is_key_pair),
                         "use_compare": True,
                         "is_key_pair": bool(is_key_pair),
+                        "is_relationship_pair": bool(is_relationship_pair),
                         "low_cardinality": bool(metrics["low_cardinality"] >= 0.5),
                     }
                 )
@@ -927,6 +939,7 @@ def suggest_field_mappings(
                 if s_col in used_source or t_col in used_target:
                     continue
                 is_key_pair = _is_key_pair_candidate(metrics)
+                is_relationship_pair = _is_relationship_pair_candidate(metrics)
                 mappings.append(
                     {
                         "source_field": s_col,
@@ -936,6 +949,7 @@ def suggest_field_mappings(
                         "use_key": bool(is_key_pair),
                         "use_compare": True,
                         "is_key_pair": bool(is_key_pair),
+                        "is_relationship_pair": bool(is_relationship_pair),
                         "low_cardinality": bool(metrics["low_cardinality"] >= 0.5),
                     }
                 )

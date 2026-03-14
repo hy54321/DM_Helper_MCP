@@ -58,14 +58,76 @@ def _get_anthropic_tools() -> List[Dict[str, Any]]:
     return tools
 
 
-def _call_mcp_tool(name: str, arguments: Dict[str, Any]) -> str:
+def _get_openai_tools() -> List[Dict[str, Any]]:
+    """Return MCP-registered tools in OpenAI chat-completions format."""
+    tools: List[Dict[str, Any]] = []
+    for tool in _mcp_instance._tool_manager._tools.values():
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.parameters,
+            },
+        })
+    return tools
+
+
+def _normalize_tool_result_for_llm(result: Any) -> str:
+    """Convert MCP tool results to a JSON-safe text payload for LLM tool_result messages."""
+    if isinstance(result, str):
+        return result
+
+    if result is None or isinstance(result, (dict, list, tuple, int, float, bool)):
+        try:
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:
+            return str(result)
+
+    has_calltool_shape = (
+        hasattr(result, "content")
+        or hasattr(result, "isError")
+        or hasattr(result, "structuredContent")
+    )
+    if has_calltool_shape:
+        payload: Dict[str, Any] = {
+            "is_error": bool(getattr(result, "isError", False)),
+            "structured_content": getattr(result, "structuredContent", None),
+        }
+        content_text: List[str] = []
+        content_items: List[Any] = []
+        for item in list(getattr(result, "content", []) or []):
+            item_type = str(getattr(item, "type", "") or "").strip().lower()
+            if item_type == "text":
+                text = str(getattr(item, "text", "") or "")
+                if text:
+                    content_text.append(text)
+                continue
+            try:
+                content_items.append(json.loads(json.dumps(item, ensure_ascii=False, default=str)))
+            except Exception:
+                content_items.append(str(item))
+        if content_text:
+            payload["content_text"] = content_text
+        if content_items:
+            payload["content_items"] = content_items
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    try:
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except Exception:
+        return str(result)
+
+
+def _call_mcp_tool(name: str, arguments: Dict[str, Any], source: str = "claude_chat") -> str:
     """Invoke a registered MCP tool function by *name* and return its string result."""
     tool = _mcp_instance._tool_manager._tools.get(name)
     if not tool:
         return json.dumps({"error": f"Tool '{name}' not found."})
     try:
-        with _tool_call_log_source("claude_chat"):
-            return tool.fn(**arguments)
+        with _tool_call_log_source(source):
+            raw = tool.fn(**arguments)
+            return _normalize_tool_result_for_llm(raw)
     except Exception as exc:
         return json.dumps({"error": f"Tool '{name}' failed: {exc}"})
 
@@ -221,11 +283,14 @@ class RelationshipScopedLinkRequest(BaseModel):
 class SaveAppSettingsRequest(BaseModel):
     theme: str = "light"
     anthropic_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
     ngrok_authtoken: Optional[str] = None
     mcp_auth_mode: str = "none"
     tool_logging_enabled: Optional[bool] = None
     model: str = ""
+    openai_model: str = ""
     claude_instructions: str = ""
+    openai_instructions: str = ""
 
 
 class ValidateAnthropicKeyRequest(BaseModel):
@@ -236,12 +301,26 @@ class LookupAnthropicModelsRequest(BaseModel):
     api_key: str = ""
 
 
+class ValidateOpenAIKeyRequest(BaseModel):
+    api_key: str = ""
+
+
+class LookupOpenAIModelsRequest(BaseModel):
+    api_key: str = ""
+
+
 class ClaudeChatHistoryMessage(BaseModel):
     role: str = "user"
     content: str = ""
 
 
 class ClaudeChatRequest(BaseModel):
+    message: str = ""
+    history: List[ClaudeChatHistoryMessage] = Field(default_factory=list)
+
+
+class ChatRequest(BaseModel):
+    provider: str = "anthropic"
     message: str = ""
     history: List[ClaudeChatHistoryMessage] = Field(default_factory=list)
 
@@ -273,6 +352,11 @@ _SETTINGS_ANTHROPIC_MODEL_KEY = "anthropic_model"
 _SETTINGS_ANTHROPIC_MODELS_CACHE_KEY = "anthropic_models_cache_json"
 _SETTINGS_ANTHROPIC_ACTIVATED_KEY = "anthropic_api_key_activated"
 _SETTINGS_CLAUDE_INSTRUCTIONS_KEY = "claude_system_instructions"
+_SETTINGS_OPENAI_API_KEY = "openai_api_key_encrypted"
+_SETTINGS_OPENAI_MODEL_KEY = "openai_model"
+_SETTINGS_OPENAI_MODELS_CACHE_KEY = "openai_models_cache_json"
+_SETTINGS_OPENAI_ACTIVATED_KEY = "openai_api_key_activated"
+_SETTINGS_OPENAI_INSTRUCTIONS_KEY = "openai_system_instructions"
 _SETTINGS_NGROK_AUTHTOKEN_KEY = "ngrok_authtoken_encrypted"
 _SETTINGS_MCP_AUTH_MODE_KEY = "mcp_auth_mode"
 _SETTINGS_MCP_API_KEY_KEY = "mcp_api_key_encrypted"
@@ -1210,6 +1294,7 @@ def _clean_field_mappings(
                     conf_value = None
                 row["confidence"] = conf_value
                 row["is_key_pair"] = bool(m.get("is_key_pair", False))
+                row["is_relationship_pair"] = bool(m.get("is_relationship_pair", False))
                 row["low_cardinality"] = bool(m.get("low_cardinality", False))
                 row["use_key"] = bool(m.get("use_key", False))
                 row["use_compare"] = bool(m.get("use_compare", True))
@@ -1555,12 +1640,31 @@ def _read_stored_anthropic_key(conn) -> tuple[str, bool]:
         return "", True
 
 
+def _read_stored_openai_key(conn) -> tuple[str, bool]:
+    encrypted = (db.get_meta(conn, _SETTINGS_OPENAI_API_KEY, "") or "").strip()
+    if not encrypted:
+        return "", False
+    try:
+        return _decrypt_secret(encrypted), True
+    except RuntimeError:
+        return "", True
+
+
 def _require_stored_anthropic_key(conn) -> str:
     key, configured = _read_stored_anthropic_key(conn)
     if key:
         return key
     if configured:
         raise RuntimeError("Stored Anthropic API key cannot be decrypted. Please set it again.")
+    return ""
+
+
+def _require_stored_openai_key(conn) -> str:
+    key, configured = _read_stored_openai_key(conn)
+    if key:
+        return key
+    if configured:
+        raise RuntimeError("Stored OpenAI API key cannot be decrypted. Please set it again.")
     return ""
 
 
@@ -1591,8 +1695,127 @@ def _list_anthropic_models(api_key: str, limit: int = 100) -> List[Dict[str, str
     return models
 
 
+def _openai_request_headers(api_key: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+def _openai_post(
+    *,
+    api_key: str,
+    endpoint: str,
+    payload: Dict[str, Any],
+    timeout: float = 120.0,
+) -> Dict[str, Any]:
+    try:
+        response = httpx.post(
+            f"https://api.openai.com/v1/{endpoint.lstrip('/')}",
+            headers=_openai_request_headers(api_key),
+            json=payload,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                err = parsed.get("error")
+                if isinstance(err, dict):
+                    detail = str(err.get("message") or "").strip()
+        except Exception:
+            detail = ""
+        detail = detail or response.text or f"HTTP {response.status_code}"
+        raise RuntimeError(detail)
+
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI response is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("OpenAI response payload is invalid.")
+    return data
+
+
+def _list_openai_models(api_key: str, limit: int = 100) -> List[Dict[str, str]]:
+    key = (api_key or "").strip()
+    if not key:
+        raise RuntimeError("OpenAI API key is required.")
+
+    try:
+        response = httpx.get(
+            "https://api.openai.com/v1/models",
+            headers=_openai_request_headers(key),
+            timeout=20.0,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI request failed: {exc}") from exc
+
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                err = parsed.get("error")
+                if isinstance(err, dict):
+                    detail = str(err.get("message") or "").strip()
+        except Exception:
+            detail = ""
+        detail = detail or response.text or f"HTTP {response.status_code}"
+        raise RuntimeError(detail)
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI response is not valid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("OpenAI response payload is invalid.")
+    raw_items = payload.get("data")
+    if not isinstance(raw_items, list):
+        raw_items = []
+
+    models: List[Dict[str, str]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        models.append({"id": model_id, "display_name": model_id})
+
+    models.sort(key=lambda row: row["id"].lower())
+    capped_limit = max(1, min(int(limit), 100))
+    return models[:capped_limit]
+
+
 def _load_cached_models(conn) -> List[Dict[str, str]]:
     raw = (db.get_meta(conn, _SETTINGS_ANTHROPIC_MODELS_CACHE_KEY, "") or "").strip()
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    models: List[Dict[str, str]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if not model_id:
+            continue
+        display_name = str(item.get("display_name") or model_id).strip() or model_id
+        models.append({"id": model_id, "display_name": display_name})
+    return models
+
+
+def _load_cached_openai_models(conn) -> List[Dict[str, str]]:
+    raw = (db.get_meta(conn, _SETTINGS_OPENAI_MODELS_CACHE_KEY, "") or "").strip()
     if not raw:
         return []
     try:
@@ -1617,13 +1840,26 @@ def _save_cached_models(conn, models: List[Dict[str, str]]) -> None:
     db.set_meta(conn, _SETTINGS_ANTHROPIC_MODELS_CACHE_KEY, json.dumps(models), commit=False)
 
 
+def _save_cached_openai_models(conn, models: List[Dict[str, str]]) -> None:
+    db.set_meta(conn, _SETTINGS_OPENAI_MODELS_CACHE_KEY, json.dumps(models), commit=False)
+
+
 def _is_anthropic_key_activated(conn) -> bool:
     raw = (db.get_meta(conn, _SETTINGS_ANTHROPIC_ACTIVATED_KEY, "0") or "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
+def _is_openai_key_activated(conn) -> bool:
+    raw = (db.get_meta(conn, _SETTINGS_OPENAI_ACTIVATED_KEY, "0") or "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _set_anthropic_key_activated(conn, activated: bool) -> None:
     db.set_meta(conn, _SETTINGS_ANTHROPIC_ACTIVATED_KEY, "1" if activated else "0", commit=False)
+
+
+def _set_openai_key_activated(conn, activated: bool) -> None:
+    db.set_meta(conn, _SETTINGS_OPENAI_ACTIVATED_KEY, "1" if activated else "0", commit=False)
 
 
 def _prepare_claude_history(history: List[ClaudeChatHistoryMessage]) -> List[Dict[str, str]]:
@@ -1650,17 +1886,44 @@ def _text_from_anthropic_message(message: Any) -> str:
     return "\n".join(parts).strip()
 
 
+def _text_from_openai_message(message: Dict[str, Any]) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type") or "").strip().lower() != "text":
+                continue
+            text = str(block.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    return ""
+
+
 def _get_saved_app_settings() -> Dict[str, Any]:
     conn = db.get_connection()
     try:
         theme = _normalize_theme((db.get_meta(conn, _SETTINGS_THEME_KEY, "light") or "light"))
         model = (db.get_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, "") or "").strip()
+        openai_model = (db.get_meta(conn, _SETTINGS_OPENAI_MODEL_KEY, "") or "").strip()
         claude_instructions = (db.get_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, "") or "").strip()
+        openai_instructions = (db.get_meta(conn, _SETTINGS_OPENAI_INSTRUCTIONS_KEY, "") or "").strip()
         models = _load_cached_models(conn)
+        openai_models = _load_cached_openai_models(conn)
         anthropic_key, anthropic_configured = _read_stored_anthropic_key(conn)
         anthropic_needs_reset = bool(anthropic_configured and not anthropic_key)
         anthropic_activated = bool(anthropic_configured and anthropic_key and _is_anthropic_key_activated(conn))
         anthropic_masked = _mask_secret(anthropic_key) if anthropic_key else ("configured" if anthropic_needs_reset else "")
+        openai_key, openai_configured = _read_stored_openai_key(conn)
+        openai_needs_reset = bool(openai_configured and not openai_key)
+        openai_activated = bool(openai_configured and openai_key and _is_openai_key_activated(conn))
+        openai_masked = _mask_secret(openai_key) if openai_key else ("configured" if openai_needs_reset else "")
         ngrok_token, ngrok_configured = _read_stored_ngrok_authtoken(conn)
         ngrok_needs_reset = bool(ngrok_configured and not ngrok_token)
         ngrok_masked = _mask_secret(ngrok_token) if ngrok_token else ("configured" if ngrok_needs_reset else "")
@@ -1678,10 +1941,17 @@ def _get_saved_app_settings() -> Dict[str, Any]:
             "theme": theme,
             "model": model,
             "models": models,
+            "openai_model": openai_model,
+            "openai_models": openai_models,
             "anthropic_api_key_set": anthropic_configured,
             "anthropic_api_key_masked": anthropic_masked,
             "anthropic_api_key_needs_reset": anthropic_needs_reset,
             "anthropic_api_key_activated": anthropic_activated,
+            "openai_api_key_set": openai_configured,
+            "openai_api_key_masked": openai_masked,
+            "openai_api_key_needs_reset": openai_needs_reset,
+            "openai_api_key_activated": openai_activated,
+            "openai_instructions": openai_instructions,
             "ngrok_authtoken_set": ngrok_configured,
             "ngrok_authtoken_masked": ngrok_masked,
             "ngrok_authtoken_needs_reset": ngrok_needs_reset,
@@ -2159,8 +2429,11 @@ def save_app_settings(req: SaveAppSettingsRequest) -> Dict[str, Any]:
     theme = _normalize_theme(req.theme)
     mcp_auth_mode = _normalize_mcp_auth_mode(req.mcp_auth_mode)
     model = (req.model or "").strip()
+    openai_model = (req.openai_model or "").strip()
     claude_instructions = (req.claude_instructions or "").strip()
+    openai_instructions = (req.openai_instructions or "").strip()
     api_key_input = req.anthropic_api_key
+    openai_api_key_input = req.openai_api_key
     ngrok_authtoken_input = req.ngrok_authtoken
 
     conn = db.get_connection()
@@ -2174,11 +2447,17 @@ def save_app_settings(req: SaveAppSettingsRequest) -> Dict[str, Any]:
         db.set_meta(conn, _SETTINGS_MCP_AUTH_MODE_KEY, mcp_auth_mode, commit=False)
         db.set_meta(conn, _SETTINGS_TOOL_LOGGING_ENABLED_KEY, "1" if tool_logging_enabled else "0", commit=False)
         db.set_meta(conn, _SETTINGS_ANTHROPIC_MODEL_KEY, model, commit=False)
+        db.set_meta(conn, _SETTINGS_OPENAI_MODEL_KEY, openai_model, commit=False)
         db.set_meta(conn, _SETTINGS_CLAUDE_INSTRUCTIONS_KEY, claude_instructions, commit=False)
+        db.set_meta(conn, _SETTINGS_OPENAI_INSTRUCTIONS_KEY, openai_instructions, commit=False)
         if api_key_input is not None:
             encrypted = _encrypt_secret((api_key_input or "").strip())
             db.set_meta(conn, _SETTINGS_ANTHROPIC_API_KEY, encrypted, commit=False)
             _set_anthropic_key_activated(conn, False)
+        if openai_api_key_input is not None:
+            encrypted_openai = _encrypt_secret((openai_api_key_input or "").strip())
+            db.set_meta(conn, _SETTINGS_OPENAI_API_KEY, encrypted_openai, commit=False)
+            _set_openai_key_activated(conn, False)
         if ngrok_authtoken_input is not None:
             encrypted_token = _encrypt_secret((ngrok_authtoken_input or "").strip())
             db.set_meta(conn, _SETTINGS_NGROK_AUTHTOKEN_KEY, encrypted_token, commit=False)
@@ -2353,8 +2632,88 @@ def lookup_anthropic_models(req: LookupAnthropicModelsRequest) -> Dict[str, Any]
     return {"models": models, "selected_model": selected_model}
 
 
-@app.post("/api/claude/chat")
-def claude_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
+@app.post("/api/settings/openai/validate")
+def validate_openai_key(req: ValidateOpenAIKeyRequest) -> Dict[str, Any]:
+    key = (req.api_key or "").strip()
+    stored_key = ""
+    should_activate = False
+    conn = db.get_connection()
+    try:
+        stored_key, _ = _read_stored_openai_key(conn)
+        if key:
+            effective_key = key
+            should_activate = bool(stored_key and stored_key == key)
+        else:
+            effective_key = _require_stored_openai_key(conn)
+            should_activate = True
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+    if not effective_key:
+        raise HTTPException(status_code=400, detail="No OpenAI API key provided or stored.")
+
+    try:
+        models = _list_openai_models(effective_key, limit=1)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if should_activate:
+        conn = db.get_connection()
+        try:
+            _set_openai_key_activated(conn, True)
+        finally:
+            conn.close()
+
+    activated = bool(should_activate)
+    return {
+        "valid": True,
+        "message": (
+            "OpenAI API key is valid and activated."
+            if activated
+            else "OpenAI API key is valid. Save this key first, then validate again to activate."
+        ),
+        "activated": activated,
+        "sample_model": models[0]["id"] if models else None,
+        "app_settings": _get_saved_app_settings(),
+    }
+
+
+@app.post("/api/settings/openai/models")
+def lookup_openai_models(req: LookupOpenAIModelsRequest) -> Dict[str, Any]:
+    provided_key = (req.api_key or "").strip()
+    selected_model = ""
+    conn = db.get_connection()
+    try:
+        selected_model = (db.get_meta(conn, _SETTINGS_OPENAI_MODEL_KEY, "") or "").strip()
+        if provided_key:
+            effective_key = provided_key
+        else:
+            effective_key = _require_stored_openai_key(conn)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+    if not effective_key:
+        raise HTTPException(status_code=400, detail="No OpenAI API key provided or stored.")
+
+    try:
+        models = _list_openai_models(effective_key, limit=100)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    conn = db.get_connection()
+    try:
+        _save_cached_openai_models(conn, models)
+    finally:
+        conn.close()
+
+    return {"models": models, "selected_model": selected_model}
+
+
+def _run_claude_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
     user_message = (req.message or "").strip()
     if not user_message:
         raise HTTPException(status_code=400, detail="Message is required.")
@@ -2414,7 +2773,7 @@ def claude_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
                     arguments = {"value": arguments}
 
                 _log.info("Calling MCP tool: %s(%s)", tool_name, arguments)
-                result_text = _call_mcp_tool(tool_name, arguments)
+                result_text = _call_mcp_tool(tool_name, arguments, source="claude_chat")
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2435,7 +2794,135 @@ def claude_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
     return {
         "message": {"role": "assistant", "content": assistant_text},
         "model": model,
+        "provider": "anthropic",
     }
+
+
+def _run_openai_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
+    user_message = (req.message or "").strip()
+    if not user_message:
+        raise HTTPException(status_code=400, detail="Message is required.")
+
+    conn = db.get_connection()
+    try:
+        model = (db.get_meta(conn, _SETTINGS_OPENAI_MODEL_KEY, "") or "").strip()
+        api_key = _require_stored_openai_key(conn)
+        activated = _is_openai_key_activated(conn)
+        openai_instructions = (db.get_meta(conn, _SETTINGS_OPENAI_INSTRUCTIONS_KEY, "") or "").strip()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        conn.close()
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No stored OpenAI API key found. Save one in Settings.")
+    if not activated:
+        raise HTTPException(status_code=400, detail="OpenAI API key must be validated before using ChatGPT chat.")
+    if not model:
+        raise HTTPException(status_code=400, detail="No OpenAI model selected. Choose one in Settings.")
+
+    history = _prepare_claude_history(req.history)
+    messages: List[Dict[str, Any]] = [*history, {"role": "user", "content": user_message}]
+    if openai_instructions:
+        messages = [{"role": "system", "content": openai_instructions}, *messages]
+    tools = _get_openai_tools()
+
+    response_message: Dict[str, Any] = {}
+    try:
+        for _round in range(_MAX_TOOL_ROUNDS):
+            payload: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+            }
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = "auto"
+
+            response = _openai_post(
+                api_key=api_key,
+                endpoint="chat/completions",
+                payload=payload,
+                timeout=120.0,
+            )
+            choices = response.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise RuntimeError("OpenAI returned no choices.")
+            choice0 = choices[0] if isinstance(choices[0], dict) else {}
+            response_message = choice0.get("message") if isinstance(choice0.get("message"), dict) else {}
+            if not response_message:
+                raise RuntimeError("OpenAI response message is empty.")
+
+            assistant_entry: Dict[str, Any] = {
+                "role": "assistant",
+                "content": response_message.get("content") if response_message.get("content") is not None else "",
+            }
+            tool_calls = response_message.get("tool_calls")
+            if isinstance(tool_calls, list) and tool_calls:
+                assistant_entry["tool_calls"] = tool_calls
+            messages.append(assistant_entry)
+
+            if not isinstance(tool_calls, list) or not tool_calls:
+                break
+
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_call_id = str(tool_call.get("id") or "").strip()
+                fn = tool_call.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                tool_name = str(fn.get("name") or "").strip()
+                raw_args = fn.get("arguments")
+                arguments: Dict[str, Any]
+                if isinstance(raw_args, str):
+                    try:
+                        parsed = json.loads(raw_args)
+                        arguments = parsed if isinstance(parsed, dict) else {"value": parsed}
+                    except Exception:
+                        arguments = {"value": raw_args}
+                elif isinstance(raw_args, dict):
+                    arguments = raw_args
+                else:
+                    arguments = {}
+
+                _log.info("Calling MCP tool: %s(%s)", tool_name, arguments)
+                result_text = _call_mcp_tool(tool_name, arguments, source="openai_chat")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result_text,
+                })
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"OpenAI chat failed: {exc}")
+
+    assistant_text = _text_from_openai_message(response_message)
+    if not assistant_text:
+        assistant_text = "(Tools executed but ChatGPT returned no text summary.)"
+
+    return {
+        "message": {"role": "assistant", "content": assistant_text},
+        "model": model,
+        "provider": "openai",
+    }
+
+
+@app.post("/api/chat")
+def chat(req: ChatRequest) -> Dict[str, Any]:
+    provider = (req.provider or "").strip().lower()
+    base_req = ClaudeChatRequest(message=req.message, history=req.history)
+    if provider in ("anthropic", "claude"):
+        return _run_claude_chat(base_req)
+    if provider in ("openai", "chatgpt"):
+        return _run_openai_chat(base_req)
+    raise HTTPException(status_code=400, detail="provider must be one of: anthropic, openai.")
+
+
+@app.post("/api/claude/chat")
+def claude_chat(req: ClaudeChatRequest) -> Dict[str, Any]:
+    return _run_claude_chat(req)
 
 
 @app.get("/api/system/browse-folder")
