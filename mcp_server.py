@@ -477,7 +477,7 @@ def _resolve_pair_context(
 def refresh_catalog(
     include_row_counts: bool = False,
 ) -> str:
-    """Scan saved source/target folders, register datasets, and auto-pair (name + field overlap fallback)."""
+    """Refresh catalog metadata from configured folders and auto-pair datasets. Returns a JSON refresh summary (or error JSON). Use after source/target/configuration files change; use `list_datasets` for read-only inspection."""
     result = cat.refresh_catalog(
         include_row_counts=include_row_counts,
     )
@@ -489,7 +489,7 @@ def list_datasets(
     side: Optional[str] = None,
     filter: Optional[str] = None,
 ) -> str:
-    """List discovered datasets visible to MCP tools. Optional side/text filter."""
+    """List datasets currently exposed to MCP tools. Returns a JSON array with dataset IDs, side, file/sheet, column count, and row_count. Use `list_fields` when you already know the dataset and need columns."""
     conn = db.get_connection()
     datasets = _tool_visible_datasets(conn)
     conn.close()
@@ -518,7 +518,7 @@ def list_datasets(
 
 @mcp.tool()
 def list_fields(dataset_id: str) -> str:
-    """List column names and count for a dataset."""
+    """List columns for one dataset. Returns JSON with `dataset`, `columns`, and `column_count` (or `error`). Use this before profiling, filtering, SQL, or comparisons."""
     ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -539,7 +539,7 @@ def preview_dataset(
     offset: int = 0,
     fields: Optional[str] = None,
 ) -> mcp_types.CallToolResult:
-    """Preview top-N rows from a dataset. Optionally specify comma-separated field names."""
+    """Preview rows from one dataset with optional field projection. Returns a `CallToolResult` with table text plus structured headers/rows/total metadata (or an error result). Use `run_sql_preview` for custom joins/aggregates."""
 
     def _error_result(message: str) -> mcp_types.CallToolResult:
         return mcp_types.CallToolResult(
@@ -591,7 +591,7 @@ def preview_dataset(
 
 @mcp.tool()
 def run_sql_preview(sql: str, limit: int = 10) -> mcp_types.CallToolResult:
-    """Execute a read-only SQL query against loaded datasets and return capped results."""
+    """Run read-only SQL against visible datasets with a capped result size. Returns a `CallToolResult` with executed SQL, headers, rows, and counts (or an error result). Use `preview_dataset` for simple top-N browsing without SQL."""
 
     def _error_result(message: str) -> mcp_types.CallToolResult:
         return mcp_types.CallToolResult(
@@ -651,7 +651,7 @@ def export_query(
     format: str = "xlsx",
     async_job: bool = True,
 ) -> str:
-    """Run read-only SQL export. By default queues a background job."""
+    """Export read-only SQL results to XLSX, sync or async. Returns accepted job JSON when `async_job=True`, otherwise report metadata JSON, or `error` JSON on failure. Use `run_sql_preview` for interactive non-export queries."""
     if async_job:
         result = _format_export_job_start(job_svc.start_export_query_job(sql=sql, filename=filename))
         return json.dumps(result, indent=2, default=str)
@@ -685,7 +685,7 @@ def export_query(
 
 @mcp.tool()
 def row_count_summary(dataset_id: str) -> str:
-    """Return row count for a single dataset."""
+    """Get row count for one dataset. Returns JSON with `dataset`, `side`, and `row_count` (or `error`). Use `data_profile` when you need column-level statistics, not only table size."""
     ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -735,7 +735,7 @@ def row_count_summary(dataset_id: str) -> str:
 
 @mcp.tool()
 def data_profile(dataset_id: str) -> str:
-    """Profile a dataset: per-column distinct, min, max, blanks."""
+    """Compute per-column profile statistics for a dataset. Returns JSON with total rows plus per-column distinct/min/max/blank_count metrics (or `error`). Use `column_value_summary` for top value frequencies."""
     _ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -749,7 +749,7 @@ def column_value_summary(
     column: Optional[str] = None,
     top_n: int = 5,
 ) -> str:
-    """Top-N value frequencies and blank counts for one or all columns."""
+    """Get top-N value frequencies and blank/null counts for one or all columns. Returns JSON summaries per column (or `error`). Use `value_distribution` when you only need one column's distribution."""
     _ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -764,7 +764,7 @@ def export_column_value_summary(
     top_n: int = 5,
     filename: Optional[str] = None,
 ) -> str:
-    """Create an XLSX Top-N value summary report (Column | Top 1..Top N | Blanks) in reports/."""
+    """Export column value summaries to XLSX. Returns report metadata JSON (`report_id`, file path/name, dataset, counts) or `error` JSON. Use `column_value_summary` for in-session JSON results only."""
     _ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -782,7 +782,7 @@ def combo_value_summary(
     columns: str,
     top_n: int = 10,
 ) -> str:
-    """Frequency of combined-field value tuples. Columns as comma-separated string."""
+    """Compute frequency of multi-column value combinations from comma-separated columns. Returns JSON with combo counts and blank/null combo counts (or `error`). Use `column_value_summary` for single-column analysis."""
     _ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -799,7 +799,7 @@ def preview_filtered_records(
     blanks_only: bool = False,
     limit: int = 10,
 ) -> str:
-    """Preview records matching a filter (exact value or blanks)."""
+    """Preview rows matching an exact value or blanks filter on one column. Returns JSON with headers, rows, row_count, and the applied filter (or `error`). Use `value_distribution` for aggregate counts instead of record samples."""
     _ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -818,7 +818,7 @@ def find_duplicates(
     key_columns: str,
     limit: int = 10,
 ) -> str:
-    """Find duplicate groups based on comma-separated key columns."""
+    """Find duplicate groups by comma-separated key columns. Returns JSON with duplicate groups and totals (or `error`). Use `suggest_keys` first if key columns are not known yet."""
     _ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -833,7 +833,7 @@ def value_distribution(
     column: str,
     limit: int = 20,
 ) -> str:
-    """Frequency counts for a single column, sorted by count descending."""
+    """Get value frequency distribution for a single column. Returns JSON with distribution rows and distinct counts (or `error`). Use `column_value_summary` to scan multiple columns in one call."""
     _ds, err = _tool_get_visible_dataset(dataset_id)
     if err:
         return json.dumps({"error": err})
@@ -851,7 +851,7 @@ def list_table_pairs(
     source_dataset_id: Optional[str] = None,
     target_dataset_id: Optional[str] = None,
 ) -> str:
-    """List compact pair metadata (no field mappings). Optional filter by source/target dataset IDs."""
+    """List compact source-target pair metadata without full mappings. Returns JSON array with pair IDs, dataset IDs, and mapping counts. Use `list_field_pairs` to load mappings for a specific pair."""
     pairs = cat.get_pairs()
 
     filter_ids = {x for x in (source_dataset_id, target_dataset_id) if x}
@@ -884,7 +884,7 @@ def list_table_pairs(
 
 @mcp.tool()
 def list_field_pairs(pair_id: str) -> str:
-    """List field mappings for a single pair_id."""
+    """Get key and compare mappings for one pair. Returns JSON mapping payload for the given `pair_id` (or `error`). Use `list_table_pairs` first when selecting a pair."""
     pair = cat.get_pair(pair_id)
     if not pair:
         return json.dumps({"error": f"Pair '{pair_id}' not found."})
@@ -905,13 +905,13 @@ def list_field_pairs(pair_id: str) -> str:
 if DEBUG_MODE:
     @mcp.tool()
     def list_pairs() -> str:
-        """DEBUG ONLY: list all pairs including full key/compare mappings."""
+        """Debug-only full pair listing including complete mapping payloads. Returns JSON array of pair records. Use `list_table_pairs`/`list_field_pairs` in production flows."""
         pairs = cat.get_pairs()
         return json.dumps(pairs, indent=2)
 
 @mcp.tool()
 def suggest_keys(pair_id: str) -> str:
-    """Suggest candidate key columns for a pair based on uniqueness, completeness, and overlap."""
+    """Suggest likely key columns for a pair using uniqueness, completeness, and overlap heuristics. Returns ranked candidate JSON with scores (or `error`). Use `find_duplicates` to validate a chosen key."""
     result = prof.suggest_keys(pair_id)
     return json.dumps(result, indent=2)
 
@@ -931,7 +931,7 @@ def save_key_preset(
 
 @mcp.tool()
 def list_key_presets(pair_id: str) -> str:
-    """List saved key presets for a pair."""
+    """List saved key presets for a pair. Returns JSON array of preset rows (or empty array). Use `suggest_keys` when no curated presets exist yet."""
     conn = db.get_connection()
     presets = db.list_key_presets(conn, pair_id)
     conn.close()
@@ -942,7 +942,7 @@ def list_key_presets(pair_id: str) -> str:
 def get_dataset_links(
     dataset_id: str,
 ) -> str:
-    """Return compact relationship links for a dataset to guide SQL join construction."""
+    """Return relationship-based join hints for a dataset. Returns JSON relations with linked datasets, field pairs, confidence, and join predicate SQL (or `error`). Use `list_fields` when only schema is needed."""
     conn = db.get_connection()
     ds = db.get_dataset(conn, dataset_id)
     if not ds:
@@ -1013,7 +1013,7 @@ def schema_diff(
     source_dataset_id: str,
     target_dataset_id: str,
 ) -> str:
-    """Compare column schemas between two datasets: find missing/extra/common columns."""
+    """Compare schemas between two datasets. Returns JSON drift details such as source-only and target-only columns (or `error`). Use `compare_tables` for data-level differences."""
     result = cat.schema_diff(source_dataset_id, target_dataset_id)
     return json.dumps(result, indent=2)
 
@@ -1028,7 +1028,7 @@ def start_export_query_job(
     sql: str,
     filename: Optional[str] = None,
 ) -> str:
-    """Start a query export job and return immediately with job_id."""
+    """Queue a background query export job. Returns accepted-job JSON with `job_id` and next polling hint (or `error`). Use `export_query(..., async_job=False)` for synchronous export."""
     result = _format_export_job_start(
         job_svc.start_export_query_job(
             sql=sql,
@@ -1046,7 +1046,7 @@ def start_comparison_job(
     pair_id: Optional[str] = None,
     compare_fields: Optional[str] = None,
 ) -> str:
-    """Start a comparison job. key/compare fields can be source or target names when pair mappings exist."""
+    """Queue a background comparison job between source and target datasets. Returns job JSON with IDs/state (or `error`) and supports mapped key/compare fields via `pair_id`. Use `compare_tables` for immediate results."""
     keys = _split_csv_fields(key_fields)
     comp_cols = _split_csv_fields(compare_fields) if compare_fields else None
     err, keys, comp_cols, key_mappings, compare_mappings = _resolve_pair_context(
@@ -1083,7 +1083,7 @@ def compare_tables(
     compare_fields: Optional[str] = None,
     sample_limit: int = 10,
 ) -> str:
-    """Quick ad-hoc comparison. key/compare fields can be source or target names when pair mappings exist."""
+    """Run an immediate table comparison. Returns JSON summary plus sample added/removed/changed rows (or `error`) and supports mapped key/compare fields via `pair_id`. Use `start_comparison_job` for long-running comparisons."""
     keys = _split_csv_fields(key_fields)
     comp_cols = _split_csv_fields(compare_fields) if compare_fields else None
     err, keys, comp_cols, key_mappings, compare_mappings = _resolve_pair_context(
@@ -1116,10 +1116,7 @@ def compare_field(
     limit: int = 10,
     pair_id: Optional[str] = None,
 ) -> str:
-    """Drill-down: per-row diffs for a single field between source and target.
-
-    When pair mappings exist, `field` can be either source or target field name.
-    """
+    """Drill into row-level differences for one field. Returns JSON field-specific diff rows (or `error`) and supports mapped fields via `pair_id`. Use `compare_tables` first for broad triage."""
     keys = _split_csv_fields(key_columns)
     err, keys, _comp_cols, key_mappings, compare_mappings = _resolve_pair_context(
         source_dataset_id=source_dataset_id,
@@ -1146,28 +1143,28 @@ def compare_field(
 
 @mcp.tool()
 def get_job_status(job_id: str) -> str:
-    """Get status and progress of a comparison job."""
+    """Get current state and progress for a job. Returns JSON status/progress/error details for `job_id` (or `error`). Use `get_job_summary` after completion for final outcomes."""
     result = job_svc.get_job_status(job_id)
     return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 def get_job_summary(job_id: str) -> str:
-    """Get detailed summary of a completed job including report info."""
+    """Get final summary for a completed job. Returns JSON completion metrics and linked report metadata when available (or `error`). Use `get_job_status` for active jobs."""
     result = job_svc.get_job_summary(job_id)
     return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 def cancel_job(job_id: str) -> str:
-    """Cancel a queued or running job."""
+    """Cancel a queued or running job. Returns JSON cancellation result for `job_id` (or `error`). Use `get_job_status` when you only need monitoring."""
     result = job_svc.cancel_job(job_id)
     return json.dumps(result, indent=2)
 
 
 @mcp.tool()
 def list_reports(limit: int = 5) -> str:
-    """List recent generated XLSX reports (default: last 5)."""
+    """List recent generated reports. Returns JSON array of report metadata rows, ordered by recency. Use `get_report_metadata` for one specific report."""
     limit = max(1, min(int(limit), 500))
     conn = db.get_connection()
     reports = db.list_reports(conn, limit=limit)
@@ -1177,7 +1174,7 @@ def list_reports(limit: int = 5) -> str:
 
 @mcp.tool()
 def get_report_metadata(report_id: str) -> str:
-    """Get metadata for a specific report."""
+    """Get metadata for one report ID. Returns JSON report details including file path/name and summary (or `error`). Use `list_reports` to discover report IDs."""
     conn = db.get_connection()
     report = db.get_report(conn, report_id)
     conn.close()
